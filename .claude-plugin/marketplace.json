@@ -1,0 +1,19 @@
+{
+  "name": "orbit",
+  "owner": {
+    "name": "Orbit"
+  },
+  "plugins": [
+    {
+      "name": "orbit",
+      "source": "./",
+      "description": "Load your YouTube/X subscriptions and surface a ranked daily digest of what's worth your attention.",
+      "skills": [
+        {
+          "name": "orbit",
+          "path": "skills/orbit"
+        }
+      ]
+    }
+  ]
+}

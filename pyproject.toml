@@ -1,0 +1,15 @@
+[project]
+name = "orbit"
+version = "0.1.0"
+description = "Orbit — a personal feed digest skill that loads your subscriptions and surfaces what matters."
+requires-python = ">=3.12"
+# Stdlib-first: Orbit's pipeline stages use only the Python standard library
+# (sqlite3, argparse, json, subprocess). yt-dlp and the Node X client are
+# invoked as subprocesses, never imported. Mirrors the last30days reference.
+dependencies = []
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.format]
+quote-style = "double"
