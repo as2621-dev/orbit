@@ -6,6 +6,30 @@ It is honest and plain. Read §8.5 in particular — it is not softened.
 
 ---
 
+## Install (quick reference)
+
+**Claude Code (recommended):**
+
+```
+/plugin marketplace add ashesh2621/orbit
+/plugin install orbit
+```
+
+**Manual / developer (symlink the skill into Claude Code):**
+
+```bash
+git clone https://github.com/ashesh2621/orbit.git
+ln -s "$(pwd)/orbit/skills/orbit" ~/.claude/skills/orbit
+```
+
+Then run `/orbit --setup` once (see §8.3) and add the cron line it prints. Three things must
+be in place first: **Python 3.12+**, **Node 22+**, and **`yt-dlp`** on your `PATH`, plus a
+browser logged into YouTube and X (see §8.2). The repo is private by default — the marketplace
+command works because you're authenticated to your own account; make it public when you want to
+share it.
+
+---
+
 ## 8.1 What Orbit does & what to expect
 
 Orbit produces **one HTML page per day** that summarizes the new items from the YouTube
@@ -40,9 +64,14 @@ server, because there isn't one.
 
 ## 8.3 Setup (5 steps)
 
-1. **Install the plugin.** Add this repo as a Claude Code plugin marketplace and install the
-   `orbit` plugin (the manifest is `.claude-plugin/marketplace.json`). For example, point
-   Claude Code at this repository and install the `orbit` plugin from the `orbit` marketplace.
+1. **Install the plugin** (see the Install quick-reference above):
+
+   ```
+   /plugin marketplace add ashesh2621/orbit
+   /plugin install orbit
+   ```
+
+   (The manifest is `.claude-plugin/marketplace.json`.)
 
 2. **Confirm you're logged in.** Open your browser and make sure you are logged into both
    **YouTube** and **X**. Orbit reads those sessions; it cannot read what you are not logged

@@ -20,7 +20,14 @@ Read that before running Orbit.
 
 ## Quick start
 
-1. Install the plugin (manifest: `.claude-plugin/marketplace.json`).
+1. Install the plugin in Claude Code (manifest: `.claude-plugin/marketplace.json`):
+
+   ```
+   /plugin marketplace add ashesh2621/orbit
+   /plugin install orbit
+   ```
+
+   Prerequisites: **Python 3.12+**, **Node 22+**, and **`yt-dlp`** on your `PATH`.
 2. Confirm you're logged into YouTube and X in a supported browser
    (Chrome/Firefox/Safari/Edge/Brave).
 3. Run `/orbit --setup` — it reads your subs/follows, auto-classifies channels, has you
