@@ -136,18 +136,25 @@ def _render_continued_link(page_2_href: str) -> str:
 
 
 def _card_deep_link(item: Any) -> str:
-    """Build the whole-video ``watch?v=ID&t=0s`` deep-link for a card title.
+    """Build the card-title link: an item-supplied ``card_url`` if present, else YouTube.
 
-    Built directly (not via ``build_deep_link``) to keep render.py free of a
-    transcribe import for the trivial ``t=0s`` case; the value is a trusted
-    constructed URL that passes the html_render allowlist.
+    Source-aware (Phase 4 / M2): when the item carries a non-empty ``card_url`` (an X
+    item sets its ``https://x.com/{handle}/status/{tweet_id}`` permalink), that link is
+    used verbatim so the unified digest renders a real x.com card. When ``card_url`` is
+    empty — every YouTube item — it falls back to the whole-video
+    ``watch?v=ID&t=0s`` deep-link, so the YouTube path is byte-for-byte unchanged. Both
+    forms are trusted constructed ``https`` URLs that pass the html_render allowlist.
 
     Args:
-        item: A :class:`lib.rerank.RankableItem` (read for ``item_external_id``).
+        item: A :class:`lib.rerank.RankableItem` (read for ``card_url`` then
+            ``item_external_id``).
 
     Returns:
-        The ``https://www.youtube.com/watch?v={id}&t=0s`` URL.
+        The item's ``card_url`` if set, else ``https://www.youtube.com/watch?v={id}&t=0s``.
     """
+    card_url = getattr(item, "card_url", "") or ""
+    if card_url:
+        return card_url
     item_external_id = getattr(item, "item_external_id", "") or ""
     return f"https://www.youtube.com/watch?v={item_external_id}&t=0s"
 

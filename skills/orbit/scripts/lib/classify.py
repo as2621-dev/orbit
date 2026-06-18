@@ -138,6 +138,32 @@ def _read_item_field(item: Any, field_name: str) -> str:
     return "" if value is None else str(value)
 
 
+def _read_first_item_field(item: Any, field_names: tuple[str, ...]) -> str:
+    """Read the FIRST non-empty value among ``field_names`` off an item.
+
+    Generalizes the classify input across sources WITHOUT a fork (Phase 4 / M2): a
+    YouTube :class:`lib.youtube_yt.Upload` exposes ``video_id`` / ``title`` /
+    ``description``; an X :class:`lib.bird_x.Tweet` exposes ``tweet_id`` / ``text`` (no
+    transcript). The SAME :func:`classify_item` reads whichever field shape the item
+    carries — the item-external-id resolves from ``video_id`` OR ``tweet_id``, and the
+    prompt body from ``title`` OR ``text`` — so both sources classify on the same two
+    axes via the same code path (no X-specific classifier).
+
+    Args:
+        item: An Upload, a Tweet, or a dict carrying any of ``field_names``.
+        field_names: Candidate field names tried in priority order; the first that
+            yields a non-empty string wins.
+
+    Returns:
+        The first non-empty field value as a string, or "" if none are present.
+    """
+    for field_name in field_names:
+        value = _read_item_field(item, field_name)
+        if value:
+            return value
+    return ""
+
+
 def _render_prompt(item: Any, channel_category: str, interests: list[str]) -> str:
     """Load references/classify.md and substitute the item / prior / interests.
 
@@ -151,9 +177,13 @@ def _render_prompt(item: Any, channel_category: str, interests: list[str]) -> st
     """
     template = _CLASSIFY_PROMPT_PATH.read_text(encoding="utf-8")
     interests_text = ", ".join(interests) if interests else _NO_INTERESTS_PLACEHOLDER
+    # Reason: read the body from whichever field shape the item carries — a YouTube
+    # Upload has title/description; an X Tweet (text-only) has `text` and no
+    # description. Map tweet text to the prompt's title slot so both classify on the
+    # same two-axis prompt without a fork (Phase 4 / M2).
     return template.format(
-        item_title=_read_item_field(item, "title"),
-        item_description=_read_item_field(item, "description"),
+        item_title=_read_first_item_field(item, ("title", "text")),
+        item_description=_read_first_item_field(item, ("description", "text")),
         channel_category=channel_category,
         interests=interests_text,
     )
@@ -256,8 +286,9 @@ def classify_item(
     routes them to the "they also posted" strip (design decision 5).
 
     Args:
-        item: An :class:`lib.youtube_yt.Upload` or a dict with at least ``video_id`` /
-            ``title`` / ``description``. ``item_external_id`` is ``video_id``.
+        item: An :class:`lib.youtube_yt.Upload`, an :class:`lib.bird_x.Tweet`, or a
+            dict. ``item_external_id`` resolves from ``video_id`` (YT) OR ``tweet_id``
+            (X); the prompt body reads ``title``/``description`` (YT) OR ``text`` (X).
         channel_category: The channel-level Axis-A prior ("signal" | "noise") from
             the ``sources`` row.
         interests: The user's topic keywords (drives Axis B).
@@ -277,7 +308,9 @@ def classify_item(
         >>> result.is_also_posted  # doctest: +SKIP
         False
     """
-    item_external_id = _read_item_field(item, "video_id")
+    # Resolve the item's stable id from whichever source field it carries — YouTube
+    # `video_id` or X `tweet_id` — so the shared classify path keys both identically.
+    item_external_id = _read_first_item_field(item, ("video_id", "tweet_id"))
 
     # 1. Deterministic override short-circuit — user corrections are sacred.
     existing = store_module.get_classification(item_external_id)

@@ -128,6 +128,11 @@ class RankableItem:
             NOT drop on it (rank controls density, never inclusion).
         chapters: The item's :class:`lib.chapterize.Chapter` list (possibly empty);
             carried through to the renderer for the chapter deep-links.
+        card_url: An OPTIONAL source-specific card link (Phase 4 / M2). Empty by
+            default → the renderer falls back to the YouTube ``watch?v=ID&t=0s`` form
+            (so a YouTube item is byte-for-byte unchanged). An X item sets this to its
+            ``https://x.com/{handle}/status/{tweet_id}`` permalink so it renders a real
+            x.com card link in the same unified digest.
     """
 
     item_external_id: str
@@ -140,6 +145,7 @@ class RankableItem:
     upload_date: str
     classification: Any = None
     chapters: list = field(default_factory=list)
+    card_url: str = ""
 
     @classmethod
     def from_parts(
@@ -192,6 +198,67 @@ class RankableItem:
             upload_date=str(getattr(upload, "upload_date", "") or ""),
             classification=classification,
             chapters=list(chapters) if chapters else [],
+        )
+
+    @classmethod
+    def from_tweet(
+        cls,
+        tweet: Any,
+        classification: Any = None,
+        *,
+        creator_external_id: str = "",
+    ) -> "RankableItem":
+        """Build a :class:`RankableItem` from an X :class:`lib.bird_x.Tweet` (Phase 4 / M2).
+
+        The X-source analog of :func:`from_parts`, so X tweets enter the SAME unified
+        rank/render stream as YouTube uploads (no separate item model). A tweet is
+        text-only (no chapters); its body becomes the ``title``, its author handle the
+        ``channel_name`` + ``creator_external_id`` (the ``creator_weights`` lookup key,
+        matching how X handles persist as ``sources.external_id``), and its engagement
+        counts map onto the shared fields (``retweet_count`` → ``view_count``,
+        ``like_count`` → ``like_count``, ``reply_count`` → ``comment_count``) so the
+        same blend scores it. ``card_url`` is set to the tweet's x.com permalink so the
+        renderer links the card to x.com rather than the YouTube fallback.
+
+        ``upload_date`` is left empty unless ``created_at`` is an ISO-8601 string we can
+        reduce to ``YYYYMMDD`` — the recency term degrades gracefully to neutral on an
+        unparseable/absent date (never crashes), so a raw Twitter date string is safe.
+
+        Args:
+            tweet: An :class:`lib.bird_x.Tweet` (or any object exposing ``tweet_id`` /
+                ``text`` / ``handle`` / ``created_at`` and the engagement counts).
+            classification: The tweet's :class:`lib.classify.Classification`, or None.
+            creator_external_id: The creator key for the priority-weight lookup —
+                defaults to the tweet's ``handle`` when not given explicitly.
+
+        Returns:
+            The unified :class:`RankableItem` carrying an x.com ``card_url``.
+
+        Example:
+            >>> from types import SimpleNamespace
+            >>> tweet = SimpleNamespace(
+            ...     tweet_id="123", text="a sharp take", handle="alice",
+            ...     created_at="2026-06-18T00:00:00Z", like_count=10,
+            ...     retweet_count=5, reply_count=2, quote_count=1,
+            ... )
+            >>> item = RankableItem.from_tweet(tweet)
+            >>> item.card_url
+            'https://x.com/alice/status/123'
+        """
+        handle = str(getattr(tweet, "handle", "") or "")
+        tweet_id = str(getattr(tweet, "tweet_id", "") or "")
+        return cls(
+            item_external_id=tweet_id,
+            title=str(getattr(tweet, "text", "") or ""),
+            channel_name=handle,
+            creator_external_id=creator_external_id or handle,
+            view_count=getattr(tweet, "retweet_count", None),
+            like_count=getattr(tweet, "like_count", None),
+            comment_count=getattr(tweet, "reply_count", None),
+            upload_date=_tweet_upload_date(getattr(tweet, "created_at", "")),
+            classification=classification,
+            chapters=[],
+            card_url=f"https://x.com/{handle}/status/{tweet_id}",
         )
 
 
@@ -335,6 +402,30 @@ def priority_weight_for(item: RankableItem, config: Any) -> float:
             ),
         )
         return DEFAULT_PRIORITY_WEIGHT
+
+
+def _tweet_upload_date(created_at: Any) -> str:
+    """Reduce a tweet ``created_at`` to the ``YYYYMMDD`` shape recency scoring expects.
+
+    Accepts an ISO-8601 string (e.g. ``"2026-06-18T00:00:00Z"``) and returns its
+    ``YYYYMMDD`` date. Anything we cannot cleanly parse (a Twitter ``"Wed Jan 15 ..."``
+    string, None, garbage) returns "" — :func:`recency_decay` then degrades to a neutral
+    mid decay rather than crashing, so an X item is never buried for an odd date format.
+
+    Args:
+        created_at: The tweet's raw ``created_at`` value (any type).
+
+    Returns:
+        A ``YYYYMMDD`` string, or "" when the value is not a parseable ISO date.
+    """
+    text = str(created_at or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    return parsed.strftime("%Y%m%d")
 
 
 def _parse_upload_date(upload_date: str) -> Optional[date]:

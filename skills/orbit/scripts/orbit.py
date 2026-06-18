@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -26,7 +26,9 @@ from typing import Callable, Optional
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
 
 import store  # noqa: E402  (import must follow the sys.path insert above)
-from lib import log, render  # noqa: E402
+from lib import bird_x, classify, log, render  # noqa: E402
+from lib.bird_x import Follow, Tweet, XAuthError  # noqa: E402
+from lib.classify import LlmClassifier, _default_llm_classifier  # noqa: E402
 from lib.config import OrbitConfig, load_config  # noqa: E402
 from lib.density import TieredItem, assign_density_tiers  # noqa: E402
 from lib.rerank import RankableItem, derank_items  # noqa: E402
@@ -174,8 +176,10 @@ def run_stage0_load_sources(
     db_path: Optional[Path] = None,
     loader: Optional[Callable[[str], list[Subscription]]] = None,
     persist: Optional[Callable[[list[Subscription]], int]] = None,
+    x_loader: Optional[Callable[[str], list[Follow]]] = None,
+    x_persist: Optional[Callable[[list[Follow]], int]] = None,
 ) -> None:
-    """Stage 0: load YouTube subscriptions into ``sources`` (deterministic, no LLM).
+    """Stage 0: load YouTube subscriptions AND the X following list (deterministic, no LLM).
 
     Initializes the DB, reads existing youtube sources, and applies the weekly-cache
     rule (:func:`_sources_need_refresh`): on a cache hit it logs ``sources_cache_hit``
@@ -184,17 +188,28 @@ def run_stage0_load_sources(
     and logs ``sources_refreshed``. A :class:`YouTubeAuthError` is logged with an
     actionable ``fix_suggestion`` and RE-RAISED (fail loud, Rule 12 — never swallowed).
 
-    The ``loader``/``persist`` callables default to the real youtube_yt functions and
-    are injectable so tests pass a mock without monkeypatching internals.
+    The X half (Phase 4 / M2) loads the user's following list via the injectable
+    ``x_loader`` / ``x_persist`` and is best-effort: an :class:`XAuthError` (e.g. missing
+    ``X_USER_ID`` / cookies) is logged with an actionable ``fix_suggestion`` and SWALLOWED
+    so a YouTube-only user still gets a digest — Orbit must not abort the whole run just
+    because the optional X source is unconfigured. (A YouTube auth failure is fatal and
+    re-raised; X is additive.) The X load is skipped entirely when ``x_loader`` is None
+    AND no X loader is wired (the default uses :func:`lib.bird_x.load_x_following`, which
+    fails loud-but-swallowed if cookies/``X_USER_ID`` are absent).
+
+    All loader/persist callables default to the real source functions and are injectable
+    so tests pass mocks without monkeypatching internals.
 
     Args:
         config: The loaded :class:`OrbitConfig` (supplies ``cookie_source``).
         db_path: Explicit DB path (tests pass a temp path); defaults to the per-user DB.
         loader: Subscription loader; defaults to ``load_youtube_subscriptions``.
         persist: Persist function; defaults to ``persist_subscriptions``.
+        x_loader: X following loader; defaults to ``bird_x.load_x_following``.
+        x_persist: X following persist; defaults to ``bird_x.persist_following``.
 
     Raises:
-        YouTubeAuthError: If the loader fails to authenticate (re-raised, not swallowed).
+        YouTubeAuthError: If the YouTube loader fails to authenticate (re-raised — fatal).
     """
     active_loader = loader or load_youtube_subscriptions
     active_persist = persist or persist_subscriptions
@@ -209,6 +224,7 @@ def run_stage0_load_sources(
             count=len(existing_rows),
             detail="Sources refreshed within the last 7 days; skipping yt-dlp re-load.",
         )
+        _load_x_sources(config, x_loader=x_loader, x_persist=x_persist)
         return
 
     # Manual-run escape hatch: skip the network-touching loader on a cold DB. Tests
@@ -220,6 +236,7 @@ def run_stage0_load_sources(
             env_var=_STAGE0_SKIP_NETWORK_ENV_VAR,
             detail="Network guard set; skipping subscription load. Unset to fetch live.",
         )
+        _load_x_sources(config, x_loader=x_loader, x_persist=x_persist)
         return
 
     log.log_info("sources_refresh_started", platform="youtube", reason="empty_or_stale")
@@ -242,6 +259,132 @@ def run_stage0_load_sources(
 
     persisted_count = active_persist(subscriptions)
     log.log_info("sources_refreshed", platform="youtube", count=persisted_count)
+    _load_x_sources(config, x_loader=x_loader, x_persist=x_persist)
+
+
+def _load_x_sources(
+    config: OrbitConfig,
+    *,
+    x_loader: Optional[Callable[[str], list[Follow]]] = None,
+    x_persist: Optional[Callable[[list[Follow]], int]] = None,
+) -> None:
+    """Load + persist the X following list (best-effort, additive to YouTube Stage 0).
+
+    The X source is OPTIONAL: an :class:`XAuthError` (missing cookies / ``X_USER_ID``)
+    is logged with an actionable ``fix_suggestion`` and swallowed so a YouTube-only user
+    still gets a digest. The loader/persist are injectable (tests inject mocks; the
+    default uses :mod:`lib.bird_x`).
+
+    Args:
+        config: The loaded :class:`OrbitConfig` (supplies ``cookie_source``).
+        x_loader: X following loader; defaults to ``bird_x.load_x_following``.
+        x_persist: X following persist; defaults to ``bird_x.persist_following``.
+    """
+    active_x_loader = x_loader or bird_x.load_x_following
+    active_x_persist = x_persist or bird_x.persist_following
+
+    log.log_info("x_sources_refresh_started", platform="x")
+    try:
+        follows = active_x_loader(config.cookie_source)
+    except XAuthError as exc:
+        # Reason: X is an additive source — do not abort the whole run when the user
+        # has not configured X. Surface an actionable message and continue YouTube-only.
+        log.log_warning(
+            "stage0_x_sources_skipped",
+            platform="x",
+            fix_suggestion=(
+                "X following not loaded (auth/config). Set AUTH_TOKEN/CT0 + X_USER_ID to "
+                "include X in the digest; YouTube-only digest produced this run."
+            ),
+            error_message=str(exc),
+        )
+        return
+
+    persisted_count = active_x_persist(follows)
+    log.log_info("x_sources_refreshed", platform="x", count=persisted_count)
+
+
+def run_stage1_build_x_items(
+    config: OrbitConfig,
+    depth: str,
+    *,
+    run_day_ordinal: Optional[int] = None,
+    x_delta: Optional[Callable[..., list[Tweet]]] = None,
+    llm_classifier: LlmClassifier = _default_llm_classifier,
+) -> list[RankableItem]:
+    """Stage 1 (X half): delta-fetch X tweets, classify them, build unified RankableItems.
+
+    Loads the persisted X sources (``store.list_sources(platform="x")``), pulls each
+    rotated handle's new tweets via the injectable ``x_delta`` (defaults to
+    :func:`lib.bird_x.fetch_new_tweets`), classifies EACH tweet on the SAME two-axis
+    :func:`lib.classify.classify_item` path as YouTube (the channel-level Axis-A prior
+    comes from the source row's ``category``), and adapts every tweet into the shared
+    :class:`RankableItem` via :meth:`RankableItem.from_tweet` (carrying its x.com
+    ``card_url``). The result merges into the SAME unified stream YouTube uploads feed,
+    so X tweets and videos rank + render together (the M2 unified digest).
+
+    No-op (returns ``[]``) when there are no X sources. ``orbit.py`` stays wiring-only
+    (Rule 5): rotation/delta/classify/build all live in lib/.
+
+    Args:
+        config: The loaded :class:`OrbitConfig` (supplies ``interests`` for Axis B).
+        depth: ``quick`` | ``default`` | ``deep`` — selects the X handle budget.
+        run_day_ordinal: The run's day ordinal driving handle rotation; defaults to a
+            day count since the Unix epoch so rotation advances across daily runs.
+        x_delta: X delta fetcher; defaults to ``bird_x.fetch_new_tweets``. Injectable so
+            tests mock the subprocess boundary.
+        llm_classifier: The injectable classify LLM boundary; tests inject a mock, the
+            host session wires the real caller at runtime.
+
+    Returns:
+        The X tweets as classified :class:`RankableItem`s (possibly empty).
+    """
+    x_sources = store.list_sources(platform="x")
+    if not x_sources:
+        log.log_info("x_stage1_no_sources", platform="x")
+        return []
+
+    active_x_delta = x_delta or bird_x.fetch_new_tweets
+    ordinal = run_day_ordinal if run_day_ordinal is not None else _current_day_ordinal()
+
+    new_tweets = active_x_delta(x_sources, depth, ordinal)
+
+    # The channel-level Axis-A prior is the source row's category, keyed by handle.
+    category_by_handle = {str(row["external_id"]): str(row.get("category") or "signal") for row in x_sources}
+
+    rankable_items: list[RankableItem] = []
+    for tweet in new_tweets:
+        channel_category = category_by_handle.get(tweet.handle, "signal")
+        classification = classify.classify_item(
+            tweet,
+            channel_category=channel_category,
+            interests=config.interests,
+            llm_classifier=llm_classifier,
+        )
+        rankable_items.append(
+            RankableItem.from_tweet(tweet, classification, creator_external_id=tweet.handle)
+        )
+
+    log.log_info(
+        "x_stage1_build_completed",
+        platform="x",
+        source_count=len(x_sources),
+        tweet_count=len(new_tweets),
+        rankable_count=len(rankable_items),
+    )
+    return rankable_items
+
+
+def _current_day_ordinal() -> int:
+    """Return today's day count since the Unix epoch (UTC) for X handle rotation.
+
+    A monotonically increasing per-day integer so :func:`lib.bird_x.fetch_new_tweets`'s
+    round-robin rotation advances every day, widening handle coverage across runs.
+
+    Returns:
+        The number of whole days since 1970-01-01 (UTC).
+    """
+    return (datetime.now(timezone.utc).date() - date(1970, 1, 1)).days
 
 
 def run_stage6_rank_and_tier(items: list[RankableItem], config: OrbitConfig) -> list[TieredItem]:
@@ -369,20 +512,31 @@ def run_pipeline(depth: str) -> int:
         )
         return 1
 
-    # Stages 1-2 (delta fetch + classify/chapterize) are still upstream stubs — the
-    # real producers land in a later phase. They yield NO rankable items yet, so a
-    # bare CLI run ranks+renders an empty (but valid) digest. The Stage 6->7 code
-    # below is REAL and runs on whatever items the upstream provides.
+    # The YouTube delta-fetch + classify/chapterize half (Stages 1-2 for YouTube) is
+    # still an upstream stub — its real producer lands in a later phase. It yields NO
+    # rankable items yet. The X half's Stage 1 (delta + classify + build) IS real this
+    # phase, but classification needs a live LLM boundary that does not exist in this
+    # build env (the default fails loud, Rule 12). A bare CLI run therefore cannot
+    # classify, so it logs the upstream stubs and ranks+renders whatever non-classified
+    # items exist (currently none). The unified merge + X Stage-1 path is exercised
+    # end-to-end by the integration test, which injects a mock LLM + mock X delta.
     for stage_name in _STUBBED_UPSTREAM_STAGES:
         log.log_warning(
             "stage_not_yet_implemented",
             stage=stage_name,
             depth=depth,
-            detail="Upstream producer (delta fetch / classify+chapterize) lands in a later phase.",
+            detail=(
+                "Upstream producer (YouTube delta fetch / classify+chapterize) lands in a "
+                "later phase; the X Stage-1 path is wired but needs a runtime LLM classifier."
+            ),
         )
 
-    # Stage 6->7 (rank + render) — REAL this phase (Phase 3 / M1's render half).
-    rankable_items: list[RankableItem] = []  # upstream stubbed; empty until a later phase
+    # Stage 6->7 (rank + render) — REAL this phase. The unified stream merges YouTube
+    # uploads (stubbed-empty in a bare run) with X tweet RankableItems; both flow
+    # through the SAME rank/tier/render (the M2 unified-digest seam).
+    youtube_items: list[RankableItem] = []  # upstream stubbed; empty until a later phase
+    x_items: list[RankableItem] = []  # needs a runtime LLM classifier; empty in a bare CLI run
+    rankable_items = youtube_items + x_items
     tiered_items = run_stage6_rank_and_tier(rankable_items, config)
     written_paths = run_stage7_render(tiered_items, config)
 
