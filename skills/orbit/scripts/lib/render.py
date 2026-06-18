@@ -300,23 +300,242 @@ def _split_grouped_for_spill(
     return page1_grouped, page2_grouped
 
 
-def _build_body(grouped: dict[str, list[TieredItem]], *, item_count: int, creator_count: int) -> str:
-    """Assemble one page's body markup from a grouped dict (TL;DR + cards + index).
+def _trending_deep_link(trending_item: Any, items_by_id: dict[str, Any]) -> str:
+    """Resolve the deep-link for a trending/scoop entry (source-aware, reuse the card link).
+
+    Prefers the rankable item resolved by ``item_external_id`` (so an X item links to its
+    x.com card and a YouTube item to its ``watch?v=ID&t=0s`` fallback via
+    :func:`_card_deep_link` — the SAME deep-link logic the cards use). Falls back to the
+    trending entry's own ``card_url`` (the right-rail hook), then to a YouTube
+    ``watch?v=ID&t=0s`` built from the id. Empty id and no card_url -> ``"#"`` (the
+    renderer never invents a link).
+
+    Args:
+        trending_item: A :class:`lib.trending.TrendingItem` (``item_external_id`` /
+            ``card_url``).
+        items_by_id: Map of ``item_external_id`` -> :class:`lib.rerank.RankableItem` so
+            the trending entry can reuse the card's exact deep-link.
+
+    Returns:
+        The deep-link URL string (allowlist-checked + escaped at render time).
+    """
+    item_external_id = str(getattr(trending_item, "item_external_id", "") or "")
+    resolved_item = items_by_id.get(item_external_id)
+    if resolved_item is not None:
+        return _card_deep_link(resolved_item)
+    card_url = str(getattr(trending_item, "card_url", "") or "")
+    if card_url:
+        return card_url
+    if item_external_id:
+        return f"https://www.youtube.com/watch?v={item_external_id}&t=0s"
+    return "#"
+
+
+def _render_overlap_block(clusters: list[Any], items_by_id: dict[str, Any]) -> str:
+    """Render the "Everyone's talking about" overlap block (Sub-phase 1 clusters).
+
+    Renders ONLY clusters that actually represent an overlap worth surfacing — those
+    with a merged short body (>= 2 short members) OR at least one long-form cross-link
+    (a short reaction matched against an episode). Singleton clusters (one lone item,
+    no cross-links) are skipped so the block is the genuine "everyone's talking about"
+    set, not every item again. Each cluster shows its representative headline (linked
+    to the representative item's deep-link) plus, for every long-form episode on the
+    topic, a chapter deep-link into the relevant moment (the never-shred cross-link).
+    Returns ``""`` when no cluster qualifies (section absent — no empty container).
+
+    Args:
+        clusters: Sub-phase 1's :class:`lib.cluster.Cluster` list.
+        items_by_id: Map of ``item_external_id`` -> :class:`lib.rerank.RankableItem`
+            (for the representative headline + its deep-link).
+
+    Returns:
+        A ``<section class="overlap-block">...</section>`` string, or ``""`` if empty.
+    """
+    blocks: list[str] = []
+    for cluster in clusters:
+        member_item_ids = list(getattr(cluster, "member_item_ids", []) or [])
+        cross_links = list(getattr(cluster, "cross_links", []) or [])
+        # Reason: only surface a genuine overlap — a merged body (2+ short members) or a
+        # short<->long cross-link. A lone singleton is already on the page as a card.
+        if len(member_item_ids) < 2 and not cross_links:
+            continue
+
+        representative_id = str(getattr(cluster, "representative_item_id", "") or "")
+        representative_item = items_by_id.get(representative_id)
+        headline = (getattr(representative_item, "title", "") or representative_id) if representative_item else representative_id
+        headline_link = html_render.render_link(
+            _card_deep_link(representative_item) if representative_item else f"https://www.youtube.com/watch?v={representative_id}&t=0s",
+            headline,
+            css_class="overlap-headline",
+        )
+
+        member_count = len(member_item_ids)
+        convergence = int(getattr(cluster, "source_diversity", 0) or 0)
+        meta = f"{member_count} posts · {convergence} creators" if member_count else f"{convergence} creators"
+
+        cross_link_html = ""
+        if cross_links:
+            cross_link_items = [
+                "<li>"
+                + html_render.render_link(
+                    str(getattr(cross_link, "chapter_deep_link", "") or ""),
+                    f"{html_render._format_timestamp(float(getattr(cross_link, 'chapter_start_seconds', 0.0) or 0.0))} "
+                    f"{getattr(cross_link, 'chapter_title', '') or 'episode'}",
+                    css_class="overlap-crosslink",
+                )
+                + "</li>"
+                for cross_link in cross_links
+            ]
+            cross_link_html = '<ul class="overlap-crosslinks">' + "".join(cross_link_items) + "</ul>"
+
+        blocks.append(
+            '<article class="overlap-cluster">'
+            f'<div class="overlap-topic">{headline_link}</div>'
+            f'<div class="overlap-meta">{html_render.escape(meta)}</div>'
+            f"{cross_link_html}"
+            "</article>"
+        )
+
+    if not blocks:
+        return ""
+    heading = '<h2 class="section-heading">Everyone\'s talking about</h2>'
+    return f'<section class="overlap-block">{heading}{"".join(blocks)}</section>'
+
+
+def _render_trending_rail(trending_items: list[Any], items_by_id: dict[str, Any]) -> str:
+    """Render the right-rail internal-trending list, tagged corroborated-vs-scoop.
+
+    Each entry is the trending headline linked to its item/chapter deep-link, with a
+    tag badge: ``scoop`` (your network first), ``corroborated`` (also big outside), or
+    none (untagged). The list is assumed already velocity-descending (as
+    :func:`lib.trending.compute_internal_trending` returns it). Returns ``""`` when the
+    list is empty (section absent).
+
+    Args:
+        trending_items: The :class:`lib.trending.TrendingItem` list.
+        items_by_id: Map of ``item_external_id`` -> :class:`lib.rerank.RankableItem`
+            for the deep-link.
+
+    Returns:
+        An ``<aside class="trending-rail">...</aside>`` string, or ``""`` if empty.
+    """
+    rows: list[str] = []
+    for trending_item in trending_items:
+        headline = getattr(trending_item, "title", "") or getattr(trending_item, "item_external_id", "") or "Trending"
+        link = html_render.render_link(
+            _trending_deep_link(trending_item, items_by_id),
+            headline,
+            css_class="trending-link",
+        )
+        tag = str(getattr(trending_item, "corroboration_tag", "") or "")
+        is_scoop = bool(getattr(trending_item, "is_scoop", False))
+        # Reason: a scoop badge is louder than the corroboration tag — show scoop when set.
+        if is_scoop:
+            badge = '<span class="trending-tag tag-scoop">scoop</span>'
+        elif tag:
+            badge = f'<span class="trending-tag tag-{html_render.escape(tag)}">{html_render.escape(tag)}</span>'
+        else:
+            badge = ""
+        rows.append(f'<li class="trending-row">{link}{badge}</li>')
+
+    if not rows:
+        return ""
+    heading = '<h2 class="section-heading">Trending in your network</h2>'
+    return f'<aside class="trending-rail">{heading}<ul class="trending-list">' + "".join(rows) + "</ul></aside>"
+
+
+def _render_scoops_strip(scoops: list[Any], items_by_id: dict[str, Any]) -> str:
+    """Render the LOUD scoops strip — dormant-account acceleration, flagged prominently.
+
+    The brief's highest-value signal gets its own top-of-body strip. Each scoop shows a
+    loud flag plus the headline linked to its item/chapter deep-link. Returns ``""``
+    when there are no scoops (section absent — never fabricated).
+
+    Args:
+        scoops: The :class:`lib.trending.TrendingItem` list flagged by
+            :func:`lib.external_trending.detect_scoops`.
+        items_by_id: Map of ``item_external_id`` -> :class:`lib.rerank.RankableItem`
+            for the deep-link.
+
+    Returns:
+        A ``<section class="scoops-strip">...</section>`` string, or ``""`` if empty.
+    """
+    rows: list[str] = []
+    for scoop in scoops:
+        headline = getattr(scoop, "title", "") or getattr(scoop, "item_external_id", "") or "Scoop"
+        link = html_render.render_link(
+            _trending_deep_link(scoop, items_by_id),
+            headline,
+            css_class="scoop-link",
+        )
+        rows.append(f'<li class="scoop-row"><span class="scoop-flag">SCOOP</span> {link}</li>')
+
+    if not rows:
+        return ""
+    heading = '<h2 class="section-heading scoops-heading">⚡ Scoops — your network first</h2>'
+    return f'<section class="scoops-strip">{heading}<ul class="scoops-list">' + "".join(rows) + "</ul></section>"
+
+
+def _build_body(
+    grouped: dict[str, list[TieredItem]],
+    *,
+    item_count: int,
+    creator_count: int,
+    overlap_html: str = "",
+    trending_html: str = "",
+    scoops_html: str = "",
+) -> str:
+    """Assemble one page's body markup from a grouped dict (TL;DR + M3 sections + cards + index).
+
+    Layout order (design brief §3): TL;DR, then the LOUD scoops strip (top, the
+    highest-value signal), then the "Everyone's talking about" overlap block, then the
+    main cards, the right-rail trending list, and finally the "they also posted" index
+    strip. The three M3 sections (``scoops_html`` / ``overlap_html`` / ``trending_html``)
+    are pre-rendered by the caller and passed in; each is ``""`` (and so omitted) when
+    its source data was not supplied — so the M1/M2 path (no clusters/trending/scoops)
+    renders EXACTLY as before (DoD #4 regression).
 
     Args:
         grouped: A (possibly spill-split) :func:`group_items_by_tier`-shaped dict.
         item_count: Episode count for THIS page's TL;DR header.
         creator_count: Distinct-creator count for THIS page's TL;DR header.
+        overlap_html: Pre-rendered overlap block (``""`` when absent — M1 path).
+        trending_html: Pre-rendered right-rail trending list (``""`` when absent).
+        scoops_html: Pre-rendered scoops strip (``""`` when absent).
 
     Returns:
-        The ``<main>`` body markup (TL;DR + main cards + index strip; absent
-        sections omitted). Scoops strip + right-rail trending are M3 — rendered
-        absent in M1 (design brief §3 / §6); we emit nothing rather than fabricate.
+        The ``<main>`` body markup (absent sections omitted).
     """
     tldr_html = html_render.render_tldr(episode_count=item_count, creator_count=creator_count)
     main_cards_html = _render_main_cards_section(grouped)
     index_html = _render_index_section(grouped)
-    return "\n".join(part for part in (tldr_html, main_cards_html, index_html) if part)
+    return "\n".join(
+        part
+        for part in (tldr_html, scoops_html, overlap_html, main_cards_html, trending_html, index_html)
+        if part
+    )
+
+
+def _items_by_id_from_tiered(tiered_items: list[TieredItem]) -> dict[str, Any]:
+    """Index the tiered batch by ``item_external_id`` for the M3 deep-link resolution.
+
+    The M3 sections (overlap / trending / scoops) reference items by id; this lets them
+    reuse the SAME :func:`_card_deep_link` the cards use (source-aware: x.com card_url
+    else the YouTube fallback). Pure indexing, no I/O.
+
+    Args:
+        tiered_items: The tiered batch.
+
+    Returns:
+        A ``item_external_id`` -> :class:`lib.rerank.RankableItem` map.
+    """
+    items_by_id: dict[str, Any] = {}
+    for tiered_item in tiered_items:
+        item = tiered_item.scored_item.item
+        item_external_id = str(getattr(item, "item_external_id", "") or "")
+        if item_external_id:
+            items_by_id[item_external_id] = item
+    return items_by_id
 
 
 def render_digest_pages(
@@ -324,6 +543,9 @@ def render_digest_pages(
     config: Any = None,
     *,
     page_2_href: str = DEFAULT_PAGE_2_FILENAME,
+    clusters: list[Any] | None = None,
+    trending_items: list[Any] | None = None,
+    scoops: list[Any] | None = None,
 ) -> list[str]:
     """Render the digest into one or two self-contained HTML pages (Stage 7b).
 
@@ -335,6 +557,12 @@ def render_digest_pages(
     spilled item goes to page 2 even if page 2 itself would overflow the budget
     (Orbit never produces a page 3).
 
+    The three M3 sections render on PAGE 1 (the screen the user opens first), built from
+    the OPTIONAL ``clusters`` / ``trending_items`` / ``scoops`` args. When all three are
+    None/empty — the M1/M2 path — every section is ``""`` (omitted), so page 1 is
+    byte-for-byte the M1 page (DoD #4 regression). Their deep-links reuse the cards'
+    source-aware :func:`_card_deep_link`, resolved against the page's items.
+
     Rank controls density, never inclusion: nothing is dropped on either path.
 
     Args:
@@ -344,6 +572,13 @@ def render_digest_pages(
             ``digest_title`` page-title override.
         page_2_href: The href page 1 links to for the spilled content. orbit.py writes
             page 2 to a file of this name beside page 1.
+        clusters: OPTIONAL Sub-phase 1 :class:`lib.cluster.Cluster` list for the
+            "Everyone's talking about" overlap block. None/empty -> block absent.
+        trending_items: OPTIONAL :class:`lib.trending.TrendingItem` list (velocity
+            ranked, tagged) for the right-rail. None/empty -> rail absent.
+        scoops: OPTIONAL :class:`lib.trending.TrendingItem` list from
+            :func:`lib.external_trending.detect_scoops` for the loud scoops strip. None/empty ->
+            strip absent.
 
     Returns:
         ``[page1_html]`` (fits) or ``[page1_html, page2_html]`` (spilled).
@@ -353,11 +588,21 @@ def render_digest_pages(
     estimated_height_px = estimate_page_height(tiered_items)
     spilled = estimated_height_px > PAGE_1_BUDGET_PX
 
+    # Reason: build the three M3 sections ONCE; each is "" when its source is absent
+    # (the M1/M2 path), so the body composition is unchanged for the existing tests.
+    items_by_id = _items_by_id_from_tiered(tiered_items)
+    overlap_html = _render_overlap_block(clusters or [], items_by_id)
+    trending_html = _render_trending_rail(trending_items or [], items_by_id)
+    scoops_html = _render_scoops_strip(scoops or [], items_by_id)
+
     if not spilled:
         body_html = _build_body(
             grouped,
             item_count=len(tiered_items),
             creator_count=_count_distinct_creators(tiered_items),
+            overlap_html=overlap_html,
+            trending_html=trending_html,
+            scoops_html=scoops_html,
         )
         pages = [html_render.wrap_page(page_title, body_html)]
     else:
@@ -369,10 +614,14 @@ def render_digest_pages(
             page1_grouped,
             item_count=len(page1_items),
             creator_count=_count_distinct_creators(page1_items),
+            overlap_html=overlap_html,
+            trending_html=trending_html,
+            scoops_html=scoops_html,
         )
         # Reason: the spill link goes AFTER the page-1 cards so the reader hits it
         # once they've exhausted the Hero/Standard band.
         page1_body = f"{page1_body}\n{_render_continued_link(page_2_href)}"
+        # Reason: page 2 is the low-tier overflow only — the M3 sections live on page 1.
         page2_body = _build_body(
             page2_grouped,
             item_count=len(page2_items),
@@ -398,7 +647,14 @@ def render_digest_pages(
     return pages
 
 
-def render_digest_html(tiered_items: list[TieredItem], config: Any = None) -> str:
+def render_digest_html(
+    tiered_items: list[TieredItem],
+    config: Any = None,
+    *,
+    clusters: list[Any] | None = None,
+    trending_items: list[Any] | None = None,
+    scoops: list[Any] | None = None,
+) -> str:
     """Render the tiered items into ONE self-contained HTML digest page (Stage 7a/b).
 
     Backwards-compatible single-string entry point: returns PAGE 1 of
@@ -407,12 +663,14 @@ def render_digest_html(tiered_items: list[TieredItem], config: Any = None) -> st
     the "Continued on page 2 →" link — but only page 1's string (the caller that needs
     the page-2 file uses :func:`render_digest_pages`, which orbit.py wires).
 
-    Assembles the design-brief layout: TL;DR header, (empty/absent scoops strip),
-    Hero/Standard full cards WITH deep-link chapter lists, Compact rows, (empty/absent
-    right-rail trending), and the bottom "they also posted" Index strip. Every card
-    links to its whole-video ``watch?v=ID&t=0s`` and every chapter to its
-    ``chapter.deep_link`` (``watch?v=ID&t=Ns``). Every user-controlled string is
-    escaped and every href allowlist-checked inside :mod:`lib.html_render`.
+    Assembles the design-brief layout: TL;DR header, the (M3) scoops strip + overlap
+    block, Hero/Standard full cards WITH deep-link chapter lists, Compact rows, the (M3)
+    right-rail trending list, and the bottom "they also posted" Index strip. The three
+    M3 sections render only when their optional source data is supplied — with none
+    supplied (the M1/M2 path) the page is byte-for-byte the M1 page. Every card links to
+    its whole-video ``watch?v=ID&t=0s`` and every chapter to its ``chapter.deep_link``;
+    every user-controlled string is escaped and every href allowlist-checked inside
+    :mod:`lib.html_render`.
 
     Rank controls density, never inclusion: every tiered item appears somewhere
     (Hero as a big card down to Index as a one-line entry); nothing is dropped. An
@@ -423,6 +681,9 @@ def render_digest_html(tiered_items: list[TieredItem], config: Any = None) -> st
             :func:`lib.density.assign_density_tiers` (already rank-ordered + tiered).
         config: An optional :class:`lib.config.OrbitConfig` — read for an optional
             ``digest_title`` page-title override. None / missing -> the default title.
+        clusters: OPTIONAL Sub-phase 1 clusters for the overlap block (None -> absent).
+        trending_items: OPTIONAL trending list for the right-rail (None -> absent).
+        scoops: OPTIONAL detected scoops for the scoops strip (None -> absent).
 
     Returns:
         The complete ``<!DOCTYPE html>...`` page-1 string of the digest.
@@ -431,4 +692,10 @@ def render_digest_html(tiered_items: list[TieredItem], config: Any = None) -> st
         >>> render_digest_html([]).startswith("<!DOCTYPE html>")  # doctest: +SKIP
         True
     """
-    return render_digest_pages(tiered_items, config)[0]
+    return render_digest_pages(
+        tiered_items,
+        config,
+        clusters=clusters,
+        trending_items=trending_items,
+        scoops=scoops,
+    )[0]

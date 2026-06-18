@@ -494,6 +494,7 @@ def score_item(
     *,
     creator_baselines: Optional[dict[str, float]] = None,
     reference_date: Optional[date] = None,
+    trending_multipliers: Optional[dict[str, float]] = None,
 ) -> float:
     """Score one item with Orbit's deterministic weighted derank formula (Rule 5).
 
@@ -525,6 +526,15 @@ def score_item(
             == 0 — neutral for a lone item).
         reference_date: "Now" for recency decay (defaults to today UTC; injectable
             for deterministic tests).
+        trending_multipliers: OPTIONAL map of ``item_external_id`` -> trending/scoop
+            multiplier (M3 / Phase 5 Sub-phase 4). Looks the item up by its
+            ``item_external_id``; an item present in the map is multiplied by its
+            (> 1.0) factor so a scoop/trending item's score rises ABOVE an otherwise
+            identical non-scoop one. When None or the item is absent, the multiplier
+            falls back to :data:`TRENDING_MULTIPLIER_NEUTRAL` (1.0) — so the M1/M2
+            scoring path is byte-for-byte unchanged. The map is built by
+            :func:`lib.external_trending.build_trending_multiplier_map` (kept out of this module
+            so rerank stays trending-agnostic — it consumes whatever map it is given).
 
     Returns:
         The item's derank score as a float.
@@ -553,8 +563,16 @@ def score_item(
 
     recency = recency_decay(item.upload_date, reference_date=reference_date)
 
+    # Reason: the M3 trending/scoop multiplier replaces the neutral 1.0 no-op for items
+    # present in the injected map; everything else keeps TRENDING_MULTIPLIER_NEUTRAL so
+    # the M1/M2 score is unchanged when no map is passed (DoD #4 regression).
+    if trending_multipliers:
+        trending_multiplier = float(trending_multipliers.get(item.item_external_id, TRENDING_MULTIPLIER_NEUTRAL))
+    else:
+        trending_multiplier = TRENDING_MULTIPLIER_NEUTRAL
+
     intrinsic = UNIQUENESS_BASELINE_BOOST + RELATIVE_ENGAGEMENT_WEIGHT * relative_engagement + RECENCY_WEIGHT * recency
-    score = priority_weight * CLUSTER_SIZE_NEUTRAL * TRENDING_MULTIPLIER_NEUTRAL * intrinsic
+    score = priority_weight * CLUSTER_SIZE_NEUTRAL * trending_multiplier * intrinsic
 
     log.log_debug(
         "rerank_scored_item",
@@ -563,6 +581,7 @@ def score_item(
         priority_weight=priority_weight,
         relative_engagement=round(relative_engagement, 4),
         recency_decay=round(recency, 4),
+        trending_multiplier=round(trending_multiplier, 4),
         score=round(score, 4),
     )
     return score
@@ -573,6 +592,7 @@ def derank_items(
     config: Any,
     *,
     reference_date: Optional[date] = None,
+    trending_multipliers: Optional[dict[str, float]] = None,
 ) -> list[ScoredItem]:
     """Score every item and return them sorted DESCENDING by score (nothing dropped).
 
@@ -587,6 +607,9 @@ def derank_items(
         config: An :class:`lib.config.OrbitConfig` (read for ``creator_weights``).
         reference_date: "Now" for recency decay (defaults to today UTC; injectable
             for deterministic tests).
+        trending_multipliers: OPTIONAL ``item_external_id`` -> trending/scoop
+            multiplier map (M3). Passed through to :func:`score_item`. None (the M1/M2
+            path) leaves every multiplier neutral, so ranking is unchanged (DoD #4).
 
     Returns:
         The :class:`ScoredItem`s sorted descending by score (``len`` == ``len(items)``).
@@ -614,6 +637,7 @@ def derank_items(
                 config,
                 creator_baselines=creator_baselines,
                 reference_date=reference_date,
+                trending_multipliers=trending_multipliers,
             ),
         )
         for item in items

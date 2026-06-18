@@ -466,6 +466,61 @@ a:hover { text-decoration: underline; }
 .index-list { list-style: none; margin: 0; padding: 0; }
 .index-line { padding: 5px 0; font-size: 0.9rem; border-bottom: 1px solid var(--border); }
 .index-line .channel { color: var(--muted); }
+/* M3 sections (Phase 5): scoops strip, overlap block, right-rail trending. */
+.scoops-strip {
+  margin: 0 0 24px;
+  padding: 14px 18px;
+  background: var(--surface-2);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+}
+.scoops-heading { margin-top: 0; color: var(--accent); }
+.scoops-list { list-style: none; margin: 0; padding: 0; }
+.scoop-row { padding: 6px 0; font-weight: 600; }
+.scoop-flag {
+  display: inline-block;
+  font-size: 0.65rem;
+  letter-spacing: 0.08em;
+  background: var(--accent);
+  color: var(--bg);
+  padding: 2px 7px;
+  border-radius: 4px;
+  margin-right: 8px;
+  vertical-align: middle;
+}
+.overlap-block { margin: 0 0 24px; }
+.overlap-cluster {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 16px;
+  margin-bottom: 12px;
+}
+.overlap-topic { font-weight: 600; font-size: 1.05rem; }
+.overlap-meta { color: var(--muted); font-size: 0.85rem; margin-top: 2px; }
+.overlap-crosslinks { list-style: none; margin: 8px 0 0; padding: 0; border-top: 1px solid var(--border); }
+.overlap-crosslinks li { padding: 4px 0; }
+.trending-rail {
+  margin: 0 0 24px;
+  padding: 12px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.trending-list { list-style: none; margin: 0; padding: 0; }
+.trending-row { padding: 6px 0; display: flex; gap: 8px; align-items: baseline; justify-content: space-between; }
+.trending-tag {
+  flex: 0 0 auto;
+  font-size: 0.65rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.trending-tag.tag-scoop { color: var(--accent); border-color: var(--accent); }
+.trending-tag.tag-corroborated { color: var(--text); }
 """
 
 
