@@ -1,0 +1,18 @@
+# OpenMemory - IDE/Assistant specific rules
+.cursor/rules/openmemory.mdc
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.sqlite
+*.sqlite3
+*.db
+.env
+.env.*
+!.env.example
+node_modules/
+*.log
+.DS_Store
+# generated Orbit output
+out/
+*.orbit.html
