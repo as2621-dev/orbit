@@ -1,0 +1,290 @@
+diff --git a/skills/orbit/scripts/orbit.py b/skills/orbit/scripts/orbit.py
+index c375321..dd82fe0 100644
+--- a/skills/orbit/scripts/orbit.py
++++ b/skills/orbit/scripts/orbit.py
+@@ -18,7 +18,7 @@ import os
+ import sys
+ from datetime import date, datetime, timezone
+ from pathlib import Path
+-from typing import Callable, Optional
++from typing import Any, Callable, Optional
+ 
+ # Make ``lib`` importable when this script is run directly (e.g.
+ # ``python3 skills/orbit/scripts/orbit.py``). Mirrors the last30days reference so
+@@ -29,9 +29,16 @@ import store  # noqa: E402  (import must follow the sys.path insert above)
+ from lib import bird_x, classify, log, render  # noqa: E402
+ from lib.bird_x import Follow, Tweet, XAuthError  # noqa: E402
+ from lib.classify import LlmClassifier, _default_llm_classifier  # noqa: E402
++from lib.cluster import Cluster, cluster_overlaps  # noqa: E402
+ from lib.config import OrbitConfig, load_config  # noqa: E402
+ from lib.density import TieredItem, assign_density_tiers  # noqa: E402
++from lib.external_trending import (  # noqa: E402
++    build_trending_multiplier_map,
++    detect_scoops,
++    tag_external_corroboration,
++)
+ from lib.rerank import RankableItem, derank_items  # noqa: E402
++from lib.trending import TrendingItem, compute_internal_trending  # noqa: E402
+ from lib.youtube_yt import (  # noqa: E402
+     Subscription,
+     YouTubeAuthError,
+@@ -387,7 +394,81 @@ def _current_day_ordinal() -> int:
+     return (datetime.now(timezone.utc).date() - date(1970, 1, 1)).days
+ 
+ 
+-def run_stage6_rank_and_tier(items: list[RankableItem], config: OrbitConfig) -> list[TieredItem]:
++def run_stage5_overlap_trending_scoops(
++    items: list[RankableItem],
++    config: OrbitConfig,
++    *,
++    store_module: Any = store,
++    search_fn: Optional[Callable[[str], list[Any]]] = None,
++) -> tuple[list[Cluster], list[TrendingItem], list[TrendingItem], dict[str, float]]:
++    """Stage 5 (M3): cluster overlaps -> internal trending -> external tag -> scoops.
++
++    The M3 seam, run BETWEEN classify (Stage 2) and rank (Stage 6). Pure wiring (Rule 5:
++    all logic lives in lib/): it sequences the four deterministic lib functions and
++    returns their outputs for Stage 6 (the trending/scoop multiplier map) and Stage 7
++    (the three render sections):
++
++      1. :func:`lib.cluster.cluster_overlaps` — short-merge / long-cross-link clusters.
++      2. :func:`lib.trending.compute_internal_trending` — baseline-relative velocity
++         (reads the injected ``store_module`` only for each creator's ``seen``-history
++         DEPTH — the dormancy signal — never engagement).
++      3. :func:`lib.external_trending.tag_external_corroboration` — bounded keyless
++         cross-search tagging corroborated-vs-scoop, throttled by ``config.depth``. When
++         ``search_fn`` is None the lib default keyless search is used; tests inject a
++         fake so no live web call is made.
++      4. :func:`lib.external_trending.detect_scoops` — dormant-account acceleration, the
++         loud scoops strip — plus
++         :func:`lib.external_trending.build_trending_multiplier_map` for the rerank boost.
++
++    Empty ``items`` returns ``([], [], [], {})`` — the M1/M2 quiet path produces no M3
++    sections and a neutral multiplier map, so rank+render are byte-for-byte unchanged.
++
++    Args:
++        items: The unified classified :class:`RankableItem` stream.
++        config: The loaded :class:`OrbitConfig` (``creator_weights`` for representatives,
++            ``depth`` for the cross-search budget).
++        store_module: The store module/object for the history-depth lookup (injectable;
++            defaults to :mod:`store`).
++        search_fn: OPTIONAL keyless cross-search ``(query) -> list``; None uses the lib
++            default. Tests inject a fake so no live web call fires.
++
++    Returns:
++        ``(clusters, trending_items, scoops, trending_multipliers)``.
++    """
++    if not items:
++        log.log_info("overlap_trending_scoops_completed", cluster_count=0, trending_count=0, scoop_count=0)
++        return [], [], [], {}
++
++    clusters = cluster_overlaps(items, config)
++    items_by_id = {str(item.item_external_id): item for item in items if item.item_external_id}
++    trending_items = compute_internal_trending(clusters, items_by_id, store_module)
++
++    # Reason: external corroboration is bounded by the user's depth throttle (CSO). The
++    # search_fn defaults to the lib keyless search; tests inject a fake to stay offline.
++    if search_fn is not None:
++        tag_external_corroboration(trending_items, search_fn=search_fn, depth=config.depth)
++    else:
++        tag_external_corroboration(trending_items, depth=config.depth)
++
++    scoops = detect_scoops(trending_items)
++    trending_multipliers = build_trending_multiplier_map(trending_items)
++
++    log.log_info(
++        "overlap_trending_scoops_completed",
++        cluster_count=len(clusters),
++        trending_count=len(trending_items),
++        scoop_count=len(scoops),
++        multiplier_count=len(trending_multipliers),
++    )
++    return clusters, trending_items, scoops, trending_multipliers
++
++
++def run_stage6_rank_and_tier(
++    items: list[RankableItem],
++    config: OrbitConfig,
++    *,
++    trending_multipliers: Optional[dict[str, float]] = None,
++) -> list[TieredItem]:
+     """Stage 6: score the rankable items, then sort them into density tiers.
+ 
+     Pure delegation to ``lib.rerank.derank_items`` (weighted score, descending) then
+@@ -398,11 +479,14 @@ def run_stage6_rank_and_tier(items: list[RankableItem], config: OrbitConfig) ->
+     Args:
+         items: The :class:`RankableItem`s from the (upstream) classify/chapterize half.
+         config: The loaded :class:`OrbitConfig` (supplies ``creator_weights``).
++        trending_multipliers: OPTIONAL ``item_external_id`` -> trending/scoop multiplier
++            map from Stage 5 (M3). None (the M1/M2 path) leaves every multiplier neutral,
++            so ranking is byte-for-byte unchanged.
+ 
+     Returns:
+         The tiered, rank-ordered items ready for the renderer.
+     """
+-    scored_items = derank_items(items, config)
++    scored_items = derank_items(items, config, trending_multipliers=trending_multipliers)
+     tiered_items = assign_density_tiers(scored_items)
+     log.log_info("rank_and_tier_completed", item_count=len(tiered_items))
+     return tiered_items
+@@ -444,6 +528,9 @@ def run_stage7_render(
+     *,
+     html_path: Optional[Path] = None,
+     writer: Callable[[Path, str], None] = _default_html_writer,
++    clusters: Optional[list[Cluster]] = None,
++    trending_items: Optional[list[TrendingItem]] = None,
++    scoops: Optional[list[TrendingItem]] = None,
+ ) -> list[Path]:
+     """Stage 7: render the tiered items to HTML and write page 1 (and page 2 if spilled).
+ 
+@@ -467,7 +554,14 @@ def run_stage7_render(
+     page_1_path = html_path if html_path is not None else _resolve_html_path(config)
+     page_2_path = page_1_path.parent / render.DEFAULT_PAGE_2_FILENAME
+ 
+-    pages = render.render_digest_pages(tiered_items, config, page_2_href=render.DEFAULT_PAGE_2_FILENAME)
++    pages = render.render_digest_pages(
++        tiered_items,
++        config,
++        page_2_href=render.DEFAULT_PAGE_2_FILENAME,
++        clusters=clusters,
++        trending_items=trending_items,
++        scoops=scoops,
++    )
+ 
+     written_paths: list[Path] = [page_1_path]
+     writer(page_1_path, pages[0])
+@@ -537,8 +631,21 @@ def run_pipeline(depth: str) -> int:
+     youtube_items: list[RankableItem] = []  # upstream stubbed; empty until a later phase
+     x_items: list[RankableItem] = []  # needs a runtime LLM classifier; empty in a bare CLI run
+     rankable_items = youtube_items + x_items
+-    tiered_items = run_stage6_rank_and_tier(rankable_items, config)
+-    written_paths = run_stage7_render(tiered_items, config)
++
++    # Stage 5 (M3) — cluster overlaps, compute baseline-relative trending, tag external
++    # corroboration vs scoop, detect dormant-account scoops. Feeds the trending/scoop
++    # multiplier into rank and the three M3 sections into render. On the bare CLI run
++    # rankable_items is empty, so this yields no clusters/trending/scoops and a neutral
++    # multiplier map (the M1/M2 path is unchanged).
++    clusters, trending_items, scoops, trending_multipliers = run_stage5_overlap_trending_scoops(
++        rankable_items, config
++    )
++    tiered_items = run_stage6_rank_and_tier(
++        rankable_items, config, trending_multipliers=trending_multipliers
++    )
++    written_paths = run_stage7_render(
++        tiered_items, config, clusters=clusters, trending_items=trending_items, scoops=scoops
++    )
+ 
+     log.log_info(
+         "pipeline_completed",
+diff --git a/tests/test_scoops_and_render.py b/tests/test_scoops_and_render.py
+index 3a794db..f431286 100644
+--- a/tests/test_scoops_and_render.py
++++ b/tests/test_scoops_and_render.py
+@@ -34,9 +34,11 @@ from types import SimpleNamespace
+ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "orbit" / "scripts"
+ sys.path.insert(0, str(SCRIPTS_DIR))
+ 
++import orbit  # noqa: E402
+ from lib import render  # noqa: E402
+ from lib.chapterize import Chapter  # noqa: E402
+ from lib.cluster import Cluster  # noqa: E402
++from lib.config import OrbitConfig  # noqa: E402
+ from lib.density import TIER_HERO, TIER_STANDARD, TieredItem  # noqa: E402
+ from lib.external_trending import build_trending_multiplier_map, detect_scoops  # noqa: E402
+ from lib.fusion import CrossLink  # noqa: E402
+@@ -277,3 +279,94 @@ def test_no_m3_data_renders_m1_page_without_new_sections() -> None:
+     # The M1 spine is still there.
+     assert 'class="card hero"' in output_html
+     assert 'class="tldr"' in output_html
++
++
++# --- Authorized-divergence wiring: orbit.py Stage 5 invokes M3 end-to-end ------
++
++
++def _classified_rankable(
++    item_external_id: str,
++    *,
++    creator_external_id: str,
++    title: str,
++    view_count: int,
++    like_count: int,
++    comment_count: int,
++) -> RankableItem:
++    """A RankableItem fixture for the Stage-5 wiring test (mocks the Phase 1-2 upstream)."""
++    return RankableItem(
++        item_external_id=item_external_id,
++        title=title,
++        channel_name=creator_external_id,
++        creator_external_id=creator_external_id,
++        view_count=view_count,
++        like_count=like_count,
++        comment_count=comment_count,
++        upload_date="20260101",
++        chapters=[],
++    )
++
++
++def test_orbit_stage5_wires_overlap_trending_scoops_through_rank_and_render(tmp_path: Path) -> None:
++    """orbit.py Stage 5 invokes cluster->trending->scoop and threads it into rank+render (DoD #1/#2/#3 wiring).
++
++    WHY: the phase-level DoD requires the PIPELINE — not just the lib functions — to
++    surface the M3 sections and run the trending/scoop multiplier. This exercises the
++    authorized orbit.py divergence end-to-end with a FAKE store (low seen-history =
++    dormancy) and a FAKE keyless search (zero external results = scoop tag) so NO
++    network/LLM/real-store boundary is touched. The dormant creator's breakout item
++    sits against its own low-engagement siblings, so its batch-median baseline is low
++    and the breakout spikes far above it (dormancy AND acceleration) — flagged a scoop.
++    The test asserts (a) Stage 5 returns a scoop, (b) the scoop's multiplier ranks its
++    item first in Stage 6, and (c) Stage 7 writes a file containing all three M3
++    sections. A regression that failed to wire any of the three threads breaks this.
++    """
++    # Dormant creator UC_dorm: one breakout + two near-identical low-engagement siblings
++    # (same text so they cluster together; the breakout becomes the representative whose
++    # engagement is far above the creator's batch-median baseline).
++    breakout = _classified_rankable(
++        "d1", creator_external_id="UC_dorm", title="Apple M5 chip is insane wow",
++        view_count=500_000, like_count=40_000, comment_count=8_000,
++    )
++    sibling_a = _classified_rankable(
++        "d2", creator_external_id="UC_dorm", title="Apple M5 chip is insane wow",
++        view_count=50, like_count=2, comment_count=0,
++    )
++    sibling_b = _classified_rankable(
++        "d3", creator_external_id="UC_dorm", title="Apple M5 chip is insane wow",
++        view_count=40, like_count=1, comment_count=0,
++    )
++    items = [breakout, sibling_a, sibling_b]
++    config = OrbitConfig(creator_weights={})
++
++    # Fake store: UC_dorm has only 1 prior seen item (dormant, <= the dormancy threshold).
++    fake_store = SimpleNamespace(
++        list_sources=lambda: [{"source_id": 1, "external_id": "UC_dorm"}],
++        get_seen_ids=lambda source_id: {"prior"},
++    )
++    # Fake keyless search: zero external results -> the topic is a scoop (your network first).
++    fake_search = lambda query: []  # noqa: E731
++
++    clusters, trending_items, scoops, trending_multipliers = orbit.run_stage5_overlap_trending_scoops(
++        items, config, store_module=fake_store, search_fn=fake_search
++    )
++
++    # (a) the dormant breakout is flagged a scoop, and its multiplier map is non-neutral.
++    assert clusters, "the near-duplicate items must cluster"
++    assert scoops, "the dormant breakout must be flagged a scoop"
++    assert "d1" in trending_multipliers and trending_multipliers["d1"] > 1.0
++
++    # (b) the scoop multiplier raises the breakout above a plain item in Stage 6 ranking.
++    tiered = orbit.run_stage6_rank_and_tier(items, config, trending_multipliers=trending_multipliers)
++    assert tiered[0].scored_item.item.item_external_id == "d1", "the scoop must rank first via the multiplier"
++
++    # (c) Stage 7 writes a file with all three M3 sections populated.
++    html_path = tmp_path / "out" / "today.html"
++    written = orbit.run_stage7_render(
++        tiered, config, html_path=html_path, clusters=clusters, trending_items=trending_items, scoops=scoops
++    )
++    assert html_path in written and html_path.exists()
++    written_html = html_path.read_text(encoding="utf-8")
++    assert 'class="overlap-block"' in written_html
++    assert 'class="trending-rail"' in written_html
++    assert 'class="scoops-strip"' in written_html
