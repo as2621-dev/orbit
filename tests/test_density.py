@@ -29,9 +29,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Make ``skills/orbit/scripts`` importable so ``from lib import ...`` and ``import
+# Make ``scripts`` importable so ``from lib import ...`` and ``import
 # store`` resolve regardless of the working directory. Mirrors tests/test_rerank.py.
-SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "orbit" / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import store  # noqa: E402

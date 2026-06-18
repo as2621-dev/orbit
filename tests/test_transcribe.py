@@ -28,9 +28,9 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-# Make ``skills/orbit/scripts`` importable so ``from lib import transcribe``
+# Make ``scripts`` importable so ``from lib import transcribe``
 # resolves regardless of the working directory.
-SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "orbit" / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from lib import subproc, transcribe  # noqa: E402

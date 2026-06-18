@@ -8,13 +8,7 @@
       "name": "orbit",
       "source": "./",
       "version": "0.1.0",
-      "description": "A personal daily digest of your own YouTube subscriptions and X follows: delta-fetches new items, classifies signal vs noise and on- vs off-topic, clusters overlaps, flags trending and scoops, and renders a ranked HTML one-pager with deep-links. Cookies-only, runs locally on a cron schedule, optional iMessage delivery. Run /orbit --setup to configure.",
-      "skills": [
-        {
-          "name": "orbit",
-          "path": "skills/orbit"
-        }
-      ]
+      "description": "A personal daily digest of your own YouTube subscriptions and X follows: delta-fetches new items, classifies signal vs noise and on- vs off-topic, clusters overlaps, flags trending and scoops, and renders a ranked HTML one-pager with deep-links. Cookies-only, runs locally on a cron schedule, optional iMessage delivery. Run /orbit --setup to configure."
     }
   ]
 }

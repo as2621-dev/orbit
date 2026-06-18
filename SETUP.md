@@ -15,12 +15,21 @@ It is honest and plain. Read §8.5 in particular — it is not softened.
 /plugin install orbit@orbit
 ```
 
-**Manual / developer (symlink the skill into Claude Code):**
+**Manual / developer (install the local clone as a plugin):**
+
+Orbit is a **single-skill plugin** — the repo root *is* the skill (a `SKILL.md` lives at the
+root, with no `skills/` subdirectory). So you install the clone itself as the plugin, not a
+nested directory. Add the local checkout as a marketplace and install from it:
 
 ```bash
 git clone https://github.com/as2621-dev/orbit.git
-ln -s "$(pwd)/orbit/skills/orbit" ~/.claude/skills/orbit
+# Inside Claude Code, point the marketplace at the local clone, then install:
+#   /plugin marketplace add ./orbit
+#   /plugin install orbit@orbit
 ```
+
+Because the plugin is the single root `SKILL.md`, it installs as the bare `/orbit` command
+(not `/orbit:orbit`).
 
 Then run `/orbit --setup` once (see §8.3) and add the cron line it prints. Three things must
 be in place first: **Python 3.12+**, **Node 22+**, and **`yt-dlp`** on your `PATH`, plus a

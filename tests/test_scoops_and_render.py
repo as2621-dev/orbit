@@ -29,9 +29,9 @@ from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
-# Make ``skills/orbit/scripts`` importable so ``from lib import ...`` resolves
+# Make ``scripts`` importable so ``from lib import ...`` resolves
 # regardless of the working directory. Mirrors tests/test_render.py.
-SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "orbit" / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import orbit  # noqa: E402

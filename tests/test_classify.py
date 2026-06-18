@@ -30,9 +30,9 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
-# Make ``skills/orbit/scripts`` importable so ``import store`` and
+# Make ``scripts`` importable so ``import store`` and
 # ``from lib import classify`` resolve regardless of the working directory.
-SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "orbit" / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import store  # noqa: E402

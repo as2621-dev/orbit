@@ -31,9 +31,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-# Make ``skills/orbit/scripts`` importable so ``from lib import ...`` resolves regardless
+# Make ``scripts`` importable so ``from lib import ...`` resolves regardless
 # of the working directory. Mirrors tests/test_config.py / test_orbit_stage0.py.
-SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "orbit" / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from lib.bird_x import XAuthError  # noqa: E402

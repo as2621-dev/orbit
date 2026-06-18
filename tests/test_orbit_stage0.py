@@ -23,9 +23,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
-# Make ``skills/orbit/scripts`` importable so ``import store`` / ``import orbit`` and
+# Make ``scripts`` importable so ``import store`` / ``import orbit`` and
 # ``from lib import ...`` resolve regardless of the working directory.
-SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "orbit" / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import orbit  # noqa: E402

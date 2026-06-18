@@ -8,7 +8,7 @@ stage. Real Stage 0 (subscription loading), classification, ranking, and render
 land in later sub-phases/phases.
 
 Run directly:
-    python3 skills/orbit/scripts/orbit.py --depth default
+    python3 scripts/orbit.py --depth default
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 # Make ``lib`` importable when this script is run directly (e.g.
-# ``python3 skills/orbit/scripts/orbit.py``). Mirrors the last30days reference so
+# ``python3 scripts/orbit.py``). Mirrors the last30days reference so
 # lifted modules import ``from lib import log, subproc`` unchanged in later phases.
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
 

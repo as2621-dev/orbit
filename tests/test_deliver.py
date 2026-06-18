@@ -27,7 +27,7 @@ from typing import Any, Mapping, Sequence
 import pytest
 
 # Make the skill's scripts dir importable so ``from lib import deliver`` resolves.
-_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "skills" / "orbit" / "scripts"
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 

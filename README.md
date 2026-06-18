@@ -5,7 +5,7 @@ following. It pulls what's new, ranks it by signal, and renders a single HTML on
 so you open one digest instead of ten feeds.
 
 **Full onboarding, the five permissions and why we ask for them, the honest risk disclosure,
-troubleshooting, and a cost estimate live in [`skills/orbit/README.md`](skills/orbit/README.md).**
+troubleshooting, and a cost estimate live in [`SETUP.md`](SETUP.md).**
 Read that before running Orbit.
 
 ## What's shipped
@@ -40,7 +40,7 @@ Read that before running Orbit.
    0 7 * * * cd /path/to/orbit && claude -p "/orbit"
    ```
 
-The full 5-step setup is in [`skills/orbit/README.md`](skills/orbit/README.md) §8.3.
+The full 5-step setup is in [`SETUP.md`](SETUP.md) §8.3.
 
 ## Configuration & environment
 
@@ -58,4 +58,4 @@ sessions, reads those cookies at runtime only, and **never logs, transmits, or s
 off your machine**. There is no Orbit server — if your machine is off, nothing runs and
 nothing leaks. Your X `auth_token` is full account access, so treat your cookies like a
 password; logging out of that browser revokes access immediately. See
-[`skills/orbit/README.md`](skills/orbit/README.md) §8.5 for the full risk disclosure.
+[`SETUP.md`](SETUP.md) §8.5 for the full risk disclosure.

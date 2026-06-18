@@ -16,7 +16,9 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SKILL_README = REPO_ROOT / "skills" / "orbit" / "README.md"
+# Single-skill plugin: the §8 onboarding doc now lives at the repo root as SETUP.md
+# (the plugin root IS the skill; there is no skills/orbit/ subdirectory anymore).
+SKILL_README = REPO_ROOT / "SETUP.md"
 ROOT_README = REPO_ROOT / "README.md"
 MARKETPLACE = REPO_ROOT / ".claude-plugin" / "marketplace.json"
 
@@ -140,9 +142,12 @@ def test_marketplace_json_parses() -> None:
     assert isinstance(data, dict), "marketplace.json must be a JSON object"
 
 
-def test_marketplace_declares_orbit_plugin_and_skill() -> None:
-    """WHY: the manifest must declare the `orbit` plugin and the `orbit` skill at
-    skills/orbit, or Claude Code can't find/install the skill the README points users at."""
+def test_marketplace_declares_single_skill_orbit_plugin() -> None:
+    """WHY: this is a SINGLE-SKILL plugin so it installs as the bare `/orbit` command. That
+    requires a SKILL.md at the plugin root and NO `skills` manifest field (Claude Code's
+    single-skill auto-detection must own the skill). If a `skills` array were present, or the
+    root SKILL.md were missing, the skill would install namespaced as `/orbit:orbit` or not at
+    all — breaking the documented `/orbit` / `/orbit --setup` invocation."""
     data = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
     assert data.get("name") == "orbit", "marketplace name must be 'orbit'"
 
@@ -152,19 +157,25 @@ def test_marketplace_declares_orbit_plugin_and_skill() -> None:
     assert orbit_plugin is not None, "marketplace must declare the 'orbit' plugin"
     assert orbit_plugin.get("description"), "the orbit plugin must carry a description"
 
-    skills = orbit_plugin.get("skills", [])
-    orbit_skill = next((s for s in skills if s.get("name") == "orbit"), None)
-    assert orbit_skill is not None, "the orbit plugin must declare the 'orbit' skill"
-    assert orbit_skill.get("path") == "skills/orbit", (
-        "the orbit skill must point at skills/orbit"
+    # Single-skill contract: NO `skills` field, and the root SKILL.md is the lone skill.
+    assert "skills" not in orbit_plugin, (
+        "single-skill plugin must NOT declare a `skills` array — auto-detection from the "
+        "root SKILL.md is what makes it install as the bare `/orbit` command"
+    )
+    assert (REPO_ROOT / "SKILL.md").is_file(), (
+        "single-skill plugin requires a SKILL.md at the plugin root"
+    )
+    assert not (REPO_ROOT / "skills").exists(), (
+        "a skills/ directory must NOT exist, or single-skill auto-detection fails"
     )
 
 
-def test_root_readme_points_at_skill_readme() -> None:
+def test_root_readme_points_at_setup_doc() -> None:
     """WHY: README-update discipline requires the repo-root README to exist and route users
-    to the full §8 onboarding/permissions doc rather than duplicating or omitting it."""
+    to the full §8 onboarding/permissions doc (now SETUP.md at the root) rather than
+    duplicating or omitting it."""
     assert ROOT_README.is_file(), "repo-root README.md must exist"
     text = ROOT_README.read_text(encoding="utf-8").lower()
-    assert "skills/orbit/readme.md" in text, (
-        "root README must point at the full skills/orbit/README.md onboarding doc"
+    assert "setup.md" in text, (
+        "root README must point at the full SETUP.md onboarding doc"
     )

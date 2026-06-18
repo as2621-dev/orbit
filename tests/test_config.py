@@ -26,9 +26,9 @@ from pathlib import Path
 
 import pytest
 
-# Make ``skills/orbit/scripts`` importable so ``from lib import config`` resolves
+# Make ``scripts`` importable so ``from lib import config`` resolves
 # regardless of the working directory. Mirrors tests/test_scoops_and_render.py.
-SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "orbit" / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from lib.config import (  # noqa: E402

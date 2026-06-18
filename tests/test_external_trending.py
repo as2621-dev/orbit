@@ -31,9 +31,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Make ``skills/orbit/scripts`` importable so ``from lib import ...`` resolves
+# Make ``scripts`` importable so ``from lib import ...`` resolves
 # regardless of the working directory. Mirrors tests/test_trending.py.
-SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "orbit" / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from lib import web_search_keyless  # noqa: E402

@@ -17,14 +17,20 @@ run it once with `--setup` to configure Orbit for the first time.
 
 ## Entrypoint
 
-Run the pipeline driver:
+Run the pipeline driver, passing through any arguments the user gave after `/orbit`:
 
 ```bash
-SKILL_DIR="<absolute path of the directory containing this SKILL.md>"
-python3 "${SKILL_DIR}/scripts/orbit.py" --depth default
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/orbit.py" $ARGUMENTS
 ```
 
-Flags:
+`${CLAUDE_PLUGIN_ROOT}` is the absolute path of this plugin's root (the directory
+containing this `SKILL.md`), set by Claude Code; `scripts/orbit.py` lives directly under it.
+`$ARGUMENTS` is the text the user typed after the skill name. With no arguments
+(a bare `/orbit`), the driver defaults to `--depth default`, so the line above is the daily
+run. With arguments it forwards them — e.g. `/orbit --setup` becomes
+`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/orbit.py" --setup`.
+
+Flags (passed through via `$ARGUMENTS`):
 
 - `--depth {quick,default,deep}` — how much work the pipeline does per run (default: `default`).
 - `--setup` — run the first-time setup wizard (see below).

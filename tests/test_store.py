@@ -18,9 +18,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Make ``skills/orbit/scripts`` importable so ``import store`` and ``from lib import
+# Make ``scripts`` importable so ``import store`` and ``from lib import
 # paths`` resolve regardless of the working directory the test runs from.
-SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "orbit" / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import store  # noqa: E402

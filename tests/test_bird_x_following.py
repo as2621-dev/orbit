@@ -31,9 +31,9 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-# Make ``skills/orbit/scripts`` importable so ``import store`` and ``from lib import ...``
+# Make ``scripts`` importable so ``import store`` and ``from lib import ...``
 # resolve regardless of the working directory. Mirrors tests/test_orbit_stage0.py.
-SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "orbit" / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import store  # noqa: E402

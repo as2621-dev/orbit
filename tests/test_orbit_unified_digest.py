@@ -25,8 +25,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Make ``skills/orbit/scripts`` importable. Mirrors tests/test_orbit_pipeline.py.
-SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "orbit" / "scripts"
+# Make ``scripts`` importable. Mirrors tests/test_orbit_pipeline.py.
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import orbit  # noqa: E402
