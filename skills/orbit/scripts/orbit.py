@@ -26,8 +26,10 @@ from typing import Callable, Optional
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
 
 import store  # noqa: E402  (import must follow the sys.path insert above)
-from lib import log  # noqa: E402
+from lib import log, render  # noqa: E402
 from lib.config import OrbitConfig, load_config  # noqa: E402
+from lib.density import TieredItem, assign_density_tiers  # noqa: E402
+from lib.rerank import RankableItem, derank_items  # noqa: E402
 from lib.youtube_yt import (  # noqa: E402
     Subscription,
     YouTubeAuthError,
@@ -45,8 +47,9 @@ _SOURCES_REFRESH_INTERVAL_SECONDS: int = 7 * 24 * 60 * 60
 # mocked loader; this env var is the equivalent escape hatch for a bare CLI run.
 _STAGE0_SKIP_NETWORK_ENV_VAR: str = "ORBIT_STAGE0_SKIP_NETWORK"
 
-# The pipeline stages, in execution order. Each maps to a lib module in later
-# phases; here they only emit a "not yet implemented" notice.
+# The pipeline stages, in execution order. Stage 0 (sources) and Stage 3-4
+# (rank + render, this phase) are real; Stages 1-2 (delta fetch, classify,
+# chapterize) are still upstream stubs wired in a later phase.
 PIPELINE_STAGES: tuple[str, ...] = (
     "stage_0_load_sources",
     "stage_1_delta_fetch",
@@ -54,6 +57,17 @@ PIPELINE_STAGES: tuple[str, ...] = (
     "stage_3_rank",
     "stage_4_render",
 )
+
+# Stages still stubbed (delta fetch + classify/chapterize) — the upstream half that
+# feeds rankable items. This phase (Phase 3, M1) builds only the rank+render half;
+# the real producers land in a later phase. Listed here so run_pipeline logs each
+# as "not yet implemented" while still running the real Stage 6->7 on whatever items
+# the upstream provides.
+_STUBBED_UPSTREAM_STAGES: tuple[str, ...] = ("stage_1_delta_fetch", "stage_2_classify")
+
+# Default HTML output path when ``config.delivery`` carries no ``html_path``. The
+# tilde is expanded at write time. Page 2 is written beside it as today-page2.html.
+DEFAULT_HTML_PATH: str = "~/orbit/out/today.html"
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -230,6 +244,105 @@ def run_stage0_load_sources(
     log.log_info("sources_refreshed", platform="youtube", count=persisted_count)
 
 
+def run_stage6_rank_and_tier(items: list[RankableItem], config: OrbitConfig) -> list[TieredItem]:
+    """Stage 6: score the rankable items, then sort them into density tiers.
+
+    Pure delegation to ``lib.rerank.derank_items`` (weighted score, descending) then
+    ``lib.density.assign_density_tiers`` (rank -> hero/standard/compact/index). Rank
+    controls density, NEVER inclusion — ``len(out) == len(items)``; nothing dropped.
+    No LLM (Rule 5 — deterministic math in lib/); orbit.py stays wiring-only.
+
+    Args:
+        items: The :class:`RankableItem`s from the (upstream) classify/chapterize half.
+        config: The loaded :class:`OrbitConfig` (supplies ``creator_weights``).
+
+    Returns:
+        The tiered, rank-ordered items ready for the renderer.
+    """
+    scored_items = derank_items(items, config)
+    tiered_items = assign_density_tiers(scored_items)
+    log.log_info("rank_and_tier_completed", item_count=len(tiered_items))
+    return tiered_items
+
+
+def _default_html_writer(path: Path, html: str) -> None:
+    """Write ``html`` to ``path`` (UTF-8), creating parent directories as needed.
+
+    The default Stage-7 writer. Kept tiny and injectable so tests pass their own
+    writer / a temp path and never touch the real per-user output location.
+
+    Args:
+        path: The (already tilde-expanded) absolute file path to write.
+        html: The HTML string to write.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(html, encoding="utf-8")
+
+
+def _resolve_html_path(config: OrbitConfig) -> Path:
+    """Resolve the page-1 HTML output path from ``config.delivery`` (tilde-expanded).
+
+    Reads ``config.delivery["html_path"]`` (default :data:`DEFAULT_HTML_PATH`), expands
+    a leading ``~``, and returns an absolute Path. Page 2 is written beside it.
+
+    Args:
+        config: The loaded :class:`OrbitConfig`.
+
+    Returns:
+        The absolute, tilde-expanded page-1 output path.
+    """
+    raw_path = str(config.delivery.get("html_path") or DEFAULT_HTML_PATH)
+    return Path(raw_path).expanduser()
+
+
+def run_stage7_render(
+    tiered_items: list[TieredItem],
+    config: OrbitConfig,
+    *,
+    html_path: Optional[Path] = None,
+    writer: Callable[[Path, str], None] = _default_html_writer,
+) -> list[Path]:
+    """Stage 7: render the tiered items to HTML and write page 1 (and page 2 if spilled).
+
+    Delegates rendering to ``lib.render.render_digest_pages`` (which decides the 1-vs-2
+    page split via the height budget, hard-capped at 2 pages), then writes page 1 to
+    ``html_path`` (default from ``config.delivery``, tilde-expanded, parents created)
+    and, when the digest spilled, page 2 to ``render.DEFAULT_PAGE_2_FILENAME`` in the
+    SAME directory. The ``writer`` is injectable so tests write to a temp dir without
+    touching the real per-user path. Logs ``render_completed`` with the page count.
+
+    Args:
+        tiered_items: The Stage-6 output (tiered, rank-ordered).
+        config: The loaded :class:`OrbitConfig` (supplies ``delivery.html_path``).
+        html_path: Explicit page-1 path (tests pass a temp path); defaults to the
+            resolved ``config.delivery.html_path``.
+        writer: ``(path, html) -> None`` writer; defaults to :func:`_default_html_writer`.
+
+    Returns:
+        The list of paths actually written (``[page1]`` or ``[page1, page2]``).
+    """
+    page_1_path = html_path if html_path is not None else _resolve_html_path(config)
+    page_2_path = page_1_path.parent / render.DEFAULT_PAGE_2_FILENAME
+
+    pages = render.render_digest_pages(tiered_items, config, page_2_href=render.DEFAULT_PAGE_2_FILENAME)
+
+    written_paths: list[Path] = [page_1_path]
+    writer(page_1_path, pages[0])
+    if len(pages) > 1:
+        writer(page_2_path, pages[1])
+        written_paths.append(page_2_path)
+
+    log.log_info(
+        "render_completed",
+        stage="stage_7_render",
+        item_count=len(tiered_items),
+        page_count=len(pages),
+        spilled=len(pages) > 1,
+        html_path=str(page_1_path),
+    )
+    return written_paths
+
+
 def run_pipeline(depth: str) -> int:
     """Run the Orbit pipeline. Stage 0 is real; later stages are still stubs.
 
@@ -256,14 +369,30 @@ def run_pipeline(depth: str) -> int:
         )
         return 1
 
-    for stage_name in PIPELINE_STAGES[1:]:
+    # Stages 1-2 (delta fetch + classify/chapterize) are still upstream stubs — the
+    # real producers land in a later phase. They yield NO rankable items yet, so a
+    # bare CLI run ranks+renders an empty (but valid) digest. The Stage 6->7 code
+    # below is REAL and runs on whatever items the upstream provides.
+    for stage_name in _STUBBED_UPSTREAM_STAGES:
         log.log_warning(
             "stage_not_yet_implemented",
             stage=stage_name,
             depth=depth,
-            detail="Scaffold only — implemented in a later sub-phase/phase.",
+            detail="Upstream producer (delta fetch / classify+chapterize) lands in a later phase.",
         )
-    log.log_info("pipeline_completed", depth=depth, status="stage0_only")
+
+    # Stage 6->7 (rank + render) — REAL this phase (Phase 3 / M1's render half).
+    rankable_items: list[RankableItem] = []  # upstream stubbed; empty until a later phase
+    tiered_items = run_stage6_rank_and_tier(rankable_items, config)
+    written_paths = run_stage7_render(tiered_items, config)
+
+    log.log_info(
+        "pipeline_completed",
+        depth=depth,
+        status="rank_render_half",
+        item_count=len(tiered_items),
+        pages_written=len(written_paths),
+    )
     return 0
 
 

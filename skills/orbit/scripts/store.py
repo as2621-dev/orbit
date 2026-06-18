@@ -381,6 +381,91 @@ def get_classification(item_external_id: str) -> Optional[Dict[str, Any]]:
         conn.close()
 
 
+# --- Carryforward (resurface-once) -----------------------------------------
+
+# A top-tier item the user did not open is eligible for ONE resurface. The cap is
+# enforced in code (SQLite has no native "increment-but-clamp"): the first
+# :func:`record_carryforward` for an item inserts the row with ``surfaced_count = 1``;
+# every subsequent call is a no-op increment (stays at the cap). One resurface only.
+CARRYFORWARD_SURFACED_COUNT_CAP: int = 1
+
+
+def record_carryforward(item_external_id: str, density_tier: str) -> None:
+    """Record (or re-affirm) that a top-tier item is carried forward — capped at one resurface.
+
+    The first call for an ``item_external_id`` inserts a ``carryforward`` row with
+    ``surfaced_count = 1``. Every subsequent call leaves ``surfaced_count`` at the
+    :data:`CARRYFORWARD_SURFACED_COUNT_CAP` (1) — calling repeatedly NEVER exceeds the
+    cap (resurface-once intent, api-contracts ``carryforward`` table). The
+    ``density_tier`` is refreshed to the most recent tier the item held.
+
+    Reason: ``carryforward`` has no UNIQUE on ``item_external_id`` in the v1 schema, so
+    the cap is enforced here — we look the item up and either insert (count = 1) or
+    update the existing row (count clamped to the cap), never inserting a second row.
+
+    Args:
+        item_external_id: The item being carried forward (``video_id`` / ``tweet_id``).
+        density_tier: The tier the item held when carried forward —
+            ``hero`` | ``standard`` | ``compact`` | ``index``.
+
+    Example:
+        >>> record_carryforward("vid_abc", "hero")  # doctest: +SKIP
+        >>> record_carryforward("vid_abc", "hero")  # second call stays capped  # doctest: +SKIP
+        >>> get_carryforward("vid_abc")["surfaced_count"]  # doctest: +SKIP
+        1
+    """
+    conn = _connect()
+    try:
+        existing = conn.execute(
+            "SELECT carryforward_id, surfaced_count FROM carryforward WHERE item_external_id = ?",
+            (item_external_id,),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """INSERT INTO carryforward (item_external_id, density_tier, surfaced_count)
+                   VALUES (?, ?, ?)""",
+                (item_external_id, density_tier, CARRYFORWARD_SURFACED_COUNT_CAP),
+            )
+        else:
+            # Reason: clamp to the cap (resurface-once) and refresh the tier — never
+            # let repeated calls push surfaced_count past CARRYFORWARD_SURFACED_COUNT_CAP.
+            capped_count = min(int(existing["surfaced_count"]) + 1, CARRYFORWARD_SURFACED_COUNT_CAP)
+            conn.execute(
+                "UPDATE carryforward SET density_tier = ?, surfaced_count = ? WHERE carryforward_id = ?",
+                (density_tier, capped_count, int(existing["carryforward_id"])),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    log.log_info(
+        "carryforward_recorded",
+        item_external_id=item_external_id,
+        density_tier=density_tier,
+        surfaced_count_cap=CARRYFORWARD_SURFACED_COUNT_CAP,
+    )
+
+
+def get_carryforward(item_external_id: str) -> Optional[Dict[str, Any]]:
+    """Return an item's carryforward row, or None if it was never carried forward.
+
+    Args:
+        item_external_id: The item to look up.
+
+    Returns:
+        The carryforward row as a dict (``carryforward_id``, ``item_external_id``,
+        ``density_tier``, ``surfaced_count``, ``created_at``), or None.
+    """
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM carryforward WHERE item_external_id = ?",
+            (item_external_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
 # --- Interests -------------------------------------------------------------
 
 
