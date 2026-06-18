@@ -18,7 +18,7 @@ import os
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 # Make ``lib`` importable when this script is run directly (e.g.
 # ``python3 skills/orbit/scripts/orbit.py``). Mirrors the last30days reference so
@@ -26,12 +26,20 @@ from typing import Callable, Optional
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
 
 import store  # noqa: E402  (import must follow the sys.path insert above)
-from lib import bird_x, classify, log, render  # noqa: E402
+from lib import bird_x, classify, deliver, log, render  # noqa: E402
 from lib.bird_x import Follow, Tweet, XAuthError  # noqa: E402
 from lib.classify import LlmClassifier, _default_llm_classifier  # noqa: E402
+from lib.cluster import Cluster, cluster_overlaps  # noqa: E402
 from lib.config import OrbitConfig, load_config  # noqa: E402
 from lib.density import TieredItem, assign_density_tiers  # noqa: E402
+from lib.external_trending import (  # noqa: E402
+    build_trending_multiplier_map,
+    detect_scoops,
+    tag_external_corroboration,
+)
 from lib.rerank import RankableItem, derank_items  # noqa: E402
+from lib.setup_wizard import run_setup_wizard  # noqa: E402
+from lib.trending import TrendingItem, compute_internal_trending  # noqa: E402
 from lib.youtube_yt import (  # noqa: E402
     Subscription,
     YouTubeAuthError,
@@ -97,24 +105,26 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--setup",
         action="store_true",
-        help="Run first-time setup (cookie source, interests, delivery). Stub for now.",
+        help="Run first-time setup (reads subs/follows, auto-classifies, writes orbit.config.json, prints a cron entry).",
     )
     return parser
 
 
 def run_setup() -> int:
-    """Run the first-time setup flow (stub).
+    """Run the first-time setup wizard (brief §8.3), writing ``orbit.config.json``.
+
+    Wiring only (Rule 5): delegates to :func:`lib.setup_wizard.run_setup_wizard` with the
+    real defaults — the live subscription/following loaders, the module-level
+    :func:`lib.classify._default_llm_classifier` boundary (the host session wires the real
+    caller at runtime), builtin ``input``, and ``./orbit.config.json``. The wizard reads
+    subs/follows, auto-classifies via the existing classify path, confirms categories,
+    picks priority creators, sets delivery + schedule, writes the config, and prints the
+    OS cron entry.
 
     Returns:
-        Process exit code (0 on success).
+        Process exit code (0 on success), propagated from the wizard.
     """
-    log.log_info("setup_started", mode="stub")
-    log.log_warning(
-        "setup_not_yet_implemented",
-        detail="The --setup wizard ships in a later milestone (M4).",
-    )
-    log.log_info("setup_completed", mode="stub")
-    return 0
+    return run_setup_wizard(llm_classifier=_default_llm_classifier)
 
 
 def _parse_iso_timestamp(text: Optional[str]) -> Optional[datetime]:
@@ -387,7 +397,81 @@ def _current_day_ordinal() -> int:
     return (datetime.now(timezone.utc).date() - date(1970, 1, 1)).days
 
 
-def run_stage6_rank_and_tier(items: list[RankableItem], config: OrbitConfig) -> list[TieredItem]:
+def run_stage5_overlap_trending_scoops(
+    items: list[RankableItem],
+    config: OrbitConfig,
+    *,
+    store_module: Any = store,
+    search_fn: Optional[Callable[[str], list[Any]]] = None,
+) -> tuple[list[Cluster], list[TrendingItem], list[TrendingItem], dict[str, float]]:
+    """Stage 5 (M3): cluster overlaps -> internal trending -> external tag -> scoops.
+
+    The M3 seam, run BETWEEN classify (Stage 2) and rank (Stage 6). Pure wiring (Rule 5:
+    all logic lives in lib/): it sequences the four deterministic lib functions and
+    returns their outputs for Stage 6 (the trending/scoop multiplier map) and Stage 7
+    (the three render sections):
+
+      1. :func:`lib.cluster.cluster_overlaps` — short-merge / long-cross-link clusters.
+      2. :func:`lib.trending.compute_internal_trending` — baseline-relative velocity
+         (reads the injected ``store_module`` only for each creator's ``seen``-history
+         DEPTH — the dormancy signal — never engagement).
+      3. :func:`lib.external_trending.tag_external_corroboration` — bounded keyless
+         cross-search tagging corroborated-vs-scoop, throttled by ``config.depth``. When
+         ``search_fn`` is None the lib default keyless search is used; tests inject a
+         fake so no live web call is made.
+      4. :func:`lib.external_trending.detect_scoops` — dormant-account acceleration, the
+         loud scoops strip — plus
+         :func:`lib.external_trending.build_trending_multiplier_map` for the rerank boost.
+
+    Empty ``items`` returns ``([], [], [], {})`` — the M1/M2 quiet path produces no M3
+    sections and a neutral multiplier map, so rank+render are byte-for-byte unchanged.
+
+    Args:
+        items: The unified classified :class:`RankableItem` stream.
+        config: The loaded :class:`OrbitConfig` (``creator_weights`` for representatives,
+            ``depth`` for the cross-search budget).
+        store_module: The store module/object for the history-depth lookup (injectable;
+            defaults to :mod:`store`).
+        search_fn: OPTIONAL keyless cross-search ``(query) -> list``; None uses the lib
+            default. Tests inject a fake so no live web call fires.
+
+    Returns:
+        ``(clusters, trending_items, scoops, trending_multipliers)``.
+    """
+    if not items:
+        log.log_info("overlap_trending_scoops_completed", cluster_count=0, trending_count=0, scoop_count=0)
+        return [], [], [], {}
+
+    clusters = cluster_overlaps(items, config)
+    items_by_id = {str(item.item_external_id): item for item in items if item.item_external_id}
+    trending_items = compute_internal_trending(clusters, items_by_id, store_module)
+
+    # Reason: external corroboration is bounded by the user's depth throttle (CSO). The
+    # search_fn defaults to the lib keyless search; tests inject a fake to stay offline.
+    if search_fn is not None:
+        tag_external_corroboration(trending_items, search_fn=search_fn, depth=config.depth)
+    else:
+        tag_external_corroboration(trending_items, depth=config.depth)
+
+    scoops = detect_scoops(trending_items)
+    trending_multipliers = build_trending_multiplier_map(trending_items)
+
+    log.log_info(
+        "overlap_trending_scoops_completed",
+        cluster_count=len(clusters),
+        trending_count=len(trending_items),
+        scoop_count=len(scoops),
+        multiplier_count=len(trending_multipliers),
+    )
+    return clusters, trending_items, scoops, trending_multipliers
+
+
+def run_stage6_rank_and_tier(
+    items: list[RankableItem],
+    config: OrbitConfig,
+    *,
+    trending_multipliers: Optional[dict[str, float]] = None,
+) -> list[TieredItem]:
     """Stage 6: score the rankable items, then sort them into density tiers.
 
     Pure delegation to ``lib.rerank.derank_items`` (weighted score, descending) then
@@ -398,11 +482,14 @@ def run_stage6_rank_and_tier(items: list[RankableItem], config: OrbitConfig) -> 
     Args:
         items: The :class:`RankableItem`s from the (upstream) classify/chapterize half.
         config: The loaded :class:`OrbitConfig` (supplies ``creator_weights``).
+        trending_multipliers: OPTIONAL ``item_external_id`` -> trending/scoop multiplier
+            map from Stage 5 (M3). None (the M1/M2 path) leaves every multiplier neutral,
+            so ranking is byte-for-byte unchanged.
 
     Returns:
         The tiered, rank-ordered items ready for the renderer.
     """
-    scored_items = derank_items(items, config)
+    scored_items = derank_items(items, config, trending_multipliers=trending_multipliers)
     tiered_items = assign_density_tiers(scored_items)
     log.log_info("rank_and_tier_completed", item_count=len(tiered_items))
     return tiered_items
@@ -444,6 +531,9 @@ def run_stage7_render(
     *,
     html_path: Optional[Path] = None,
     writer: Callable[[Path, str], None] = _default_html_writer,
+    clusters: Optional[list[Cluster]] = None,
+    trending_items: Optional[list[TrendingItem]] = None,
+    scoops: Optional[list[TrendingItem]] = None,
 ) -> list[Path]:
     """Stage 7: render the tiered items to HTML and write page 1 (and page 2 if spilled).
 
@@ -467,7 +557,14 @@ def run_stage7_render(
     page_1_path = html_path if html_path is not None else _resolve_html_path(config)
     page_2_path = page_1_path.parent / render.DEFAULT_PAGE_2_FILENAME
 
-    pages = render.render_digest_pages(tiered_items, config, page_2_href=render.DEFAULT_PAGE_2_FILENAME)
+    pages = render.render_digest_pages(
+        tiered_items,
+        config,
+        page_2_href=render.DEFAULT_PAGE_2_FILENAME,
+        clusters=clusters,
+        trending_items=trending_items,
+        scoops=scoops,
+    )
 
     written_paths: list[Path] = [page_1_path]
     writer(page_1_path, pages[0])
@@ -484,6 +581,86 @@ def run_stage7_render(
         html_path=str(page_1_path),
     )
     return written_paths
+
+
+def _build_delivery_summary(tiered_items: list[TieredItem], scoops: list[TrendingItem]) -> str:
+    """Build the one-line delivery TL;DR from the tiered items + scoops (deterministic).
+
+    A PURE, deterministic helper (Rule 5 — no LLM in the delivery path): it counts the
+    items and names the top scoop / top item so the iMessage/WhatsApp body is a useful
+    one-liner without any model call. Leads with the loudest signal (a scoop) when one
+    exists (brief §3 Stage 7: "TL;DR + scoops + a link"), else falls back to the
+    top-ranked item's title, else a quiet "no new items" line.
+
+    Args:
+        tiered_items: The Stage-6 output (rank-ordered; index 0 is the top item).
+        scoops: The Stage-5 scoops (the highest-value signal), possibly empty.
+
+    Returns:
+        A one-line TL;DR string suitable for the message body.
+    """
+    item_count = len(tiered_items)
+    if item_count == 0:
+        return "Orbit: no new items in your feed today."
+
+    noun = "item" if item_count == 1 else "items"
+    lead = f"Orbit: {item_count} new {noun}"
+
+    if scoops:
+        scoop_count = len(scoops)
+        scoop_label = "scoop" if scoop_count == 1 else "scoops"
+        top_scoop_title = (scoops[0].title or "").strip()
+        if top_scoop_title:
+            return f"{lead}, {scoop_count} {scoop_label} — top: {top_scoop_title}"
+        return f"{lead}, {scoop_count} {scoop_label}"
+
+    top_title = (tiered_items[0].scored_item.item.title or "").strip()
+    if top_title:
+        return f"{lead} — top: {top_title}"
+    return lead
+
+
+def run_stage7_deliver(
+    tiered_items: list[TieredItem],
+    scoops: list[TrendingItem],
+    config: OrbitConfig,
+    page_1_path: Path,
+) -> None:
+    """Deliver the digest (iMessage core; WhatsApp/Briefcast gated stretch). Wiring only.
+
+    Runs AFTER :func:`run_stage7_render`. Builds a deterministic one-line TL;DR
+    (:func:`_build_delivery_summary` — no LLM, Rule 5) and routes it through the
+    delivery channels in :mod:`lib.deliver`:
+
+      * iMessage (core) — always attempted; :func:`lib.deliver.deliver_imessage` is a
+        logged no-op when ``delivery.imessage_to`` is unset (the bare CLI run path).
+      * WhatsApp (stretch) — gated behind ``delivery.whatsapp_to``; skipped by default.
+        Wired only when a target is set; the host injects the HTTP boundary at runtime
+        (not wired here, so a misconfigured target without that boundary fails loud
+        rather than sending). Left unwired in this build to keep the stretch path gated.
+      * Briefcast (stretch) — gated behind ``delivery.briefcast_path``; writes a payload
+        file when configured, skipped otherwise.
+
+    Business logic lives in :mod:`lib.deliver`; this stays sequencing only.
+
+    Args:
+        tiered_items: The Stage-6 tiered items (for the TL;DR + Briefcast episode list).
+        scoops: The Stage-5 scoops (the TL;DR leads with the loudest one).
+        config: The loaded :class:`OrbitConfig` (supplies the ``delivery`` targets).
+        page_1_path: The page-1 HTML path the render stage wrote (the link target).
+    """
+    summary = _build_delivery_summary(tiered_items, scoops)
+
+    imessage_to = config.delivery.get("imessage_to")
+    deliver.deliver_imessage(summary, page_1_path, imessage_to)
+
+    # Stretch channels — gated behind their config keys, skipped by default. Briefcast
+    # is wired (a file, no auth surface); WhatsApp stays gated on its config key but is
+    # not given an HTTP boundary here (the host wires it), so an accidental target fails
+    # loud in lib.deliver rather than this stage sending without a configured client.
+    briefcast_path = config.delivery.get("briefcast_path")
+    if briefcast_path:
+        deliver.emit_briefcast_payload(summary, list(tiered_items), briefcast_path)
 
 
 def run_pipeline(depth: str) -> int:
@@ -537,8 +714,26 @@ def run_pipeline(depth: str) -> int:
     youtube_items: list[RankableItem] = []  # upstream stubbed; empty until a later phase
     x_items: list[RankableItem] = []  # needs a runtime LLM classifier; empty in a bare CLI run
     rankable_items = youtube_items + x_items
-    tiered_items = run_stage6_rank_and_tier(rankable_items, config)
-    written_paths = run_stage7_render(tiered_items, config)
+
+    # Stage 5 (M3) — cluster overlaps, compute baseline-relative trending, tag external
+    # corroboration vs scoop, detect dormant-account scoops. Feeds the trending/scoop
+    # multiplier into rank and the three M3 sections into render. On the bare CLI run
+    # rankable_items is empty, so this yields no clusters/trending/scoops and a neutral
+    # multiplier map (the M1/M2 path is unchanged).
+    clusters, trending_items, scoops, trending_multipliers = run_stage5_overlap_trending_scoops(
+        rankable_items, config
+    )
+    tiered_items = run_stage6_rank_and_tier(
+        rankable_items, config, trending_multipliers=trending_multipliers
+    )
+    written_paths = run_stage7_render(
+        tiered_items, config, clusters=clusters, trending_items=trending_items, scoops=scoops
+    )
+
+    # Stage 7 (deliver) — notify the user the digest is ready. iMessage is opt-in: on
+    # the bare CLI run delivery.imessage_to is unset, so this is a logged no-op and the
+    # run stays a clean exit-0. page 1 is written_paths[0] (page 1 first by contract).
+    run_stage7_deliver(tiered_items, scoops, config, written_paths[0])
 
     log.log_info(
         "pipeline_completed",

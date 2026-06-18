@@ -12,8 +12,8 @@ Orbit reads the feeds you already follow (YouTube subscriptions, X follows), tra
 what you have already seen, and surfaces a ranked digest of the new, on-topic, high-signal
 items — so you open one digest instead of ten feeds.
 
-`scripts/orbit.py` is the entrypoint. This SKILL.md is a thin Bash-orchestration stub;
-the full pipeline (delta fetch, classification, ranking, render) lands in later milestones.
+`scripts/orbit.py` is the entrypoint. Run it daily (via cron) to produce the digest, or
+run it once with `--setup` to configure Orbit for the first time.
 
 ## Entrypoint
 
@@ -27,10 +27,29 @@ python3 "${SKILL_DIR}/scripts/orbit.py" --depth default
 Flags:
 
 - `--depth {quick,default,deep}` — how much work the pipeline does per run (default: `default`).
-- `--setup` — run first-time setup (cookie source, interests, delivery). Stub for now.
+- `--setup` — run the first-time setup wizard (see below).
 
-## Status
+## `/orbit`
 
-Scaffold only (Phase 1, Sub-phase 1). Each stage currently logs a structured
-`not yet implemented` notice. Stage 0 (subscription loading), the SQLite state store,
-classification, ranking, and render are implemented in subsequent phases.
+The daily run. Loads your subscriptions/follows (riding a weekly cache), delta-fetches new
+items, classifies them on the signal/noise and on/off-topic axes, ranks them, and renders a
+ranked HTML digest to your configured `delivery.html_path`. Reads `orbit.config.json` for
+your cookie source, creator weights, interests, depth, delivery target, and schedule.
+
+## `/orbit --setup`
+
+The first-run wizard. It:
+
+1. Asks which browser holds your logins (cookie source).
+2. Reads your YouTube subscriptions and X follows (X is best-effort — if X auth is
+   unconfigured, setup continues YouTube-only).
+3. Auto-classifies each creator into signal/noise using the same classify path the daily
+   run uses, then lets you confirm or flip each category and pick priority creators
+   (which become `creator_weights`).
+4. Seeds your `interests` from subscription titles, then asks for the delivery target
+   (HTML path + optional iMessage number) and the cron schedule.
+5. Writes a validated `orbit.config.json` and prints the exact OS cron entry
+   (`<cron_expr> cd <repo> && claude -p "/orbit"`) for you to paste into `crontab -e`.
+
+Scheduling is OS cron on your own machine (no cloud scheduler), because the cookie-based
+feed reads must run where your browser sessions live.

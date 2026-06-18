@@ -7,7 +7,8 @@
     {
       "name": "orbit",
       "source": "./",
-      "description": "Load your YouTube/X subscriptions and surface a ranked daily digest of what's worth your attention.",
+      "version": "0.1.0",
+      "description": "A personal daily digest of your own YouTube subscriptions and X follows: delta-fetches new items, classifies signal vs noise and on- vs off-topic, clusters overlaps, flags trending and scoops, and renders a ranked HTML one-pager with deep-links. Cookies-only, runs locally on a cron schedule, optional iMessage delivery. Run /orbit --setup to configure.",
       "skills": [
         {
           "name": "orbit",

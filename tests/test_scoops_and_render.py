@@ -34,9 +34,11 @@ from types import SimpleNamespace
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "orbit" / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import orbit  # noqa: E402
 from lib import render  # noqa: E402
 from lib.chapterize import Chapter  # noqa: E402
 from lib.cluster import Cluster  # noqa: E402
+from lib.config import OrbitConfig  # noqa: E402
 from lib.density import TIER_HERO, TIER_STANDARD, TieredItem  # noqa: E402
 from lib.external_trending import build_trending_multiplier_map, detect_scoops  # noqa: E402
 from lib.fusion import CrossLink  # noqa: E402
@@ -277,3 +279,94 @@ def test_no_m3_data_renders_m1_page_without_new_sections() -> None:
     # The M1 spine is still there.
     assert 'class="card hero"' in output_html
     assert 'class="tldr"' in output_html
+
+
+# --- Authorized-divergence wiring: orbit.py Stage 5 invokes M3 end-to-end ------
+
+
+def _classified_rankable(
+    item_external_id: str,
+    *,
+    creator_external_id: str,
+    title: str,
+    view_count: int,
+    like_count: int,
+    comment_count: int,
+) -> RankableItem:
+    """A RankableItem fixture for the Stage-5 wiring test (mocks the Phase 1-2 upstream)."""
+    return RankableItem(
+        item_external_id=item_external_id,
+        title=title,
+        channel_name=creator_external_id,
+        creator_external_id=creator_external_id,
+        view_count=view_count,
+        like_count=like_count,
+        comment_count=comment_count,
+        upload_date="20260101",
+        chapters=[],
+    )
+
+
+def test_orbit_stage5_wires_overlap_trending_scoops_through_rank_and_render(tmp_path: Path) -> None:
+    """orbit.py Stage 5 invokes cluster->trending->scoop and threads it into rank+render (DoD #1/#2/#3 wiring).
+
+    WHY: the phase-level DoD requires the PIPELINE — not just the lib functions — to
+    surface the M3 sections and run the trending/scoop multiplier. This exercises the
+    authorized orbit.py divergence end-to-end with a FAKE store (low seen-history =
+    dormancy) and a FAKE keyless search (zero external results = scoop tag) so NO
+    network/LLM/real-store boundary is touched. The dormant creator's breakout item
+    sits against its own low-engagement siblings, so its batch-median baseline is low
+    and the breakout spikes far above it (dormancy AND acceleration) — flagged a scoop.
+    The test asserts (a) Stage 5 returns a scoop, (b) the scoop's multiplier ranks its
+    item first in Stage 6, and (c) Stage 7 writes a file containing all three M3
+    sections. A regression that failed to wire any of the three threads breaks this.
+    """
+    # Dormant creator UC_dorm: one breakout + two near-identical low-engagement siblings
+    # (same text so they cluster together; the breakout becomes the representative whose
+    # engagement is far above the creator's batch-median baseline).
+    breakout = _classified_rankable(
+        "d1", creator_external_id="UC_dorm", title="Apple M5 chip is insane wow",
+        view_count=500_000, like_count=40_000, comment_count=8_000,
+    )
+    sibling_a = _classified_rankable(
+        "d2", creator_external_id="UC_dorm", title="Apple M5 chip is insane wow",
+        view_count=50, like_count=2, comment_count=0,
+    )
+    sibling_b = _classified_rankable(
+        "d3", creator_external_id="UC_dorm", title="Apple M5 chip is insane wow",
+        view_count=40, like_count=1, comment_count=0,
+    )
+    items = [breakout, sibling_a, sibling_b]
+    config = OrbitConfig(creator_weights={})
+
+    # Fake store: UC_dorm has only 1 prior seen item (dormant, <= the dormancy threshold).
+    fake_store = SimpleNamespace(
+        list_sources=lambda: [{"source_id": 1, "external_id": "UC_dorm"}],
+        get_seen_ids=lambda source_id: {"prior"},
+    )
+    # Fake keyless search: zero external results -> the topic is a scoop (your network first).
+    fake_search = lambda query: []  # noqa: E731
+
+    clusters, trending_items, scoops, trending_multipliers = orbit.run_stage5_overlap_trending_scoops(
+        items, config, store_module=fake_store, search_fn=fake_search
+    )
+
+    # (a) the dormant breakout is flagged a scoop, and its multiplier map is non-neutral.
+    assert clusters, "the near-duplicate items must cluster"
+    assert scoops, "the dormant breakout must be flagged a scoop"
+    assert "d1" in trending_multipliers and trending_multipliers["d1"] > 1.0
+
+    # (b) the scoop multiplier raises the breakout above a plain item in Stage 6 ranking.
+    tiered = orbit.run_stage6_rank_and_tier(items, config, trending_multipliers=trending_multipliers)
+    assert tiered[0].scored_item.item.item_external_id == "d1", "the scoop must rank first via the multiplier"
+
+    # (c) Stage 7 writes a file with all three M3 sections populated.
+    html_path = tmp_path / "out" / "today.html"
+    written = orbit.run_stage7_render(
+        tiered, config, html_path=html_path, clusters=clusters, trending_items=trending_items, scoops=scoops
+    )
+    assert html_path in written and html_path.exists()
+    written_html = html_path.read_text(encoding="utf-8")
+    assert 'class="overlap-block"' in written_html
+    assert 'class="trending-rail"' in written_html
+    assert 'class="scoops-strip"' in written_html
