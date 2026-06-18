@@ -24,7 +24,7 @@ Read that before running Orbit.
 
    ```
    /plugin marketplace add as2621-dev/orbit
-   /plugin install orbit
+   /plugin install orbit@orbit
    ```
 
    Prerequisites: **Python 3.12+**, **Node 22+**, and **`yt-dlp`** on your `PATH`.

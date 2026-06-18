@@ -12,7 +12,7 @@ It is honest and plain. Read §8.5 in particular — it is not softened.
 
 ```
 /plugin marketplace add as2621-dev/orbit
-/plugin install orbit
+/plugin install orbit@orbit
 ```
 
 **Manual / developer (symlink the skill into Claude Code):**
@@ -68,7 +68,7 @@ server, because there isn't one.
 
    ```
    /plugin marketplace add as2621-dev/orbit
-   /plugin install orbit
+   /plugin install orbit@orbit
    ```
 
    (The manifest is `.claude-plugin/marketplace.json`.)
