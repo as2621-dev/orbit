@@ -11,14 +11,14 @@ It is honest and plain. Read §8.5 in particular — it is not softened.
 **Claude Code (recommended):**
 
 ```
-/plugin marketplace add ashesh2621/orbit
+/plugin marketplace add as2621-dev/orbit
 /plugin install orbit
 ```
 
 **Manual / developer (symlink the skill into Claude Code):**
 
 ```bash
-git clone https://github.com/ashesh2621/orbit.git
+git clone https://github.com/as2621-dev/orbit.git
 ln -s "$(pwd)/orbit/skills/orbit" ~/.claude/skills/orbit
 ```
 
@@ -67,7 +67,7 @@ server, because there isn't one.
 1. **Install the plugin** (see the Install quick-reference above):
 
    ```
-   /plugin marketplace add ashesh2621/orbit
+   /plugin marketplace add as2621-dev/orbit
    /plugin install orbit
    ```
 

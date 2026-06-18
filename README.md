@@ -23,7 +23,7 @@ Read that before running Orbit.
 1. Install the plugin in Claude Code (manifest: `.claude-plugin/marketplace.json`):
 
    ```
-   /plugin marketplace add ashesh2621/orbit
+   /plugin marketplace add as2621-dev/orbit
    /plugin install orbit
    ```
 
