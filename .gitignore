@@ -16,3 +16,6 @@ node_modules/
 # generated Orbit output
 out/
 *.orbit.html
+CLAUDE.md
+# personal, per-user config (written by `/orbit --setup`); template is orbit.config.example.json
+orbit.config.json
