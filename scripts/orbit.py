@@ -32,6 +32,7 @@ from lib.classify import LlmClassifier, _default_llm_classifier  # noqa: E402
 from lib.cluster import Cluster, cluster_overlaps  # noqa: E402
 from lib.config import OrbitConfig, load_config  # noqa: E402
 from lib.density import TieredItem, assign_density_tiers  # noqa: E402
+from lib.llm import load_dotenv, make_llm_classifier  # noqa: E402
 from lib.external_trending import (  # noqa: E402
     build_trending_multiplier_map,
     detect_scoops,
@@ -114,17 +115,17 @@ def run_setup() -> int:
     """Run the first-time setup wizard (brief §8.3), writing ``orbit.config.json``.
 
     Wiring only (Rule 5): delegates to :func:`lib.setup_wizard.run_setup_wizard` with the
-    real defaults — the live subscription/following loaders, the module-level
-    :func:`lib.classify._default_llm_classifier` boundary (the host session wires the real
-    caller at runtime), builtin ``input``, and ``./orbit.config.json``. The wizard reads
-    subs/follows, auto-classifies via the existing classify path, confirms categories,
-    picks priority creators, sets delivery + schedule, writes the config, and prints the
-    OS cron entry.
+    real defaults — the live subscription/following loaders, the live Claude classify
+    boundary (:func:`lib.llm.make_llm_classifier`, which shells out to ``claude -p`` on the
+    Claude Code subscription), builtin ``input``, and ``./orbit.config.json``. The wizard
+    reads subs/follows, auto-classifies
+    via the existing classify path, confirms categories, picks priority creators, sets
+    delivery + schedule, writes the config, and prints the OS cron entry.
 
     Returns:
         Process exit code (0 on success), propagated from the wizard.
     """
-    return run_setup_wizard(llm_classifier=_default_llm_classifier)
+    return run_setup_wizard(llm_classifier=make_llm_classifier())
 
 
 def _parse_iso_timestamp(text: Optional[str]) -> Optional[datetime]:
@@ -689,30 +690,35 @@ def run_pipeline(depth: str) -> int:
         )
         return 1
 
-    # The YouTube delta-fetch + classify/chapterize half (Stages 1-2 for YouTube) is
-    # still an upstream stub — its real producer lands in a later phase. It yields NO
-    # rankable items yet. The X half's Stage 1 (delta + classify + build) IS real this
-    # phase, but classification needs a live LLM boundary that does not exist in this
-    # build env (the default fails loud, Rule 12). A bare CLI run therefore cannot
-    # classify, so it logs the upstream stubs and ranks+renders whatever non-classified
-    # items exist (currently none). The unified merge + X Stage-1 path is exercised
-    # end-to-end by the integration test, which injects a mock LLM + mock X delta.
+    # The live Claude boundary for classification (reads ANTHROPIC_API_KEY / .env).
+    # Built once and threaded into the producers below.
+    llm_classifier = make_llm_classifier()
+
+    # The YouTube delta-fetch + classify/chapterize producer (Stages 1-2 for YouTube)
+    # is NOT yet wired into this driver — the lib building blocks (delta, transcribe,
+    # classify, chapterize) exist and are unit-tested, but no orbit.py stage assembles
+    # them, so the YouTube half yields NO rankable items here yet. Surfaced loudly
+    # (Rule 12) rather than silently producing an empty digest.
     for stage_name in _STUBBED_UPSTREAM_STAGES:
         log.log_warning(
             "stage_not_yet_implemented",
             stage=stage_name,
             depth=depth,
             detail=(
-                "Upstream producer (YouTube delta fetch / classify+chapterize) lands in a "
-                "later phase; the X Stage-1 path is wired but needs a runtime LLM classifier."
+                "YouTube delta-fetch + classify/chapterize producer is not wired into the "
+                "driver yet; the X Stage-1 producer below IS wired and runs this pass."
             ),
         )
 
-    # Stage 6->7 (rank + render) — REAL this phase. The unified stream merges YouTube
-    # uploads (stubbed-empty in a bare run) with X tweet RankableItems; both flow
+    # Stage 1 (X half) — REAL: delta-fetch X tweets, classify them on the live LLM
+    # boundary, build RankableItems. No-op (empty) when the user has no X sources
+    # configured (YouTube-only setups).
+    youtube_items: list[RankableItem] = []  # YouTube producer not wired into the driver yet
+    x_items = run_stage1_build_x_items(config, depth, llm_classifier=llm_classifier)
+
+    # Stage 6->7 (rank + render). The unified stream merges YouTube uploads (empty
+    # until the YouTube producer is wired) with X tweet RankableItems; both flow
     # through the SAME rank/tier/render (the M2 unified-digest seam).
-    youtube_items: list[RankableItem] = []  # upstream stubbed; empty until a later phase
-    x_items: list[RankableItem] = []  # needs a runtime LLM classifier; empty in a bare CLI run
     rankable_items = youtube_items + x_items
 
     # Stage 5 (M3) — cluster overlaps, compute baseline-relative trending, tag external
@@ -757,6 +763,11 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = build_argument_parser()
     parsed_args = parser.parse_args(argv)
+
+    # Seed the local .env into os.environ ONCE, before any stage runs. The X loader
+    # (lib.bird_x) reads AUTH_TOKEN / CT0 / X_USER_ID straight from os.environ, so this must
+    # happen up front — not as a side effect of a later classify call. No-op if .env absent.
+    load_dotenv()
 
     if parsed_args.setup:
         return run_setup()
