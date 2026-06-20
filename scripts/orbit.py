@@ -43,9 +43,19 @@ from lib.setup_wizard import run_setup_wizard  # noqa: E402
 from lib.trending import TrendingItem, compute_internal_trending  # noqa: E402
 from lib.youtube_yt import (  # noqa: E402
     Subscription,
+    Upload,
     YouTubeAuthError,
+    YouTubeFetchError,
+    fetch_new_uploads,
     load_youtube_subscriptions,
     persist_subscriptions,
+)
+from lib.transcribe import TRANSCRIPT_LIMITS, Transcript, fetch_transcript_with_cues  # noqa: E402
+from lib.chapterize import (  # noqa: E402
+    ChapterSegmenter,
+    LONG_FORM_THRESHOLD_SECONDS,
+    _default_chapter_segmenter,
+    chapterize_episode,
 )
 
 # Weekly-cache window (brief §3 Stage 0): sources are re-loaded at most once per
@@ -58,9 +68,9 @@ _SOURCES_REFRESH_INTERVAL_SECONDS: int = 7 * 24 * 60 * 60
 # mocked loader; this env var is the equivalent escape hatch for a bare CLI run.
 _STAGE0_SKIP_NETWORK_ENV_VAR: str = "ORBIT_STAGE0_SKIP_NETWORK"
 
-# The pipeline stages, in execution order. Stage 0 (sources) and Stage 3-4
-# (rank + render, this phase) are real; Stages 1-2 (delta fetch, classify,
-# chapterize) are still upstream stubs wired in a later phase.
+# The pipeline stages, in execution order. All stages are now wired: Stage 0
+# (sources), Stages 1-2 (delta fetch + classify/chapterize, for BOTH YouTube and X),
+# and Stages 3-4 (rank + render).
 PIPELINE_STAGES: tuple[str, ...] = (
     "stage_0_load_sources",
     "stage_1_delta_fetch",
@@ -68,13 +78,6 @@ PIPELINE_STAGES: tuple[str, ...] = (
     "stage_3_rank",
     "stage_4_render",
 )
-
-# Stages still stubbed (delta fetch + classify/chapterize) — the upstream half that
-# feeds rankable items. This phase (Phase 3, M1) builds only the rank+render half;
-# the real producers land in a later phase. Listed here so run_pipeline logs each
-# as "not yet implemented" while still running the real Stage 6->7 on whatever items
-# the upstream provides.
-_STUBBED_UPSTREAM_STAGES: tuple[str, ...] = ("stage_1_delta_fetch", "stage_2_classify")
 
 # Default HTML output path when ``config.delivery`` carries no ``html_path``. The
 # tilde is expanded at write time. Page 2 is written beside it as today-page2.html.
@@ -381,6 +384,145 @@ def run_stage1_build_x_items(
         platform="x",
         source_count=len(x_sources),
         tweet_count=len(new_tweets),
+        rankable_count=len(rankable_items),
+    )
+    return rankable_items
+
+
+def run_stage1_build_youtube_items(
+    config: OrbitConfig,
+    depth: str,
+    *,
+    upload_delta: Optional[Callable[[dict, str], list[Upload]]] = None,
+    transcript_fetcher: Optional[Callable[..., Optional[Transcript]]] = None,
+    mark_seen: Optional[Callable[[int, str], None]] = None,
+    llm_classifier: LlmClassifier = _default_llm_classifier,
+    segmenter: ChapterSegmenter = _default_chapter_segmenter,
+) -> list[RankableItem]:
+    """Stage 1-2 (YouTube half): delta-fetch new uploads, classify + chapterize, build RankableItems.
+
+    The YouTube-source analog of :func:`run_stage1_build_x_items`. For each persisted
+    YouTube source (``store.list_sources(platform="youtube")``) it delta-fetches the new
+    uploads via the injectable ``upload_delta`` (defaults to
+    :func:`lib.youtube_yt.fetch_new_uploads`, which already filters out ``seen`` ids),
+    classifies EACH upload on the SAME two-axis :func:`lib.classify.classify_item` path as
+    X (the channel-level Axis-A prior is the source row's ``category``), chapterizes
+    long-form uploads via :func:`lib.chapterize.chapterize_episode`, and adapts each into
+    the shared :class:`RankableItem` via :meth:`RankableItem.from_parts`. The result merges
+    into the SAME unified stream X tweets feed, so videos and tweets rank + render together.
+
+    Chapterization is budgeted (Rule 5 — deterministic gating, no LLM in the decision):
+    a long-form upload (``duration > LONG_FORM_THRESHOLD_SECONDS``) with creator-supplied
+    chapters is mapped deterministically (no transcript, no model); a long-form upload
+    WITHOUT them needs a transcript to segment, and transcript fetches are capped per run
+    at :data:`lib.transcribe.TRANSCRIPT_LIMITS` ``[depth]`` (``quick`` 0, ``default`` 2,
+    ``deep`` 8) so a daily run never transcribes the whole feed. Over-budget long-form
+    uploads simply render without chapters.
+
+    Per-channel fetch failures are best-effort: a :class:`lib.youtube_yt.YouTubeFetchError`
+    (a single channel's timeout / transient listing failure) is logged with an actionable
+    ``fix_suggestion`` and SKIPPED so one bad channel never loses the whole YouTube half.
+    A seen-mark is written AFTER each upload is successfully built (delta-engine contract:
+    marking is the driver's post-success job, never pre-marked).
+
+    No-op (returns ``[]``) when there are no YouTube sources. ``orbit.py`` stays
+    wiring-only (Rule 5): delta/classify/chapterize/build all live in lib/.
+
+    Args:
+        config: The loaded :class:`OrbitConfig` (supplies ``interests`` for Axis B).
+        depth: ``quick`` | ``default`` | ``deep`` — selects the per-run transcript budget.
+        upload_delta: Per-channel new-upload fetcher; defaults to
+            :func:`lib.youtube_yt.fetch_new_uploads`. Injectable so tests mock the
+            subprocess boundary.
+        transcript_fetcher: Transcript fetcher; defaults to
+            :func:`lib.transcribe.fetch_transcript_with_cues`. Injectable for tests.
+        mark_seen: Seen-marker; defaults to :func:`store.mark_seen`. Injectable for tests.
+        llm_classifier: The injectable classify LLM boundary; tests inject a mock, the
+            host session wires the real caller at runtime.
+        segmenter: The injectable chapterize LLM boundary (same shape); tests inject a
+            mock, the host session wires the real caller at runtime.
+
+    Returns:
+        The new YouTube uploads as classified + chapterized :class:`RankableItem`s
+        (possibly empty).
+    """
+    youtube_sources = store.list_sources(platform="youtube")
+    if not youtube_sources:
+        log.log_info("youtube_stage1_no_sources", platform="youtube")
+        return []
+
+    active_upload_delta = upload_delta or fetch_new_uploads
+    active_transcript_fetcher = transcript_fetcher or fetch_transcript_with_cues
+    active_mark_seen = mark_seen or store.mark_seen
+
+    transcript_limit = TRANSCRIPT_LIMITS.get(depth, TRANSCRIPT_LIMITS["default"])
+    transcripts_fetched = 0
+    total_new_uploads = 0
+
+    rankable_items: list[RankableItem] = []
+    for source in youtube_sources:
+        source_id = source["source_id"]
+        channel_id = str(source["external_id"])
+        channel_category = str(source.get("category") or "signal")
+
+        try:
+            new_uploads = active_upload_delta(source, depth)
+        except YouTubeFetchError as exc:
+            # Reason: one channel's listing failure must not lose the whole YouTube half.
+            # Log loud-and-actionable (Rule 12) and skip just this channel — the rest of
+            # the feed (and the X half) still produces a digest.
+            log.log_warning(
+                "youtube_stage1_channel_skipped",
+                platform="youtube",
+                source_id=source_id,
+                channel_id=channel_id,
+                fix_suggestion=(
+                    "Listing uploads for this channel failed (timeout / transient); skipped "
+                    "it for this run. Other channels still processed. See the error above."
+                ),
+                error_message=str(exc),
+            )
+            continue
+
+        total_new_uploads += len(new_uploads)
+        for upload in new_uploads:
+            classification = classify.classify_item(
+                upload,
+                channel_category=channel_category,
+                interests=config.interests,
+                llm_classifier=llm_classifier,
+            )
+
+            # Only a long-form upload WITHOUT creator chapters needs a transcript (the LLM
+            # segmentation path); short items and creator-chaptered items need none. Fetch
+            # one only while under the per-run budget — chapterize_episode then decides the
+            # rest (short -> [], creator chapters -> deterministic, else snap to cues).
+            transcript: Optional[Transcript] = None
+            needs_transcript = (
+                upload.duration is not None
+                and upload.duration > LONG_FORM_THRESHOLD_SECONDS
+                and not upload.chapters
+            )
+            if needs_transcript and transcripts_fetched < transcript_limit:
+                transcript = active_transcript_fetcher(upload.video_id, depth)
+                transcripts_fetched += 1
+            chapters = chapterize_episode(upload, transcript, segmenter=segmenter)
+
+            rankable_items.append(
+                RankableItem.from_parts(
+                    upload, classification, chapters, creator_external_id=channel_id
+                )
+            )
+            # Mark seen AFTER a successful build so a mid-run crash never silently drops an
+            # item by pre-marking it (delta-engine contract, youtube_yt.fetch_new_uploads).
+            active_mark_seen(source_id, upload.video_id)
+
+    log.log_info(
+        "youtube_stage1_build_completed",
+        platform="youtube",
+        source_count=len(youtube_sources),
+        upload_count=total_new_uploads,
+        transcripts_fetched=transcripts_fetched,
         rankable_count=len(rankable_items),
     )
     return rankable_items
@@ -694,31 +836,22 @@ def run_pipeline(depth: str) -> int:
     # Code subscription — no ANTHROPIC_API_KEY). Built once and threaded into the producers below.
     llm_classifier = make_llm_classifier()
 
-    # The YouTube delta-fetch + classify/chapterize producer (Stages 1-2 for YouTube)
-    # is NOT yet wired into this driver — the lib building blocks (delta, transcribe,
-    # classify, chapterize) exist and are unit-tested, but no orbit.py stage assembles
-    # them, so the YouTube half yields NO rankable items here yet. Surfaced loudly
-    # (Rule 12) rather than silently producing an empty digest.
-    for stage_name in _STUBBED_UPSTREAM_STAGES:
-        log.log_warning(
-            "stage_not_yet_implemented",
-            stage=stage_name,
-            depth=depth,
-            detail=(
-                "YouTube delta-fetch + classify/chapterize producer is not wired into the "
-                "driver yet; the X Stage-1 producer below IS wired and runs this pass."
-            ),
-        )
+    # Stage 1-2 (YouTube half) — delta-fetch new uploads, classify them on the live LLM
+    # boundary, chapterize long-form episodes (creator chapters deterministically, else a
+    # budgeted transcript + LLM segmentation), build RankableItems. The same llm boundary
+    # serves both classify and chapterize. No-op (empty) when the user has no YouTube
+    # sources configured.
+    youtube_items = run_stage1_build_youtube_items(
+        config, depth, llm_classifier=llm_classifier, segmenter=llm_classifier
+    )
 
-    # Stage 1 (X half) — REAL: delta-fetch X tweets, classify them on the live LLM
-    # boundary, build RankableItems. No-op (empty) when the user has no X sources
-    # configured (YouTube-only setups).
-    youtube_items: list[RankableItem] = []  # YouTube producer not wired into the driver yet
+    # Stage 1 (X half) — delta-fetch X tweets, classify them on the live LLM boundary,
+    # build RankableItems. No-op (empty) when the user has no X sources configured
+    # (YouTube-only setups).
     x_items = run_stage1_build_x_items(config, depth, llm_classifier=llm_classifier)
 
-    # Stage 6->7 (rank + render). The unified stream merges YouTube uploads (empty
-    # until the YouTube producer is wired) with X tweet RankableItems; both flow
-    # through the SAME rank/tier/render (the M2 unified-digest seam).
+    # Stage 6->7 (rank + render). The unified stream merges YouTube uploads with X tweet
+    # RankableItems; both flow through the SAME rank/tier/render (the M2 unified-digest seam).
     rankable_items = youtube_items + x_items
 
     # Stage 5 (M3) — cluster overlaps, compute baseline-relative trending, tag external
