@@ -131,11 +131,13 @@ def test_generate_cron_entry_contains_claude_orbit_command() -> None:
 
     WHY: step 5 of setup hands the user a crontab line they paste verbatim. If the command
     isn't the brief's default scheduler invocation, their cron would run the wrong thing (or
-    nothing). We assert both the schedule prefix and the exact command tail.
+    nothing). The ``--dangerously-skip-permissions`` flag is load-bearing: without it the
+    headless cron run blocks on a permission prompt and silently produces nothing. We assert
+    the schedule prefix, the skip-permissions flag, and the exact command tail.
     """
     entry = generate_cron_entry("0 7 * * *", repo_path=Path("/home/me/orbit"))
     assert entry.startswith("0 7 * * * ")
-    assert 'claude -p "/orbit"' in entry
+    assert 'claude -p --dangerously-skip-permissions "/orbit"' in entry
     assert "cd /home/me/orbit" in entry
 
 

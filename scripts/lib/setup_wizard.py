@@ -46,7 +46,7 @@ from lib.youtube_yt import Subscription, load_youtube_subscriptions  # noqa: E40
 # The default scheduler command, per brief §8.3 step 5 / §2 (OS cron -> claude -p "/orbit").
 # ``{repo}`` is the directory the user runs Orbit from; the cron line cds there first so
 # the relative ``orbit.config.json`` resolves the same way a manual run would.
-_DEFAULT_CRON_COMMAND_TEMPLATE: str = 'cd {repo} && claude -p "/orbit"'
+_DEFAULT_CRON_COMMAND_TEMPLATE: str = 'cd {repo} && claude -p --dangerously-skip-permissions "/orbit"'
 
 # A weight applied to every creator the user marks as priority. The brief leaves the
 # exact value to the maintainer; 2.0 is a clear "thumb on the scale" (api-contracts.md

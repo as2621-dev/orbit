@@ -690,8 +690,8 @@ def run_pipeline(depth: str) -> int:
         )
         return 1
 
-    # The live Claude boundary for classification (reads ANTHROPIC_API_KEY / .env).
-    # Built once and threaded into the producers below.
+    # The live Claude boundary for classification (runs ``claude -p`` on the user's Claude
+    # Code subscription — no ANTHROPIC_API_KEY). Built once and threaded into the producers below.
     llm_classifier = make_llm_classifier()
 
     # The YouTube delta-fetch + classify/chapterize producer (Stages 1-2 for YouTube)

@@ -54,14 +54,23 @@ def test_call_claude_cli_returns_clean_json_and_passes_model() -> None:
 
     Encodes the contract callers depend on — the raw JSON string flows straight to
     ``json.loads`` — and that ``--model`` is actually wired (a regression dropping it would
-    silently classify on the wrong/expensive model)."""
+    silently classify on the wrong/expensive model). Also pins
+    ``--dangerously-skip-permissions`` so headless/cron runs never block on a permission
+    prompt (matches the subscription-run pattern used by /last30days)."""
     verdict = '{"axis_a_signal":1,"axis_b_on_topic":0}'
     runner = _runner_returning(verdict)
 
     result = llm.call_claude_cli("prompt", model="claude-sonnet-4-6", runner=runner)
 
     assert result == verdict
-    assert runner.captured["cmd"] == ["claude", "-p", "--model", "claude-sonnet-4-6", "prompt"]
+    assert runner.captured["cmd"] == [
+        "claude",
+        "-p",
+        "--dangerously-skip-permissions",
+        "--model",
+        "claude-sonnet-4-6",
+        "prompt",
+    ]
 
 
 def test_call_claude_cli_strips_markdown_fence() -> None:

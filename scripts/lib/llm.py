@@ -211,7 +211,7 @@ def call_claude_cli(
         )
         raise LlmCliError(f"'{CLAUDE_CLI}' CLI not found on PATH")
 
-    command = [CLAUDE_CLI, "-p", "--model", model, prompt]
+    command = [CLAUDE_CLI, "-p", "--dangerously-skip-permissions", "--model", model, prompt]
     try:
         result = runner(command, timeout=timeout)
     except subproc.SubprocTimeout as exc:
