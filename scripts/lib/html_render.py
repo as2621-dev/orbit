@@ -211,6 +211,66 @@ def render_chapter_list(chapters: Iterable[Any]) -> str:
     return '<ul class="chapters">' + "".join(chapter_items) + "</ul>"
 
 
+def render_summary_bullets(bullets: Iterable[Any]) -> str:
+    """Render a winner's summary as a bullet list (the digest's headline content).
+
+    Each bullet is a :class:`lib.summarize.SummaryBullet` (duck-typed: ``.text``,
+    ``.start_seconds``, ``.deep_link``). A VIDEO bullet carries a ``deep_link`` and is
+    rendered as a timestamped deep-link ``<li>`` (jump straight to the moment); a TWEET
+    bullet has no ``deep_link`` and renders as a plain text ``<li>``. The deep-link is a
+    trusted ``watch?v=ID&t=Ns`` URL, so it passes the allowlist and survives escaping.
+    Returns ``""`` for an empty list (no empty container).
+
+    Args:
+        bullets: An iterable of summary bullets.
+
+    Returns:
+        A ``<ul class="summary">...</ul>`` string, or ``""`` if there are no bullets.
+    """
+    list_items: list[str] = []
+    for bullet in bullets:
+        text = escape(getattr(bullet, "text", "") or "")
+        deep_link = getattr(bullet, "deep_link", None)
+        if deep_link:
+            timestamp = escape(_format_timestamp(getattr(bullet, "start_seconds", 0.0) or 0.0))
+            list_items.append(
+                f'<li><a class="summary-link" href="{safe_href(deep_link)}">'
+                f'<span class="summary-time">{timestamp}</span> '
+                f'<span class="summary-text">{text}</span></a></li>'
+            )
+        else:
+            list_items.append(f'<li class="summary-point">{text}</li>')
+    if not list_items:
+        return ""
+    return '<ul class="summary">' + "".join(list_items) + "</ul>"
+
+
+def render_footnote_links(footnote_links: Iterable[tuple[str, str]]) -> str:
+    """Render the "Also covered" footnote links folded under a cluster winner's card.
+
+    The non-winner members of a topic cluster are surfaced here as links (so duplicate
+    coverage of one story collapses to a single summarized card plus these footnotes).
+    Each link's URL is allowlist-checked + escaped via :func:`render_link`. Returns
+    ``""`` for an empty list (no empty container).
+
+    Args:
+        footnote_links: An iterable of ``(url, label)`` pairs (built by the renderer
+            from each non-winner item's deep-link + title).
+
+    Returns:
+        A ``<div class="card-footnotes">...</div>`` string, or ``""`` if empty.
+    """
+    list_items = [
+        f'<li>{render_link(url, label, css_class="footnote-link")}</li>' for url, label in footnote_links
+    ]
+    if not list_items:
+        return ""
+    return (
+        '<div class="card-footnotes"><span class="footnote-label">Also covered</span>'
+        '<ul class="footnote-list">' + "".join(list_items) + "</ul></div>"
+    )
+
+
 def render_meta_line(item: Any) -> str:
     """Render a one-line engagement/meta string for a card (channel · views).
 
@@ -257,18 +317,35 @@ def _format_count(count: int) -> str:
     return str(count)
 
 
-def render_card(item: Any, card_url: str, tier_class: str, *, with_chapters: bool) -> str:
+def render_card(
+    item: Any,
+    card_url: str,
+    tier_class: str,
+    *,
+    with_chapters: bool,
+    summary_bullets: Iterable[Any] | None = None,
+    footnote_links: Iterable[tuple[str, str]] | None = None,
+) -> str:
     """Render a full creator episode card (Hero / Standard tiers).
 
     The card title links to ``card_url`` (the whole-video ``watch?v=ID&t=0s``
-    deep-link). When ``with_chapters`` is True and the item carries chapters, the
-    full deep-link chapter list is appended. Title is escaped; href is allowlisted.
+    deep-link). Its body content is, in precedence order: the SUMMARY bullet list when
+    ``summary_bullets`` is given (a cluster winner — the headline feature, timestamped
+    for videos), ELSE the deep-link chapter list when ``with_chapters`` and the item
+    carries chapters (legacy / non-summarized path). The "Also covered" footnote links
+    (the folded non-winner cluster members) are appended when ``footnote_links`` is
+    given. Title is escaped; every href is allowlisted. With neither ``summary_bullets``
+    nor ``footnote_links`` (the existing callers / M1 path), output is unchanged.
 
     Args:
         item: A :class:`lib.rerank.RankableItem`.
         card_url: The whole-video deep-link for the card title.
         tier_class: The CSS tier class (``"hero"`` / ``"standard"``).
-        with_chapters: Whether to render the chapter list (Hero/Standard: True).
+        with_chapters: Whether to render the chapter list (Hero/Standard: True) when
+            there is no summary.
+        summary_bullets: OPTIONAL the winner's summary bullets; when present they
+            REPLACE the chapter list as the card's body.
+        footnote_links: OPTIONAL ``(url, label)`` pairs for the "Also covered" footnotes.
 
     Returns:
         A ``<article class="card {tier_class}">...</article>`` string.
@@ -276,16 +353,23 @@ def render_card(item: Any, card_url: str, tier_class: str, *, with_chapters: boo
     title = getattr(item, "title", "") or ""
     title_link = f'<h2 class="card-title">{render_link(card_url, title)}</h2>'
     meta_line = render_meta_line(item)
-    chapter_list = render_chapter_list(getattr(item, "chapters", []) or []) if with_chapters else ""
-    return f'<article class="card {escape(tier_class)}">{title_link}{meta_line}{chapter_list}</article>'
+    summary_html = render_summary_bullets(summary_bullets) if summary_bullets else ""
+    if summary_html:
+        body = summary_html
+    else:
+        body = render_chapter_list(getattr(item, "chapters", []) or []) if with_chapters else ""
+    footnotes_html = render_footnote_links(footnote_links or [])
+    return f'<article class="card {escape(tier_class)}">{title_link}{meta_line}{body}{footnotes_html}</article>'
 
 
-def render_compact_row(item: Any, card_url: str) -> str:
+def render_compact_row(item: Any, card_url: str, *, footnote_links: Iterable[tuple[str, str]] | None = None) -> str:
     """Render a condensed single-line Compact-tier row (no chapter list).
 
     Args:
         item: A :class:`lib.rerank.RankableItem`.
         card_url: The whole-video deep-link for the linked title.
+        footnote_links: OPTIONAL "Also covered" links (a compact-tier cluster winner
+            still folds its non-winner members in rather than dropping them).
 
     Returns:
         A ``<div class="card compact">...</div>`` row string.
@@ -293,9 +377,11 @@ def render_compact_row(item: Any, card_url: str) -> str:
     title = getattr(item, "title", "") or ""
     channel_name = getattr(item, "channel_name", "") or ""
     channel_html = f' <span class="channel">· {escape(channel_name)}</span>' if channel_name else ""
+    footnotes_html = render_footnote_links(footnote_links or [])
     return (
         '<div class="card compact">'
         f'<span class="compact-title">{render_link(card_url, title)}</span>{channel_html}'
+        f"{footnotes_html}"
         "</div>"
     )
 
@@ -548,6 +634,29 @@ a:hover { text-decoration: underline; }
 }
 .trending-tag.tag-scoop { color: var(--accent); border-color: var(--accent); }
 .trending-tag.tag-corroborated { color: var(--text); }
+/* Summary bullets (the cluster-winner headline content) + "Also covered" footnotes. */
+.summary { list-style: none; margin: 12px 0 0; padding: 0; border-top: 1px solid var(--border); }
+.summary li { padding: 5px 0; }
+.summary-link { display: flex; gap: 10px; }
+.summary-time {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  min-width: 3.5em;
+}
+.summary-text { color: var(--text); }
+.summary-point { color: var(--text); }
+.card-footnotes { margin-top: 12px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.footnote-label {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.footnote-list { list-style: none; margin: 4px 0 0; padding: 0; }
+.footnote-list li { padding: 2px 0; font-size: 0.85rem; }
 """
 
 

@@ -78,6 +78,18 @@ ENGAGEMENT_COMMENT_WEIGHT: float = 0.15
 # beats its creator's norm, negative when it lags — so over-performers float.
 RELATIVE_ENGAGEMENT_WEIGHT: float = 1.0
 
+# How strongly RAW popularity (the item's absolute log-engagement blend, NOT relative
+# to its creator) moves the score. Deliberately SMALL vs RELATIVE_ENGAGEMENT_WEIGHT so
+# absolute view/like/comment counts HELP a high-traffic item rank up without letting a
+# mega-channel's every upload dominate (the baseline-relative term remains primary).
+RAW_POPULARITY_WEIGHT: float = 0.3
+
+# How strongly a video's duration biases WINNER selection (winner_score only — not the
+# main derank score). A small log-space nudge so that, among same-topic cluster members
+# of comparable score, the longer / more in-depth video is crowned ("covers the most
+# information"). Does not affect the final page ordering.
+DURATION_BIAS_WEIGHT: float = 0.15
+
 # Recency: exponential decay over days since upload. RECENCY_HALF_LIFE_DAYS is the
 # age at which the recency term halves; RECENCY_WEIGHT scales its contribution.
 # A missing/garbage upload_date falls back to RECENCY_NEUTRAL_DECAY (neutral mid),
@@ -146,6 +158,16 @@ class RankableItem:
     classification: Any = None
     chapters: list = field(default_factory=list)
     card_url: str = ""
+    # Duration in seconds (YouTube uploads). None for tweets / unknown. Carried so the
+    # clusterer can detect long-form by duration (chapters no longer exist at cluster
+    # time) and so winner_score can bias toward longer, more in-depth videos.
+    duration: Optional[int] = None
+    # The item's :class:`lib.summarize.Summary` (set on cluster WINNERS by the
+    # summarize stage), or None. Read by the renderer to draw the bullet list.
+    summary: Any = None
+    # When this item is a cluster winner, the non-winner cluster members it absorbed —
+    # rendered as "Also covered" footnote links under its card. Empty for singletons.
+    footnotes: list = field(default_factory=list)
 
     @classmethod
     def from_parts(
@@ -198,6 +220,7 @@ class RankableItem:
             upload_date=str(getattr(upload, "upload_date", "") or ""),
             classification=classification,
             chapters=list(chapters) if chapters else [],
+            duration=getattr(upload, "duration", None),
         )
 
     @classmethod
@@ -571,7 +594,12 @@ def score_item(
     else:
         trending_multiplier = TRENDING_MULTIPLIER_NEUTRAL
 
-    intrinsic = UNIQUENESS_BASELINE_BOOST + RELATIVE_ENGAGEMENT_WEIGHT * relative_engagement + RECENCY_WEIGHT * recency
+    intrinsic = (
+        UNIQUENESS_BASELINE_BOOST
+        + RELATIVE_ENGAGEMENT_WEIGHT * relative_engagement
+        + RAW_POPULARITY_WEIGHT * item_blend
+        + RECENCY_WEIGHT * recency
+    )
     score = priority_weight * CLUSTER_SIZE_NEUTRAL * trending_multiplier * intrinsic
 
     log.log_debug(
@@ -585,6 +613,47 @@ def score_item(
         score=round(score, 4),
     )
     return score
+
+
+def winner_score(
+    item: RankableItem,
+    config: Any,
+    *,
+    creator_baselines: Optional[dict[str, float]] = None,
+    reference_date: Optional[date] = None,
+    trending_multipliers: Optional[dict[str, float]] = None,
+) -> float:
+    """Score one item for CLUSTER-WINNER selection: the derank score, duration-biased.
+
+    Used by the crown-winners stage to pick the single item that represents a topic
+    cluster (the one that gets the full summary; the rest become footnotes). It is the
+    ordinary :func:`score_item` PLUS a small ``DURATION_BIAS_WEIGHT`` log-space nudge
+    toward longer videos — a deterministic proxy for "covers the most information"
+    (locked decision 3). Tweets and unknown-duration items get a zero duration bonus
+    (``log1p_safe(None) == 0.0``), so among comparable scores a real long-form video
+    naturally edges out a short clip or a tweet. This affects ONLY which member is
+    crowned, never the final page ordering (that still uses :func:`score_item`).
+
+    Args:
+        item: The :class:`RankableItem` candidate.
+        config: An :class:`lib.config.OrbitConfig` (read for ``creator_weights``).
+        creator_baselines: Precomputed creator baseline-blend map (see
+            :func:`compute_creator_engagement_baselines`); pass the SAME map used for the
+            final rank so winner choice and page rank stay consistent.
+        reference_date: "Now" for recency decay (injectable for deterministic tests).
+        trending_multipliers: OPTIONAL trending/scoop multiplier map (same as score_item).
+
+    Returns:
+        The duration-biased winner score as a float.
+    """
+    base = score_item(
+        item,
+        config,
+        creator_baselines=creator_baselines,
+        reference_date=reference_date,
+        trending_multipliers=trending_multipliers,
+    )
+    return base + DURATION_BIAS_WEIGHT * log1p_safe(getattr(item, "duration", None))
 
 
 def derank_items(

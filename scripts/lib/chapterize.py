@@ -161,12 +161,13 @@ def _render_prompt(video_title: str, transcript: Transcript) -> str:
     return template.format(video_title=video_title, cue_lines=cue_lines)
 
 
-def _snap_to_nearest_cue_offset(target_seconds: float, cue_offsets: list[float]) -> float:
+def snap_to_nearest_cue_offset(target_seconds: float, cue_offsets: list[float]) -> float:
     """Snap a model-returned timestamp to the NEAREST real cue offset.
 
-    This is the invariant enforcer: a chapter's ``start_seconds`` MUST be a real cue
-    offset, never an invented number. If the model returns an exact cue offset it is
-    returned unchanged; otherwise it maps to the closest one.
+    This is the invariant enforcer reused by BOTH chapterize and summarize: a
+    chapter's (or summary bullet's) ``start_seconds`` MUST be a real cue offset,
+    never an invented number. If the model returns an exact cue offset it is returned
+    unchanged; otherwise it maps to the closest one.
 
     Args:
         target_seconds: The model's proposed start offset.
@@ -176,6 +177,10 @@ def _snap_to_nearest_cue_offset(target_seconds: float, cue_offsets: list[float])
         The element of ``cue_offsets`` closest to ``target_seconds``.
     """
     return min(cue_offsets, key=lambda cue_offset: abs(cue_offset - target_seconds))
+
+
+# Private alias kept for any in-tree caller/test referencing the underscore name.
+_snap_to_nearest_cue_offset = snap_to_nearest_cue_offset
 
 
 def _parse_segments(raw: str) -> list[dict] | None:

@@ -211,3 +211,42 @@ def test_inter_request_delay_is_invoked_between_handles() -> None:
         assert len(sleep_calls) == len(handles) - 1
         # And it sleeps the configured conservative inter-request delay each time.
         assert all(seconds == bird_x.INTER_REQUEST_DELAY_SECONDS for seconds in sleep_calls)
+
+
+def test_retweets_and_quote_tweets_are_dropped_but_marked_seen() -> None:
+    """Pure retweets and quote-tweets are dropped from the digest but still marked seen.
+
+    WHY: the user wants only ORIGINAL posts summarized (no retweets, no quote-tweets). A pure
+    retweet is detected by its ``RT @`` text prefix (the vendored client surfaces no retweet
+    flag); a quote-tweet by its ``quotedTweet`` object. Both must be DROPPED from the
+    returned stream yet STILL marked seen — otherwise the delta engine would re-pull and
+    re-evaluate them every run forever. Only the fully original tweet survives.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store(Path(tmp))
+        source_id_by_handle = _seed_x_sources(["alice"])
+        alice_id = source_id_by_handle["alice"]
+
+        payload = json.dumps(
+            [
+                {"id": "orig", "text": "an original take on ai agents", "author": {"username": "alice"},
+                 "createdAt": "2026-06-18T00:00:00Z", "likeCount": 5, "retweetCount": 1, "replyCount": 0},
+                {"id": "rt", "text": "RT @someone: a borrowed hot take", "author": {"username": "alice"},
+                 "createdAt": "2026-06-18T00:00:00Z", "likeCount": 0, "retweetCount": 99, "replyCount": 0},
+                {"id": "quote", "text": "my comment on this", "author": {"username": "alice"},
+                 "createdAt": "2026-06-18T00:00:00Z", "likeCount": 2, "retweetCount": 0, "replyCount": 0,
+                 "quotedTweet": {"id": "other", "text": "the quoted original"}},
+            ]
+        )
+        queried: List[str] = []
+        sources = store.list_sources(platform="x")
+
+        with patch.object(bird_x.subproc, "run_with_timeout", _make_subproc_stub({"alice": payload}, queried)):
+            new_tweets = bird_x.fetch_new_tweets(sources, depth="default", run_day_ordinal=0, sleeper=lambda _s: None)
+
+        returned_ids = {tweet.tweet_id for tweet in new_tweets}
+        # Only the original survives the drop.
+        assert returned_ids == {"orig"}
+        # But ALL three (incl. the dropped RT + quote) are marked seen — dropping is terminal.
+        seen_after = store.get_seen_ids(alice_id)
+        assert {"orig", "rt", "quote"}.issubset(seen_after)

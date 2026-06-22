@@ -26,7 +26,7 @@ from typing import Any, Callable, Optional
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
 
 import store  # noqa: E402  (import must follow the sys.path insert above)
-from lib import bird_x, classify, deliver, log, render  # noqa: E402
+from lib import bird_x, classify, deliver, log, render, summarize  # noqa: E402
 from lib.bird_x import Follow, Tweet, XAuthError  # noqa: E402
 from lib.classify import LlmClassifier, _default_llm_classifier  # noqa: E402
 from lib.cluster import Cluster, cluster_overlaps  # noqa: E402
@@ -38,7 +38,12 @@ from lib.external_trending import (  # noqa: E402
     detect_scoops,
     tag_external_corroboration,
 )
-from lib.rerank import RankableItem, derank_items  # noqa: E402
+from lib.rerank import (  # noqa: E402
+    RankableItem,
+    compute_creator_engagement_baselines,
+    derank_items,
+    winner_score,
+)
 from lib.setup_wizard import run_setup_wizard  # noqa: E402
 from lib.trending import TrendingItem, compute_internal_trending  # noqa: E402
 from lib.youtube_yt import (  # noqa: E402
@@ -50,12 +55,12 @@ from lib.youtube_yt import (  # noqa: E402
     load_youtube_subscriptions,
     persist_subscriptions,
 )
-from lib.transcribe import TRANSCRIPT_LIMITS, Transcript, fetch_transcript_with_cues  # noqa: E402
-from lib.chapterize import (  # noqa: E402
-    ChapterSegmenter,
-    LONG_FORM_THRESHOLD_SECONDS,
-    _default_chapter_segmenter,
-    chapterize_episode,
+from lib.transcribe import (  # noqa: E402
+    SUMMARY_CAP_BY_DEPTH,
+    SUMMARY_FLOOR,
+    X_SUMMARY_CAP_BY_DEPTH,
+    Transcript,
+    fetch_transcript_with_cues,
 )
 
 # Weekly-cache window (brief §3 Stage 0): sources are re-loaded at most once per
@@ -85,10 +90,14 @@ _STAGE1_MAX_CLASSIFIED_UPLOADS: int = 60
 # and Stages 3-4 (rank + render).
 PIPELINE_STAGES: tuple[str, ...] = (
     "stage_0_load_sources",
-    "stage_1_delta_fetch",
+    "stage_1_ingest_metadata",
     "stage_2_classify",
-    "stage_3_rank",
-    "stage_4_render",
+    "stage_3_cluster",
+    "stage_4_crown_winners",
+    "stage_5_summarize_winners",
+    "stage_6_trending_scoops",
+    "stage_7_rank",
+    "stage_8_render",
 )
 
 # Default HTML output path when ``config.delivery`` carries no ``html_path``. The
@@ -437,30 +446,26 @@ def run_stage1_build_youtube_items(
     depth: str,
     *,
     upload_delta: Optional[Callable[[dict, str], list[Upload]]] = None,
-    transcript_fetcher: Optional[Callable[..., Optional[Transcript]]] = None,
     mark_seen: Optional[Callable[[int, str], None]] = None,
     llm_classifier: LlmClassifier = _default_llm_classifier,
-    segmenter: ChapterSegmenter = _default_chapter_segmenter,
 ) -> list[RankableItem]:
-    """Stage 1-2 (YouTube half): delta-fetch new uploads, classify + chapterize, build RankableItems.
+    """Stage 1-2 (YouTube half): delta-fetch new uploads, classify, build RankableItems.
 
     The YouTube-source analog of :func:`run_stage1_build_x_items`. For each persisted
     YouTube source (``store.list_sources(platform="youtube")``) it delta-fetches the new
     uploads via the injectable ``upload_delta`` (defaults to
     :func:`lib.youtube_yt.fetch_new_uploads`, which already filters out ``seen`` ids),
     classifies EACH upload on the SAME two-axis :func:`lib.classify.classify_item` path as
-    X (the channel-level Axis-A prior is the source row's ``category``), chapterizes
-    long-form uploads via :func:`lib.chapterize.chapterize_episode`, and adapts each into
-    the shared :class:`RankableItem` via :meth:`RankableItem.from_parts`. The result merges
-    into the SAME unified stream X tweets feed, so videos and tweets rank + render together.
+    X (the channel-level Axis-A prior is the source row's ``category``), and adapts each
+    into the shared :class:`RankableItem` via :meth:`RankableItem.from_parts` (carrying its
+    ``duration`` so the clusterer can detect long-form). The result merges into the SAME
+    unified stream X tweets feed, so videos and tweets cluster, rank, and render together.
 
-    Chapterization is budgeted (Rule 5 — deterministic gating, no LLM in the decision):
-    a long-form upload (``duration > LONG_FORM_THRESHOLD_SECONDS``) with creator-supplied
-    chapters is mapped deterministically (no transcript, no model); a long-form upload
-    WITHOUT them needs a transcript to segment, and transcript fetches are capped per run
-    at :data:`lib.transcribe.TRANSCRIPT_LIMITS` ``[depth]`` (``quick`` 0, ``default`` 2,
-    ``deep`` 8) so a daily run never transcribes the whole feed. Over-budget long-form
-    uploads simply render without chapters.
+    NOTE (pipeline reorder): transcript fetch + chapterization no longer happen here.
+    They are EXPENSIVE and now run only for the ONE crowned winner of each topic cluster,
+    in :func:`run_stage5_summarize_winners` (after clustering collapses duplicate coverage)
+    — so a daily run transcribes a bounded handful of winners, never the whole feed. Items
+    therefore leave this stage with an empty ``chapters`` list.
 
     Per-channel fetch failures are best-effort: a :class:`lib.youtube_yt.YouTubeFetchError`
     (a single channel's timeout / transient listing failure) is logged with an actionable
@@ -469,25 +474,20 @@ def run_stage1_build_youtube_items(
     marking is the driver's post-success job, never pre-marked).
 
     No-op (returns ``[]``) when there are no YouTube sources. ``orbit.py`` stays
-    wiring-only (Rule 5): delta/classify/chapterize/build all live in lib/.
+    wiring-only (Rule 5): delta/classify/build all live in lib/.
 
     Args:
         config: The loaded :class:`OrbitConfig` (supplies ``interests`` for Axis B).
-        depth: ``quick`` | ``default`` | ``deep`` — selects the per-run transcript budget.
+        depth: ``quick`` | ``default`` | ``deep`` — passed through to the upload delta.
         upload_delta: Per-channel new-upload fetcher; defaults to
             :func:`lib.youtube_yt.fetch_new_uploads`. Injectable so tests mock the
             subprocess boundary.
-        transcript_fetcher: Transcript fetcher; defaults to
-            :func:`lib.transcribe.fetch_transcript_with_cues`. Injectable for tests.
         mark_seen: Seen-marker; defaults to :func:`store.mark_seen`. Injectable for tests.
         llm_classifier: The injectable classify LLM boundary; tests inject a mock, the
             host session wires the real caller at runtime.
-        segmenter: The injectable chapterize LLM boundary (same shape); tests inject a
-            mock, the host session wires the real caller at runtime.
 
     Returns:
-        The new YouTube uploads as classified + chapterized :class:`RankableItem`s
-        (possibly empty).
+        The new YouTube uploads as classified :class:`RankableItem`s (possibly empty).
     """
     youtube_sources = store.list_sources(platform="youtube")
     if not youtube_sources:
@@ -495,11 +495,8 @@ def run_stage1_build_youtube_items(
         return []
 
     active_upload_delta = upload_delta or fetch_new_uploads
-    active_transcript_fetcher = transcript_fetcher or fetch_transcript_with_cues
     active_mark_seen = mark_seen or store.mark_seen
 
-    transcript_limit = TRANSCRIPT_LIMITS.get(depth, TRANSCRIPT_LIMITS["default"])
-    transcripts_fetched = 0
     total_new_uploads = 0
     classified_count = 0
 
@@ -566,24 +563,12 @@ def run_stage1_build_youtube_items(
                 llm_classifier=llm_classifier,
             )
 
-            # Only a long-form upload WITHOUT creator chapters needs a transcript (the LLM
-            # segmentation path); short items and creator-chaptered items need none. Fetch
-            # one only while under the per-run budget — chapterize_episode then decides the
-            # rest (short -> [], creator chapters -> deterministic, else snap to cues).
-            transcript: Optional[Transcript] = None
-            needs_transcript = (
-                upload.duration is not None
-                and upload.duration > LONG_FORM_THRESHOLD_SECONDS
-                and not upload.chapters
-            )
-            if needs_transcript and transcripts_fetched < transcript_limit:
-                transcript = active_transcript_fetcher(upload.video_id, depth)
-                transcripts_fetched += 1
-            chapters = chapterize_episode(upload, transcript, segmenter=segmenter)
-
+            # Transcript + chapterize moved to run_stage5_summarize_winners (winners only).
+            # Items leave Stage 1 with no chapters; ``duration`` flows through from_parts so
+            # the clusterer can still detect long-form by duration.
             rankable_items.append(
                 RankableItem.from_parts(
-                    upload, classification, chapters, creator_external_id=channel_id
+                    upload, classification, [], creator_external_id=channel_id
                 )
             )
             # Mark seen AFTER a successful build so a mid-run crash never silently drops an
@@ -596,7 +581,6 @@ def run_stage1_build_youtube_items(
         source_count=len(youtube_sources),
         upload_count=total_new_uploads,
         classified_count=classified_count,
-        transcripts_fetched=transcripts_fetched,
         rankable_count=len(rankable_items),
     )
     return rankable_items
@@ -614,57 +598,219 @@ def _current_day_ordinal() -> int:
     return (datetime.now(timezone.utc).date() - date(1970, 1, 1)).days
 
 
-def run_stage5_overlap_trending_scoops(
+def run_stage3_cluster(items: list[RankableItem], config: OrbitConfig) -> list[Cluster]:
+    """Stage 3: cluster the unified stream so duplicate coverage of one topic collapses.
+
+    Runs BEFORE summarization (the reorder): :func:`lib.cluster.cluster_overlaps` groups
+    same-topic items (lexical similarity + entity overlap) so the next stage can crown ONE
+    winner per topic and summarize only that one. Empty ``items`` -> ``[]``. Pure wiring.
+
+    Because chapterization now happens AFTER clustering, items reach here with no chapters;
+    the clusterer's default long-form predicate falls through to "short", so same-topic
+    long-form videos merge into one cluster body too (the locked decision: don't surface 5
+    summaries of one release). Each cluster carries ``all_member_item_ids`` — the full
+    membership the crown stage ranks.
+
+    Args:
+        items: The unified classified :class:`RankableItem` stream.
+        config: The loaded :class:`OrbitConfig` (``creator_weights`` for representatives).
+
+    Returns:
+        The clusters (one per topic group; singletons are 1-member clusters).
+    """
+    if not items:
+        log.log_info("cluster_completed", cluster_count=0, item_count=0)
+        return []
+    clusters = cluster_overlaps(items, config)
+    log.log_info("cluster_completed", cluster_count=len(clusters), item_count=len(items))
+    return clusters
+
+
+def run_stage4_crown_winners(
+    items: list[RankableItem],
+    clusters: list[Cluster],
+    config: OrbitConfig,
+) -> list[RankableItem]:
+    """Stage 4: crown ONE winner per cluster; fold the rest in as footnotes.
+
+    For each cluster, the winner is the member with the highest
+    :func:`lib.rerank.winner_score` (the derank score biased toward longer / more
+    in-depth videos — locked decision 3), ties broken by ``item_external_id`` for
+    determinism. The non-winner members are attached to the winner's ``.footnotes`` (so
+    the renderer folds them under its card as "Also covered" links) and recorded on the
+    cluster (``winner_item_id`` / ``footnote_item_ids``). Only the winners proceed to
+    summarize/rank/render — duplicate coverage of one story becomes a single card plus
+    footnotes (rank still controls density among winners; nothing a user cares about is
+    dropped — the losers are the footnotes).
+
+    Creator engagement baselines are computed ONCE over the whole batch and reused for
+    every cluster's winner pick so the choice is consistent.
+
+    Args:
+        items: The full unified :class:`RankableItem` stream (winners + losers).
+        clusters: The Stage-3 clusters (mutated in place: winner/footnote ids set).
+        config: The loaded :class:`OrbitConfig` (``creator_weights``).
+
+    Returns:
+        The winners — one :class:`RankableItem` per cluster (each carrying its footnotes).
+    """
+    if not items or not clusters:
+        return list(items)
+
+    items_by_id = {str(item.item_external_id): item for item in items if item.item_external_id}
+    baselines = compute_creator_engagement_baselines(items)
+
+    winners: list[RankableItem] = []
+    for cluster in clusters:
+        members = [items_by_id[mid] for mid in cluster.all_member_item_ids if mid in items_by_id]
+        if not members:
+            continue
+        # Deterministic: highest winner_score, ties broken by id (matches derank's tiebreak).
+        ranked = sorted(
+            members,
+            key=lambda it: (winner_score(it, config, creator_baselines=baselines), str(it.item_external_id)),
+            reverse=True,
+        )
+        winner = ranked[0]
+        losers = [member for member in members if member is not winner]
+        winner.footnotes = losers
+        cluster.winner_item_id = str(winner.item_external_id)
+        cluster.footnote_item_ids = [str(member.item_external_id) for member in losers]
+        winners.append(winner)
+
+    log.log_info(
+        "crown_winners_completed",
+        cluster_count=len(clusters),
+        winner_count=len(winners),
+        footnoted_count=sum(len(cluster.footnote_item_ids) for cluster in clusters),
+    )
+    return winners
+
+
+def _is_x_winner(item: RankableItem) -> bool:
+    """True when a winner is an X post (its ``card_url`` is an x.com permalink)."""
+    return "x.com/" in (getattr(item, "card_url", "") or "")
+
+
+def run_stage5_summarize_winners(
+    winners: list[RankableItem],
+    depth: str,
+    config: OrbitConfig,
+    *,
+    llm_classifier: LlmClassifier = _default_llm_classifier,
+    transcript_fetcher: Optional[Callable[..., Optional[Transcript]]] = None,
+    summarizer: Optional[summarize.Summarizer] = None,
+) -> None:
+    """Stage 5: transcribe + summarize the crowned winners (capped, floor of 8 videos).
+
+    The expensive stage, run ONLY for winners (so it summarizes the deduplicated set):
+
+      * VIDEO winners (sorted by :func:`lib.rerank.winner_score`, top N where
+        ``N = max(SUMMARY_FLOOR, SUMMARY_CAP_BY_DEPTH[depth])`` — so at least 8 distinct
+        video topics are summarized every run, even at ``quick``): fetch the transcript
+        (``force=True`` to bypass the quick=0 feed-wide gate), then
+        :func:`lib.summarize.summarize_video` into exactly 5 timestamped bullets attached
+        to ``item.summary``. Winners beyond the cap render as plain cards (no summary).
+      * X (tweet) winners (top ``X_SUMMARY_CAP_BY_DEPTH[depth]``):
+        :func:`lib.summarize.summarize_tweet` into 2-3 timeless bullets.
+
+    The 5 timestamped summary bullets ARE the per-winner deep-link navigation now (they
+    supersede the old chapter list on the card), so winners are NOT separately chapterized.
+    Mutates the winner items in place (sets ``.summary``). The same ``claude -p`` boundary
+    serves classify and summarize.
+
+    Args:
+        winners: The Stage-4 winners (mutated in place).
+        depth: ``quick`` | ``default`` | ``deep`` — selects the per-run summary caps.
+        config: The loaded :class:`OrbitConfig`.
+        llm_classifier: The live LLM boundary (used as the default summarizer).
+        transcript_fetcher: Transcript fetcher; defaults to
+            :func:`lib.transcribe.fetch_transcript_with_cues`. Must accept ``force=``.
+        summarizer: Summarize LLM boundary; defaults to ``llm_classifier``.
+    """
+    if not winners:
+        return
+
+    active_transcript_fetcher = transcript_fetcher or fetch_transcript_with_cues
+    active_summarizer = summarizer if summarizer is not None else llm_classifier
+
+    baselines = compute_creator_engagement_baselines(winners)
+
+    def by_winner_score(item: RankableItem) -> tuple[float, str]:
+        return (winner_score(item, config, creator_baselines=baselines), str(item.item_external_id))
+
+    video_winners = sorted(
+        (winner for winner in winners if not _is_x_winner(winner)), key=by_winner_score, reverse=True
+    )
+    x_winners = sorted((winner for winner in winners if _is_x_winner(winner)), key=by_winner_score, reverse=True)
+
+    video_cap = max(SUMMARY_FLOOR, SUMMARY_CAP_BY_DEPTH.get(depth, SUMMARY_CAP_BY_DEPTH["default"]))
+    x_cap = X_SUMMARY_CAP_BY_DEPTH.get(depth, X_SUMMARY_CAP_BY_DEPTH["default"])
+
+    video_summarized = 0
+    for winner in video_winners[:video_cap]:
+        # force=True: the quick=0 transcript gate is feed-wide; the bounded winner set opts in.
+        transcript = active_transcript_fetcher(winner.item_external_id, depth, force=True)
+        winner.summary = summarize.summarize_video(winner, transcript, summarizer=active_summarizer)
+        video_summarized += 1
+
+    x_summarized = 0
+    for winner in x_winners[:x_cap]:
+        winner.summary = summarize.summarize_tweet(winner, summarizer=active_summarizer)
+        x_summarized += 1
+
+    log.log_info(
+        "summary_cap_applied",
+        depth=depth,
+        video_winners=len(video_winners),
+        video_summarized=video_summarized,
+        video_cap=video_cap,
+        summary_floor=SUMMARY_FLOOR,
+        x_winners=len(x_winners),
+        x_summarized=x_summarized,
+        x_cap=x_cap,
+    )
+
+
+def run_stage6_trending_scoops(
+    clusters: list[Cluster],
     items: list[RankableItem],
     config: OrbitConfig,
     *,
     store_module: Any = store,
     search_fn: Optional[Callable[[str], list[Any]]] = None,
-) -> tuple[list[Cluster], list[TrendingItem], list[TrendingItem], dict[str, float]]:
-    """Stage 5 (M3): cluster overlaps -> internal trending -> external tag -> scoops.
+) -> tuple[list[TrendingItem], list[TrendingItem], dict[str, float]]:
+    """Stage 6 (M3): internal trending -> external tag -> scoops, over the EXISTING clusters.
 
-    The M3 seam, run BETWEEN classify (Stage 2) and rank (Stage 6). Pure wiring (Rule 5:
-    all logic lives in lib/): it sequences the four deterministic lib functions and
-    returns their outputs for Stage 6 (the trending/scoop multiplier map) and Stage 7
-    (the three render sections):
+    Consumes the Stage-3 clusters (does NOT re-cluster) and sequences the deterministic
+    trending lib functions (Rule 5 — all logic in lib/):
 
-      1. :func:`lib.cluster.cluster_overlaps` — short-merge / long-cross-link clusters.
-      2. :func:`lib.trending.compute_internal_trending` — baseline-relative velocity
-         (reads the injected ``store_module`` only for each creator's ``seen``-history
-         DEPTH — the dormancy signal — never engagement).
-      3. :func:`lib.external_trending.tag_external_corroboration` — bounded keyless
-         cross-search tagging corroborated-vs-scoop, throttled by ``config.depth``. When
-         ``search_fn`` is None the lib default keyless search is used; tests inject a
-         fake so no live web call is made.
-      4. :func:`lib.external_trending.detect_scoops` — dormant-account acceleration, the
-         loud scoops strip — plus
-         :func:`lib.external_trending.build_trending_multiplier_map` for the rerank boost.
+      1. :func:`lib.trending.compute_internal_trending` — baseline-relative velocity
+         (reads ``store_module`` only for each creator's ``seen``-history DEPTH).
+      2. :func:`lib.external_trending.tag_external_corroboration` — bounded keyless
+         cross-search tagging corroborated-vs-scoop, throttled by ``config.depth``.
+      3. :func:`lib.external_trending.detect_scoops` + ``build_trending_multiplier_map``
+         for the rerank boost.
 
-    Empty ``items`` returns ``([], [], [], {})`` — the M1/M2 quiet path produces no M3
-    sections and a neutral multiplier map, so rank+render are byte-for-byte unchanged.
+    Empty ``clusters`` -> ``([], [], {})`` (neutral multiplier map; rank unchanged).
 
     Args:
-        items: The unified classified :class:`RankableItem` stream.
-        config: The loaded :class:`OrbitConfig` (``creator_weights`` for representatives,
-            ``depth`` for the cross-search budget).
-        store_module: The store module/object for the history-depth lookup (injectable;
-            defaults to :mod:`store`).
-        search_fn: OPTIONAL keyless cross-search ``(query) -> list``; None uses the lib
-            default. Tests inject a fake so no live web call fires.
+        clusters: The Stage-3 clusters.
+        items: The items whose ids the clusters reference (for the deep-link map).
+        config: The loaded :class:`OrbitConfig` (``depth`` for the cross-search budget).
+        store_module: The store module for the history-depth lookup (injectable).
+        search_fn: OPTIONAL keyless cross-search; None uses the lib default.
 
     Returns:
-        ``(clusters, trending_items, scoops, trending_multipliers)``.
+        ``(trending_items, scoops, trending_multipliers)``.
     """
-    if not items:
-        log.log_info("overlap_trending_scoops_completed", cluster_count=0, trending_count=0, scoop_count=0)
-        return [], [], [], {}
+    if not clusters:
+        log.log_info("trending_scoops_completed", trending_count=0, scoop_count=0)
+        return [], [], {}
 
-    clusters = cluster_overlaps(items, config)
     items_by_id = {str(item.item_external_id): item for item in items if item.item_external_id}
     trending_items = compute_internal_trending(clusters, items_by_id, store_module)
 
-    # Reason: external corroboration is bounded by the user's depth throttle (CSO). The
-    # search_fn defaults to the lib keyless search; tests inject a fake to stay offline.
     if search_fn is not None:
         tag_external_corroboration(trending_items, search_fn=search_fn, depth=config.depth)
     else:
@@ -674,13 +820,13 @@ def run_stage5_overlap_trending_scoops(
     trending_multipliers = build_trending_multiplier_map(trending_items)
 
     log.log_info(
-        "overlap_trending_scoops_completed",
+        "trending_scoops_completed",
         cluster_count=len(clusters),
         trending_count=len(trending_items),
         scoop_count=len(scoops),
         multiplier_count=len(trending_multipliers),
     )
-    return clusters, trending_items, scoops, trending_multipliers
+    return trending_items, scoops, trending_multipliers
 
 
 def run_stage6_rank_and_tier(
@@ -910,35 +1056,37 @@ def run_pipeline(depth: str) -> int:
     # Code subscription — no ANTHROPIC_API_KEY). Built once and threaded into the producers below.
     llm_classifier = make_llm_classifier()
 
-    # Stage 1-2 (YouTube half) — delta-fetch new uploads, classify them on the live LLM
-    # boundary, chapterize long-form episodes (creator chapters deterministically, else a
-    # budgeted transcript + LLM segmentation), build RankableItems. The same llm boundary
-    # serves both classify and chapterize. No-op (empty) when the user has no YouTube
-    # sources configured.
-    youtube_items = run_stage1_build_youtube_items(
-        config, depth, llm_classifier=llm_classifier, segmenter=llm_classifier
-    )
-
-    # Stage 1 (X half) — delta-fetch X tweets, classify them on the live LLM boundary,
-    # build RankableItems. No-op (empty) when the user has no X sources configured
-    # (YouTube-only setups).
+    # Stage 1-2 — delta-fetch new uploads/tweets, classify them on the live LLM boundary,
+    # build RankableItems. Transcript/chapterize/summary are NOT done here anymore (they
+    # run only for cluster winners in Stage 5). No-op (empty) when a source type is absent.
+    youtube_items = run_stage1_build_youtube_items(config, depth, llm_classifier=llm_classifier)
     x_items = run_stage1_build_x_items(config, depth, llm_classifier=llm_classifier)
 
-    # Stage 6->7 (rank + render). The unified stream merges YouTube uploads with X tweet
-    # RankableItems; both flow through the SAME rank/tier/render (the M2 unified-digest seam).
+    # The unified stream merges YouTube uploads with X tweet RankableItems.
     rankable_items = youtube_items + x_items
 
-    # Stage 5 (M3) — cluster overlaps, compute baseline-relative trending, tag external
-    # corroboration vs scoop, detect dormant-account scoops. Feeds the trending/scoop
-    # multiplier into rank and the three M3 sections into render. On the bare CLI run
-    # rankable_items is empty, so this yields no clusters/trending/scoops and a neutral
-    # multiplier map (the M1/M2 path is unchanged).
-    clusters, trending_items, scoops, trending_multipliers = run_stage5_overlap_trending_scoops(
-        rankable_items, config
+    # Stage 3 — cluster so duplicate coverage of one topic collapses into one group.
+    clusters = run_stage3_cluster(rankable_items, config)
+
+    # Stage 4 — crown ONE winner per cluster (deterministic, duration-biased); the rest
+    # become "Also covered" footnotes on the winner. Only winners proceed downstream.
+    winners = run_stage4_crown_winners(rankable_items, clusters, config)
+
+    # Stage 5 — transcribe + summarize the winners (5 timestamped bullets per video, 2-3
+    # per tweet), capped per run with a floor of >=8 video topics. Mutates winners in place
+    # (attaches .summary, and .chapters for long-form). The same llm boundary serves
+    # classify, chapterize, and summarize.
+    run_stage5_summarize_winners(
+        winners, depth, config, llm_classifier=llm_classifier, summarizer=llm_classifier
     )
-    tiered_items = run_stage6_rank_and_tier(
-        rankable_items, config, trending_multipliers=trending_multipliers
-    )
+
+    # Stage 6 (M3) — internal trending + external corroboration + scoops over the existing
+    # clusters. Feeds the trending/scoop multiplier into rank and the M3 render sections.
+    trending_items, scoops, trending_multipliers = run_stage6_trending_scoops(clusters, rankable_items, config)
+
+    # Stage 7-8 — rank the WINNERS (the deduplicated set) and render. Rank controls density
+    # among winners; their footnotes ride along on each card.
+    tiered_items = run_stage6_rank_and_tier(winners, config, trending_multipliers=trending_multipliers)
     written_paths = run_stage7_render(
         tiered_items, config, clusters=clusters, trending_items=trending_items, scoops=scoops
     )

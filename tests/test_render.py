@@ -343,3 +343,64 @@ def test_safe_href_allowlist_unit() -> None:
     assert safe == "https://www.youtube.com/watch?v=abc&amp;t=90s"
     assert html_render.safe_href("javascript:alert(1)") == "#"
     assert html_render.safe_href("data:text/html,<script>") == "#"
+
+
+from lib.summarize import Summary, SummaryBullet  # noqa: E402
+
+
+def test_winner_card_renders_summary_bullets_and_footnotes() -> None:
+    """A cluster winner's card shows its timestamped summary bullets + "Also covered" footnotes.
+
+    WHY: this is the headline output — the winner card carries the 5 timestamped bullets
+    (each a deep-link into the moment) and folds the duplicate non-winner coverage in as
+    footnote links rather than separate cards. A regression that dropped the summary, the
+    bullet deep-links, or the footnotes would fail here.
+    """
+    hero = _tiered("vidWIN", TIER_HERO, title="The winner video")
+    item = hero.scored_item.item
+    item.summary = Summary(
+        item_external_id="vidWIN",
+        bullets=[
+            SummaryBullet(text="key insight", start_seconds=90.0, deep_link="https://www.youtube.com/watch?v=vidWIN&t=90s"),
+            SummaryBullet(text="second point", start_seconds=0.0, deep_link="https://www.youtube.com/watch?v=vidWIN&t=0s"),
+        ],
+    )
+    loser = RankableItem(
+        item_external_id="vidDUP",
+        title="Duplicate coverage of the same story",
+        channel_name="Other Channel",
+        creator_external_id="UCx",
+        view_count=1,
+        like_count=0,
+        comment_count=0,
+        upload_date="20260101",
+    )
+    item.footnotes = [loser]
+
+    html = render.render_digest_html([hero])
+
+    # Timestamped summary bullets (deep-link escaped as &amp; in the attribute).
+    assert 'class="summary"' in html
+    assert "https://www.youtube.com/watch?v=vidWIN&amp;t=90s" in html
+    assert "key insight" in html
+    # Folded footnote to the duplicate (a link, not its own card).
+    assert 'class="card-footnotes"' in html
+    assert "Also covered" in html
+    assert "Duplicate coverage of the same story" in html
+
+
+def test_tweet_winner_summary_bullets_have_no_timestamps() -> None:
+    """An X winner's summary renders plain (timeless) bullet text — no deep-link timestamps."""
+    hero = _tiered("tw1", TIER_HERO, title="an original tweet")
+    item = hero.scored_item.item
+    item.card_url = "https://x.com/alice/status/tw1"
+    item.summary = Summary(
+        item_external_id="tw1",
+        bullets=[SummaryBullet(text="the claim"), SummaryBullet(text="a detail")],
+    )
+
+    html = render.render_digest_html([hero])
+
+    assert 'class="summary-point"' in html, "tweet bullets render as plain points"
+    assert "the claim" in html
+    assert 'class="summary-time"' not in html, "tweet bullets carry no timestamp"

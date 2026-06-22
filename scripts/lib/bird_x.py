@@ -135,6 +135,12 @@ class Tweet:
         retweet_count: Retweet count, or None if absent.
         reply_count: Reply count, or None if absent.
         quote_count: Quote count, or None if absent.
+        is_quote: True when this tweet quotes another (the vendored client emits a
+            ``quotedTweet`` object). Reliable.
+        is_retweet: True when this is a pure retweet. HEURISTIC: the vendored client does
+            not surface ``retweeted_status``, so this is detected from the ``RT @`` text
+            prefix only. Both quote-tweets and retweets are dropped before ranking
+            (only fully original posts proceed).
     """
 
     text: str
@@ -145,6 +151,8 @@ class Tweet:
     retweet_count: Optional[int] = None
     reply_count: Optional[int] = None
     quote_count: Optional[int] = None
+    is_quote: bool = False
+    is_retweet: bool = False
 
 
 def set_credentials(auth_token: Optional[str], ct0: Optional[str]) -> None:
@@ -584,12 +592,20 @@ def _parse_tweets(parsed: Any, handle: str) -> List[Tweet]:
         author_handle = (author_handle or handle).lstrip("@")
         text = str(_first_present(entry.get("text"), entry.get("full_text"), "") or "").strip()
         created_at = str(_first_present(entry.get("createdAt"), entry.get("created_at"), "") or "").strip()
+        # Quote detection is structural (the client maps quoted_status_result -> quotedTweet);
+        # retweet detection is a TEXT heuristic because the client does not surface
+        # retweeted_status. We parse the flags here (source-faithful) and DROP at the fetch
+        # boundary so tests can assert on the parsed flags.
+        is_quote = bool(entry.get("quotedTweet") or entry.get("quoted_status") or entry.get("quoted_status_result"))
+        is_retweet = text.startswith("RT @")
         tweets.append(
             Tweet(
                 text=text,
                 tweet_id=tweet_id,
                 handle=author_handle,
                 created_at=created_at,
+                is_quote=is_quote,
+                is_retweet=is_retweet,
                 like_count=_coerce_optional_int(
                     _first_present(entry.get("likeCount"), entry.get("like_count"), entry.get("favorite_count"))
                 ),
@@ -739,6 +755,19 @@ def fetch_new_tweets(
             handle_new_count = 0
             for tweet in tweets:
                 if tweet.tweet_id in seen_ids:
+                    continue
+                # Drop pure retweets AND quote-tweets — only fully original posts are
+                # summarized/ranked. mark_seen the dropped tweet anyway so the delta engine
+                # does not re-pull and re-evaluate it every run (dropping is terminal).
+                if tweet.is_retweet or tweet.is_quote:
+                    store.mark_seen(source_id, tweet.tweet_id)
+                    log.log_info(
+                        "x_tweet_dropped_rt_or_quote",
+                        handle=handle,
+                        tweet_id=tweet.tweet_id,
+                        is_retweet=tweet.is_retweet,
+                        is_quote=tweet.is_quote,
+                    )
                     continue
                 new_tweets.append(tweet)
                 # mark_seen ONLY after a successful fetch+parse for this handle.

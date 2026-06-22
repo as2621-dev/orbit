@@ -78,6 +78,10 @@ TIER_HEIGHT_PX: dict[str, int] = {
 }
 # Additional px per chapter <li> on a Hero/Standard card (chapter lists add height).
 CHAPTER_HEIGHT_PX: int = 26
+# Additional px per summary bullet <li> (the winner-card headline content) and per
+# "Also covered" footnote link — so the 1-vs-2 page split still accounts for them.
+SUMMARY_BULLET_HEIGHT_PX: int = 26
+FOOTNOTE_HEIGHT_PX: int = 22
 # Fixed chrome (TL;DR header + page margins) added once per page estimate.
 PAGE_CHROME_PX: int = 120
 # Page-1 height budget. When estimate_page_height(...) exceeds this, Compact+Index
@@ -111,10 +115,16 @@ def estimate_page_height(tiered_items: list[TieredItem]) -> int:
     """
     total_px = PAGE_CHROME_PX
     for tiered_item in tiered_items:
+        item = tiered_item.scored_item.item
         total_px += TIER_HEIGHT_PX.get(tiered_item.density_tier, TIER_HEIGHT_PX[TIER_INDEX])
+        summary_bullets = _item_summary_bullets(item)
         if tiered_item.density_tier in _FULL_CARD_TIERS:
-            chapters = getattr(tiered_item.scored_item.item, "chapters", None) or []
-            total_px += CHAPTER_HEIGHT_PX * len(chapters)
+            if summary_bullets:
+                # Summary bullets REPLACE the chapter list on a winner card.
+                total_px += SUMMARY_BULLET_HEIGHT_PX * len(summary_bullets)
+            else:
+                total_px += CHAPTER_HEIGHT_PX * len(getattr(item, "chapters", None) or [])
+        total_px += FOOTNOTE_HEIGHT_PX * len(getattr(item, "footnotes", None) or [])
     return total_px
 
 
@@ -184,8 +194,40 @@ def group_items_by_tier(tiered_items: list[TieredItem]) -> dict[str, list[Tiered
     return grouped
 
 
+def _item_summary_bullets(item: Any) -> list[Any]:
+    """Return the item's summary bullets (set on cluster winners), or ``[]``."""
+    summary = getattr(item, "summary", None)
+    return list(getattr(summary, "bullets", []) or []) if summary else []
+
+
+def _item_footnote_links(item: Any) -> list[tuple[str, str]]:
+    """Build ``(url, label)`` footnote links from the item's folded non-winner members.
+
+    Each footnote is a :class:`lib.rerank.RankableItem`; its link reuses the SAME
+    source-aware :func:`_card_deep_link` the cards use (x.com card or YouTube fallback),
+    and its label is the item's title (falling back to the link when title is empty).
+
+    Args:
+        item: A cluster winner carrying ``.footnotes`` (possibly empty).
+
+    Returns:
+        A list of ``(url, label)`` pairs (empty for a singleton winner).
+    """
+    footnotes = getattr(item, "footnotes", None) or []
+    links: list[tuple[str, str]] = []
+    for footnote_item in footnotes:
+        url = _card_deep_link(footnote_item)
+        label = (getattr(footnote_item, "title", "") or "").strip() or url
+        links.append((url, label))
+    return links
+
+
 def _render_full_card(tiered_item: TieredItem) -> str:
-    """Render one Hero/Standard full card (with its deep-link chapter list).
+    """Render one Hero/Standard full card (summary bullets + "Also covered" footnotes).
+
+    A cluster winner renders its timestamped summary bullets (the headline content,
+    replacing the chapter list); a non-summarized winner falls back to its chapter list.
+    Folded non-winner cluster members render as "Also covered" footnote links.
 
     Args:
         tiered_item: A Hero- or Standard-tier :class:`TieredItem`.
@@ -199,6 +241,8 @@ def _render_full_card(tiered_item: TieredItem) -> str:
         _card_deep_link(item),
         tiered_item.density_tier,
         with_chapters=True,
+        summary_bullets=_item_summary_bullets(item),
+        footnote_links=_item_footnote_links(item),
     )
 
 
@@ -242,7 +286,11 @@ def _render_source_grid(heading: str, tiered_items: list[TieredItem]) -> str:
         if tiered_item.density_tier in (TIER_HERO, TIER_STANDARD)
     )
     compact_html = "".join(
-        html_render.render_compact_row(tiered_item.scored_item.item, _card_deep_link(tiered_item.scored_item.item))
+        html_render.render_compact_row(
+            tiered_item.scored_item.item,
+            _card_deep_link(tiered_item.scored_item.item),
+            footnote_links=_item_footnote_links(tiered_item.scored_item.item),
+        )
         for tiered_item in tiered_items
         if tiered_item.density_tier == TIER_COMPACT
     )

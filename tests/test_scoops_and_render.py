@@ -347,8 +347,9 @@ def test_orbit_stage5_wires_overlap_trending_scoops_through_rank_and_render(tmp_
     # Fake keyless search: zero external results -> the topic is a scoop (your network first).
     fake_search = lambda query: []  # noqa: E731
 
-    clusters, trending_items, scoops, trending_multipliers = orbit.run_stage5_overlap_trending_scoops(
-        items, config, store_module=fake_store, search_fn=fake_search
+    clusters = orbit.run_stage3_cluster(items, config)
+    trending_items, scoops, trending_multipliers = orbit.run_stage6_trending_scoops(
+        clusters, items, config, store_module=fake_store, search_fn=fake_search
     )
 
     # (a) the dormant breakout is flagged a scoop, and its multiplier map is non-neutral.

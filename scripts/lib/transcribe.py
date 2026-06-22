@@ -56,6 +56,26 @@ TRANSCRIPT_LIMITS: dict[str, int] = {
     "deep": 8,
 }
 
+# Per-run SUMMARY budget (the cluster-winner summarization stage). Unlike the
+# transcript budget above (which deliberately fetches 0 on quick), summarization
+# must always produce a useful digest, so every depth's cap is >= SUMMARY_FLOOR.
+# The pipeline picks the top-N winners by rank up to max(SUMMARY_FLOOR, cap[depth])
+# and transcribes EACH (passing force=True to bypass the quick==0 transcript gate);
+# the remaining winners render as cards/links without a summary.
+SUMMARY_FLOOR: int = 8
+SUMMARY_CAP_BY_DEPTH: dict[str, int] = {
+    "quick": 8,
+    "default": 12,
+    "deep": 24,
+}
+# A separate, smaller cap for X-post (tweet) summaries — tweets are cheap to
+# summarize (no transcript) but we still bound the per-run LLM call volume.
+X_SUMMARY_CAP_BY_DEPTH: dict[str, int] = {
+    "quick": 4,
+    "default": 8,
+    "deep": 16,
+}
+
 # Lifted verbatim from the reference (youtube_yt.py:57). Word cap applied across
 # the joined cue text so classify/embed inputs stay bounded; trailing cues past
 # the cap are dropped, but the cues we KEEP retain their timestamps intact.
@@ -341,7 +361,7 @@ def _read_produced_vtt(video_id: str, temp_dir: str) -> str | None:
         return None
 
 
-def fetch_transcript_with_cues(video_id: str, depth: str = "default") -> Transcript | None:
+def fetch_transcript_with_cues(video_id: str, depth: str = "default", *, force: bool = False) -> Transcript | None:
     """Fetch a video's VTT captions and parse them into a cue-preserving Transcript.
 
     Runs the lifted yt-dlp VTT command into a temp dir, reads the produced
@@ -365,7 +385,10 @@ def fetch_transcript_with_cues(video_id: str, depth: str = "default") -> Transcr
     Args:
         video_id: The video's external id (e.g. ``dQw4w9WgXcQ``).
         depth: The run depth (``quick`` / ``default`` / ``deep``). ``quick`` skips
-            transcription entirely (returns None, no yt-dlp call).
+            transcription entirely (returns None, no yt-dlp call) UNLESS ``force``.
+        force: When True, bypass the ``quick == 0`` skip gate and fetch anyway. The
+            summarize-winners stage sets this for the bounded set of cluster winners it
+            has chosen to transcribe, so summaries are produced at every depth.
 
     Returns:
         A :class:`Transcript` with intact cues, or ``None`` if transcription was
@@ -377,9 +400,12 @@ def fetch_transcript_with_cues(video_id: str, depth: str = "default") -> Transcr
         5.0
     """
     transcript_limit = TRANSCRIPT_LIMITS.get(depth, TRANSCRIPT_LIMITS["default"])
-    if transcript_limit == 0:
+    if transcript_limit == 0 and not force:
         # Reason: quick depth deliberately fetches 0 transcripts — skip the yt-dlp
-        # call entirely (the DoD: depth=quick fetches 0 transcripts).
+        # call entirely (the DoD: depth=quick fetches 0 transcripts). The
+        # summarize-winners stage passes force=True to opt in: it has already chosen a
+        # bounded set of cluster winners to transcribe, so the quick=0 feed-wide gate
+        # does not apply to it.
         log.log_info("transcript_skipped_quick_depth", video_id=video_id, depth=depth)
         return None
 

@@ -122,9 +122,25 @@ CREATE TABLE IF NOT EXISTS interests (
 INSERT OR IGNORE INTO schema_version (version) VALUES (1);
 """
 
-# Future migrations keyed by version number (>1). Empty at v1 — the baseline
-# schema is created by SCHEMA_ORBIT_V1; later phases add 2, 3, ... here.
-MIGRATIONS: Dict[int, str] = {}
+# Schema v2: per-item summaries (the cluster-winner 5-bullet / tweet 2-3-bullet
+# summaries). A JSON column holds the variable-length bullet list (text +
+# optional start_seconds + deep_link); item_external_id is UNIQUE so set_summary
+# upserts per item, and is_user_override mirrors classifications' sacred-override
+# contract (a user-corrected summary is never overwritten by a re-run).
+SCHEMA_ORBIT_V2: str = """
+CREATE TABLE IF NOT EXISTS summaries (
+    summary_id INTEGER PRIMARY KEY,
+    item_external_id TEXT NOT NULL UNIQUE,
+    bullets_json TEXT NOT NULL,
+    is_user_override INTEGER DEFAULT 0,
+    summarized_at TEXT DEFAULT (datetime('now'))
+);
+"""
+
+# Future migrations keyed by version number (>1). The baseline schema is created
+# by SCHEMA_ORBIT_V1; each numbered entry here is applied in ascending order by
+# _run_migrations when the DB's schema_version is below it.
+MIGRATIONS: Dict[int, str] = {2: SCHEMA_ORBIT_V2}
 
 
 def _connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
@@ -374,6 +390,64 @@ def get_classification(item_external_id: str) -> Optional[Dict[str, Any]]:
     try:
         row = conn.execute(
             "SELECT * FROM classifications WHERE item_external_id = ?",
+            (item_external_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+# --- Summaries -------------------------------------------------------------
+
+
+def set_summary(
+    item_external_id: str,
+    bullets_json: str,
+    is_user_override: int = 0,
+) -> None:
+    """Upsert an item's summary, keyed on ``item_external_id``.
+
+    A re-summarization of the same item UPDATEs its row (bullets / override flag)
+    rather than inserting a duplicate, so the latest summary wins — mirroring
+    :func:`set_classification`'s contract.
+
+    Args:
+        item_external_id: The summarized item.
+        bullets_json: The JSON-encoded bullet list (text + optional start_seconds +
+            deep_link per bullet).
+        is_user_override: 1 if the user edited it (sacred — persists across runs and
+            is never overwritten by a re-run).
+    """
+    conn = _connect()
+    try:
+        conn.execute(
+            """INSERT INTO summaries
+                   (item_external_id, bullets_json, is_user_override, summarized_at)
+               VALUES (?, ?, ?, datetime('now'))
+               ON CONFLICT(item_external_id) DO UPDATE SET
+                   bullets_json = excluded.bullets_json,
+                   is_user_override = excluded.is_user_override,
+                   summarized_at = excluded.summarized_at""",
+            (item_external_id, bullets_json, is_user_override),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_summary(item_external_id: str) -> Optional[Dict[str, Any]]:
+    """Return an item's summary row, or None if it has never been summarized.
+
+    Args:
+        item_external_id: The item to look up.
+
+    Returns:
+        The summary row as a dict (``bullets_json`` / ``is_user_override`` / ...), or None.
+    """
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM summaries WHERE item_external_id = ?",
             (item_external_id,),
         ).fetchone()
         return dict(row) if row else None

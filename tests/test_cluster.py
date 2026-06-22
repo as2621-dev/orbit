@@ -281,3 +281,35 @@ def test_cluster_and_fusion_paths_import_only_stdlib_and_lib_helpers() -> None:
     assert hasattr(fusion, "fuse_topic_group")
     assert cluster.SIMILARITY_THRESHOLD == 0.48
     assert cluster.ENTITY_OVERLAP_THRESHOLD == 0.45
+
+
+def test_long_form_same_topic_merge_into_one_cluster_post_reorder() -> None:
+    """Post-reorder, same-topic long-form videos merge into ONE cluster (locked decision 2).
+
+    WHY: the user does NOT want 5 separate summaries of one release. Because chapterization
+    now happens AFTER clustering, items reach the clusterer with NO chapters, so the default
+    long-form predicate treats them as mergeable — five near-identical long-form videos
+    collapse into a single cluster whose ``all_member_item_ids`` carries the full membership
+    the crown stage ranks (so it can pick ONE winner and footnote the other four). A
+    regression that kept long-form videos as 5 separate clusters fails here.
+    """
+    items = [
+        RankableItem(
+            item_external_id=f"v{i}",
+            title="New Anthropic model released today",
+            channel_name=f"channel {i}",
+            creator_external_id=f"c{i}",
+            view_count=100,
+            like_count=1,
+            comment_count=0,
+            upload_date="20260101",
+            duration=1800,  # long-form by duration, but NO chapters at cluster time
+            chapters=[],
+        )
+        for i in range(5)
+    ]
+
+    clusters = cluster_overlaps(items)  # production DEFAULT predicate (no injected is_long_form)
+
+    assert len(clusters) == 1, "five same-topic long-form videos must collapse into one cluster"
+    assert sorted(clusters[0].all_member_item_ids) == [f"v{i}" for i in range(5)]

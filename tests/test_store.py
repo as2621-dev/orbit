@@ -13,6 +13,7 @@ network). They run under pytest if available, and also standalone via the
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 import tempfile
@@ -118,6 +119,54 @@ def test_upsert_source_dedups_on_platform_external_id_and_updates() -> None:
         matching = [s for s in youtube_sources if s["external_id"] == "UC1"]
         assert len(matching) == 1, f"expected 1 row for UC1, got {len(matching)}"
         assert matching[0]["display_name"] == "Name B", "upsert did not update display_name"
+
+
+def test_migration_creates_summaries_table_and_advances_version() -> None:
+    """The v2 migration creates the summaries table and bumps schema_version to 2.
+
+    WHY: summaries are persisted state added after the v1 baseline, so they ship as a
+    numbered migration (not an edit to the v1 schema). A regression that forgot the
+    migration would crash set_summary at runtime on an upgraded DB.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = _fresh_store(Path(tmp))
+        conn = sqlite3.connect(str(db_path))
+        try:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+        finally:
+            conn.close()
+    assert "summaries" in tables, "v2 migration must create the summaries table"
+    assert version >= 2, "schema_version must advance to >= 2 after the migration"
+
+
+def test_set_summary_upserts_and_get_round_trips() -> None:
+    """set_summary upserts per item (latest wins) and get_summary round-trips the row.
+
+    WHY: a re-run must UPDATE an item's summary, not duplicate it (item_external_id UNIQUE),
+    mirroring set_classification. A regression to INSERT-only would accumulate stale rows.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store(Path(tmp))
+        store.set_summary("v1", '[{"text": "first"}]', is_user_override=0)
+        store.set_summary("v1", '[{"text": "second"}]', is_user_override=0)  # upsert, not duplicate
+        row = store.get_summary("v1")
+        assert row is not None
+        assert json.loads(row["bullets_json"]) == [{"text": "second"}], "latest summary must win"
+        assert store.get_summary("missing") is None
+
+
+def test_set_summary_override_flag_persists() -> None:
+    """A user-override summary records is_user_override=1 so the summarizer can keep it sacred.
+
+    WHY: this flag is what makes a user edit survive re-runs (the summarize override gate
+    reads it). A regression that dropped the flag would let re-summarization clobber edits.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store(Path(tmp))
+        store.set_summary("v2", '[{"text": "user wrote this"}]', is_user_override=1)
+        row = store.get_summary("v2")
+    assert row is not None and int(row["is_user_override"]) == 1
 
 
 def _run_all_standalone() -> int:

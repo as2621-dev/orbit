@@ -173,6 +173,16 @@ class Cluster:
     representative_item_id: str
     cross_links: list[CrossLink] = field(default_factory=list)
     source_diversity: int = 0
+    # ALL members of the topic group (short + long-form), by item_external_id, in stable
+    # order. Unlike ``member_item_ids`` (short-merged body only), this is the complete
+    # membership the crown-winners stage ranks to pick ONE winner per topic and footnote
+    # the rest — independent of the short/long fusion split, so it is correct even when
+    # long-form videos reach clustering without chapters (the post-reorder pipeline).
+    all_member_item_ids: list[str] = field(default_factory=list)
+    # Set by the crown-winners stage (empty until then): the crowned member's id, and the
+    # non-winner members folded under it as footnote links.
+    winner_item_id: str = ""
+    footnote_item_ids: list[str] = field(default_factory=list)
 
 
 def _item_text(item: Any) -> str:
@@ -458,6 +468,7 @@ def cluster_overlaps(
             representative_item_id = str(group[0].item_external_id)
 
         member_item_ids = [str(item.item_external_id) for item in short_members]
+        all_member_item_ids = [str(item.item_external_id) for item in group]
         distinct_creators = {str(getattr(item, "creator_external_id", "")) for item in group}
         clusters.append(
             Cluster(
@@ -466,6 +477,7 @@ def cluster_overlaps(
                 representative_item_id=representative_item_id,
                 cross_links=cross_links,
                 source_diversity=len(distinct_creators),
+                all_member_item_ids=all_member_item_ids,
             )
         )
 

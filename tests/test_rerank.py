@@ -345,6 +345,53 @@ def test_from_parts_defaults_chapters_and_creator_id() -> None:
     assert item.creator_external_id == ""
 
 
+def test_raw_popularity_term_helps_high_traffic_item() -> None:
+    """A high-view item outranks an identical low-view one even when BOTH are lone-creator.
+
+    WHY: locked decision 6 added a raw-popularity term. With each item the only one from
+    its creator, relative-engagement is 0 for both, so WITHOUT the raw term they would tie
+    and order by id. We give the high-view item the id ("zzz_high") that LOSES an
+    id-tiebreak; if it still ranks first, the raw-popularity term is doing the work.
+    """
+    config = _config({})
+    high = _item("zzz_high", "UCa", view_count=100_000, like_count=5_000, comment_count=500)
+    low = _item("aaa_low", "UCb", view_count=10, like_count=0, comment_count=0)
+    scored = _rank([high, low], config)
+    assert scored[0].item.item_external_id == "zzz_high", "raw popularity must lift the high-traffic item"
+
+
+def test_raw_popularity_does_not_dominate_priority() -> None:
+    """A trusted creator's low-view item still beats a low-priority creator's viral one.
+
+    WHY: the raw-popularity term must HELP without letting a mega-channel dominate. With
+    priority 3.0 vs 1.0, the small trusted item must still rank first despite the other's
+    huge raw counts — proving RAW_POPULARITY_WEIGHT is subordinate to priority.
+    """
+    config = _config({"UC_trusted": 3.0, "UC_big": 1.0})
+    trusted_small = _item("t", "UC_trusted", view_count=10, like_count=1, comment_count=0)
+    big_popular = _item("b", "UC_big", view_count=1_000_000, like_count=80_000, comment_count=9_000)
+    scored = _rank([trusted_small, big_popular], config)
+    assert scored[0].item.item_external_id == "t", "priority must still dominate raw popularity"
+
+
+def test_winner_score_biases_toward_longer_duration() -> None:
+    """winner_score prefers the longer video among otherwise-equal cluster members.
+
+    WHY: locked decision 3 — the cluster winner (the one that gets the full summary) is the
+    one that "covers the most information", proxied by duration. Two same-creator, same-
+    engagement items differ only in duration; the longer must score higher for selection.
+    """
+    config = _config({})
+    short = _item("s", "UC1", view_count=1_000, like_count=50, comment_count=5)
+    short.duration = 600
+    long_video = _item("l", "UC1", view_count=1_000, like_count=50, comment_count=5)
+    long_video.duration = 3_600
+    baselines = rerank.compute_creator_engagement_baselines([short, long_video])
+    score_short = rerank.winner_score(short, config, creator_baselines=baselines, reference_date=REFERENCE_DATE)
+    score_long = rerank.winner_score(long_video, config, creator_baselines=baselines, reference_date=REFERENCE_DATE)
+    assert score_long > score_short, "the longer video must win the crown among equals"
+
+
 def _run_all_standalone() -> int:
     """Run every ``test_*`` function in this module without pytest. Returns exit code."""
     test_functions = [
