@@ -66,6 +66,12 @@ def run_with_timeout(
 
     proc = subprocess.Popen(
         list(cmd),
+        # Reason: every caller (yt-dlp, the Node X client, ``claude -p``) is
+        # non-interactive. Without an explicit stdin, a headless/no-TTY run (cron,
+        # background) leaves the child's stdin attached to the parent's; ``claude -p``
+        # then blocks waiting on stdin and exits non-zero. ``DEVNULL`` gives it an
+        # immediate EOF so it proceeds with the prompt argv alone.
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

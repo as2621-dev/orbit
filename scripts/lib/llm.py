@@ -65,6 +65,11 @@ _CLI_TIMEOUT_SECONDS: int = 120
 # Repo root (scripts/lib/llm.py -> ../../). Where a local ``.env`` lives.
 _REPO_ROOT: Path = _SCRIPTS_DIR.parent.resolve()
 
+# Env vars that, if set, make the ``claude`` CLI use API-key / token auth instead of the
+# Claude Code subscription. Stripped from the classify subprocess env so a stale or empty
+# value (e.g. a leftover ``.env`` placeholder) can never break subscription auth.
+_SUBSCRIPTION_BLOCKING_ENV_VARS: frozenset[str] = frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"})
+
 # The subprocess runner shape (matches :func:`lib.subproc.run_with_timeout`), injectable so
 # tests mock the subprocess boundary instead of spawning a real ``claude`` process.
 CliRunner = Callable[..., subproc.SubprocResult]
@@ -212,8 +217,13 @@ def call_claude_cli(
         raise LlmCliError(f"'{CLAUDE_CLI}' CLI not found on PATH")
 
     command = [CLAUDE_CLI, "-p", "--dangerously-skip-permissions", "--model", model, prompt]
+    # Reason: ``claude -p`` authenticates with the Claude Code subscription (this module's
+    # whole premise). If a stale/empty ``ANTHROPIC_API_KEY`` or ``ANTHROPIC_AUTH_TOKEN`` is
+    # present in the environment (e.g. seeded from ``.env`` for other tooling), the CLI uses
+    # THAT instead and fails auth (exit 1). Strip both so the subscription path is taken.
+    classify_env = {k: v for k, v in os.environ.items() if k not in _SUBSCRIPTION_BLOCKING_ENV_VARS}
     try:
-        result = runner(command, timeout=timeout)
+        result = runner(command, timeout=timeout, env=classify_env)
     except subproc.SubprocTimeout as exc:
         log.log_error(
             "llm_cli_timeout",
