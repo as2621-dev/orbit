@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Make ``scripts`` importable. Mirrors tests/test_orbit_unified_digest.py.
@@ -62,7 +63,10 @@ def _upload(
         video_id=video_id,
         title="A talk",
         description="about ai agents",
-        upload_date="20260101",
+        # Reason: dated "today" so it clears the stage-1 recency gate (last N days). The
+        # date is incidental to what this fixture exercises (classify/chapterize/mark_seen);
+        # a dynamic value keeps the test from going stale as wall-clock time advances.
+        upload_date=datetime.now(timezone.utc).strftime("%Y%m%d"),
         view_count=10_000,
         like_count=200,
         comment_count=20,

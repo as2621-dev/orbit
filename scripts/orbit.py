@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -67,6 +67,18 @@ _SOURCES_REFRESH_INTERVAL_SECONDS: int = 7 * 24 * 60 * 60
 # touching the network on a machine with no cookies. The tested guarantee uses a
 # mocked loader; this env var is the equivalent escape hatch for a bare CLI run.
 _STAGE0_SKIP_NETWORK_ENV_VAR: str = "ORBIT_STAGE0_SKIP_NETWORK"
+
+# Stage-1 first-run bounds. The delta engine returns EVERY unseen upload, so a cold DB
+# would mark a channel's entire back-catalogue "new" (one channel returned ~2900) and
+# classify all of it — thousands of ``claude -p`` calls. A daily digest only cares about
+# what's genuinely recent, so we (a) keep only uploads from the last
+# ``_STAGE1_RECENCY_WINDOW_DAYS`` days, (b) cap each channel to its newest
+# ``_STAGE1_MAX_UPLOADS_PER_CHANNEL``, and (c) cap the whole run at
+# ``_STAGE1_MAX_CLASSIFIED_UPLOADS``. Items left unclassified stay unseen and are
+# reconsidered next run (the recency filter ages out the old back-catalogue naturally).
+_STAGE1_RECENCY_WINDOW_DAYS: int = 2
+_STAGE1_MAX_UPLOADS_PER_CHANNEL: int = 5
+_STAGE1_MAX_CLASSIFIED_UPLOADS: int = 60
 
 # The pipeline stages, in execution order. All stages are now wired: Stage 0
 # (sources), Stages 1-2 (delta fetch + classify/chapterize, for BOTH YouTube and X),
@@ -389,6 +401,37 @@ def run_stage1_build_x_items(
     return rankable_items
 
 
+def _select_recent_uploads(
+    uploads: list[Upload],
+    *,
+    recency_cutoff: str,
+    per_channel_cap: int,
+) -> list[Upload]:
+    """Keep a channel's recent uploads, newest first, capped to ``per_channel_cap``.
+
+    Bounds the cold-DB first run (where the delta engine marks an entire back-catalogue
+    "new"): only uploads with an ``upload_date`` (``YYYYMMDD``) on/after ``recency_cutoff``
+    survive, sorted newest-first, then truncated to the cap. Uploads with no date are
+    dropped — a daily digest can't place them in time, and including them would reopen the
+    back-catalogue blowup. ``YYYYMMDD`` strings compare lexically == chronologically.
+
+    Args:
+        uploads: The channel's new (unseen) uploads from the delta engine.
+        recency_cutoff: Inclusive lower bound as a ``YYYYMMDD`` string.
+        per_channel_cap: Max uploads to return for this channel.
+
+    Returns:
+        The newest in-window uploads, at most ``per_channel_cap`` of them.
+
+    Example:
+        >>> _select_recent_uploads(uploads, recency_cutoff="20260620", per_channel_cap=5)
+        [<newest>, ...]
+    """
+    recent = [upload for upload in uploads if upload.upload_date and upload.upload_date >= recency_cutoff]
+    recent.sort(key=lambda upload: upload.upload_date, reverse=True)
+    return recent[:per_channel_cap]
+
+
 def run_stage1_build_youtube_items(
     config: OrbitConfig,
     depth: str,
@@ -458,9 +501,30 @@ def run_stage1_build_youtube_items(
     transcript_limit = TRANSCRIPT_LIMITS.get(depth, TRANSCRIPT_LIMITS["default"])
     transcripts_fetched = 0
     total_new_uploads = 0
+    classified_count = 0
+
+    # Recency cutoff (YYYYMMDD) — only uploads on/after this date are eligible. Bounds a
+    # cold-DB first run to genuinely-recent items instead of whole back-catalogues.
+    recency_cutoff = (datetime.now(timezone.utc).date() - timedelta(days=_STAGE1_RECENCY_WINDOW_DAYS)).strftime(
+        "%Y%m%d"
+    )
 
     rankable_items: list[RankableItem] = []
     for source in youtube_sources:
+        if classified_count >= _STAGE1_MAX_CLASSIFIED_UPLOADS:
+            # Per-run classify budget reached; remaining channels' uploads stay unseen and
+            # are reconsidered next run. Logged so the cap is never a silent truncation.
+            log.log_warning(
+                "youtube_stage1_classify_cap_reached",
+                platform="youtube",
+                fix_suggestion=(
+                    "Per-run classify cap hit; remaining channels deferred to the next run. "
+                    "Raise _STAGE1_MAX_CLASSIFIED_UPLOADS if you want a larger single digest."
+                ),
+                classify_cap=_STAGE1_MAX_CLASSIFIED_UPLOADS,
+            )
+            break
+
         source_id = source["source_id"]
         channel_id = str(source["external_id"])
         channel_category = str(source.get("category") or "signal")
@@ -485,7 +549,16 @@ def run_stage1_build_youtube_items(
             continue
 
         total_new_uploads += len(new_uploads)
-        for upload in new_uploads:
+        # Keep only recent uploads, newest first, capped per channel and by the remaining
+        # global classify budget — so one channel's back-catalogue can't dominate the run.
+        recent_uploads = _select_recent_uploads(
+            new_uploads,
+            recency_cutoff=recency_cutoff,
+            per_channel_cap=_STAGE1_MAX_UPLOADS_PER_CHANNEL,
+        )
+        remaining_budget = _STAGE1_MAX_CLASSIFIED_UPLOADS - classified_count
+        for upload in recent_uploads[:remaining_budget]:
+            classified_count += 1
             classification = classify.classify_item(
                 upload,
                 channel_category=channel_category,
@@ -522,6 +595,7 @@ def run_stage1_build_youtube_items(
         platform="youtube",
         source_count=len(youtube_sources),
         upload_count=total_new_uploads,
+        classified_count=classified_count,
         transcripts_fetched=transcripts_fetched,
         rankable_count=len(rankable_items),
     )
