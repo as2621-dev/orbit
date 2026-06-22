@@ -202,30 +202,79 @@ def _render_full_card(tiered_item: TieredItem) -> str:
     )
 
 
-def _render_main_cards_section(grouped: dict[str, list[TieredItem]]) -> str:
-    """Render the main column: Hero + Standard full cards, then Compact rows.
+def _is_x_item(item: Any) -> bool:
+    """True when the item is an X post — i.e. its ``card_url`` is an x.com permalink.
 
-    This is one of the two section builders Sub-phase 4 reuses for pagination (the
-    Compact group is the lowest of the three here, so it is the natural spill
-    boundary alongside Index). Returns ``""`` when all three tiers are empty so the
-    section is absent.
+    The render layer has no explicit platform field (:class:`lib.rerank.RankableItem`
+    is source-agnostic); an X item is the one that set ``card_url`` to its
+    ``https://x.com/{handle}/status/{id}`` permalink, while every YouTube item leaves
+    ``card_url`` empty. Used only to split the main tile grid into a "Videos" section
+    and an "From X" section (the tiles layout keeps videos and X posts apart).
+
+    Args:
+        item: A :class:`lib.rerank.RankableItem`.
+
+    Returns:
+        True if the item is an X post, False for a YouTube video.
+    """
+    return "x.com/" in (getattr(item, "card_url", "") or "")
+
+
+def _render_source_grid(heading: str, tiered_items: list[TieredItem]) -> str:
+    """Render one source's tile section: a heading + a tile grid of its cards.
+
+    Hero/Standard items render as full-card tiles (with their deep-link chapter
+    lists); Compact items render as condensed tiles. ``tiered_items`` is already in
+    rank order, so tile SIZE still tracks rank (Hero largest → Compact smallest)
+    within the section. Returns ``""`` when the source has no Hero/Standard/Compact
+    items, so the section (and its heading) is absent rather than an empty container.
+
+    Args:
+        heading: The section label (e.g. ``"Videos"`` / ``"From X"``).
+        tiered_items: This source's Hero/Standard/Compact items, in rank order.
+
+    Returns:
+        A ``<section class="cards">`` with a ``.tile-grid``, or ``""`` if empty.
+    """
+    full_cards_html = "".join(
+        _render_full_card(tiered_item)
+        for tiered_item in tiered_items
+        if tiered_item.density_tier in (TIER_HERO, TIER_STANDARD)
+    )
+    compact_html = "".join(
+        html_render.render_compact_row(tiered_item.scored_item.item, _card_deep_link(tiered_item.scored_item.item))
+        for tiered_item in tiered_items
+        if tiered_item.density_tier == TIER_COMPACT
+    )
+    if not full_cards_html and not compact_html:
+        return ""
+    heading_html = f'<h2 class="section-heading">{html_render.escape(heading)}</h2>'
+    return f'<section class="cards">{heading_html}<div class="tile-grid">{full_cards_html}{compact_html}</div></section>'
+
+
+def _render_main_cards_section(grouped: dict[str, list[TieredItem]]) -> str:
+    """Render the main tile grid, split into a Videos section then an From-X section.
+
+    The Hero/Standard/Compact tiers are partitioned by source (:func:`_is_x_item`)
+    so videos and X posts get their own tile grids, each keeping its rank-based size
+    ladder. Index-tier items are NOT here — they render in the shared bottom strip.
+    Returns ``""`` when there are no Hero/Standard/Compact items so the whole block
+    is absent.
 
     Args:
         grouped: The output of :func:`group_items_by_tier`.
 
     Returns:
-        The main-cards section markup, or ``""`` if there are no Hero/Standard/Compact items.
+        The main tile sections (absent ones omitted), or ``""`` if all empty.
     """
-    hero_and_standard_html = "".join(
-        _render_full_card(tiered_item) for tiered_item in grouped[TIER_HERO] + grouped[TIER_STANDARD]
+    main_tiers = grouped[TIER_HERO] + grouped[TIER_STANDARD] + grouped[TIER_COMPACT]
+    video_items = [tiered_item for tiered_item in main_tiers if not _is_x_item(tiered_item.scored_item.item)]
+    x_items = [tiered_item for tiered_item in main_tiers if _is_x_item(tiered_item.scored_item.item)]
+    sections = (
+        _render_source_grid("Videos", video_items),
+        _render_source_grid("From X", x_items),
     )
-    compact_html = "".join(
-        html_render.render_compact_row(tiered_item.scored_item.item, _card_deep_link(tiered_item.scored_item.item))
-        for tiered_item in grouped[TIER_COMPACT]
-    )
-    if not hero_and_standard_html and not compact_html:
-        return ""
-    return f'<section class="cards">{hero_and_standard_html}{compact_html}</section>'
+    return "\n".join(section for section in sections if section)
 
 
 def _render_index_section(grouped: dict[str, list[TieredItem]]) -> str:

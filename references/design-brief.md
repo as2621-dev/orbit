@@ -30,6 +30,13 @@ already rank-ordered by `derank_items`).
 
 ## 3. Page layout (top to bottom)
 
+> **Layout note (Tiles, build-from-prefs):** the main cards now render as a
+> responsive **tile grid** split into two source sections — **Videos** then
+> **From X** — each keeping its rank-based size ladder (Hero tile spans the full
+> row; Standard/Compact are single-column tiles). Index-tier items still share
+> the bottom "they also posted" strip. This is an interim pass pending the final
+> "Orbit - Tiles" design; the section anatomy below still holds per tier.
+
 ```
 +------------------------------------------------------------------+
 |  TL;DR:  N episodes from M creators today                        |  <- one-line header

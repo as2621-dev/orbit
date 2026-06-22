@@ -417,7 +417,7 @@ body {
   font-family: var(--font-ui);
   line-height: 1.5;
 }
-.digest { max-width: 820px; margin: 0 auto; padding: 24px 20px 64px; }
+.digest { max-width: 1040px; margin: 0 auto; padding: 24px 20px 64px; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 .tldr {
@@ -444,6 +444,20 @@ a:hover { text-decoration: underline; }
   text-transform: uppercase;
   color: var(--muted);
   margin: 28px 0 12px;
+}
+/* Tiles layout: each source section (Videos / From X) is a responsive grid.
+   Tile SIZE tracks rank — a Hero tile spans the full row, Standard/Compact are
+   single-column tiles — so the rank ladder stays legible across the grid. */
+.tile-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+.tile-grid .card { margin-bottom: 0; height: 100%; }
+.tile-grid .card.hero { grid-column: 1 / -1; }
+@media (max-width: 640px) {
+  .tile-grid { grid-template-columns: 1fr; }
 }
 .card {
   background: var(--surface);
