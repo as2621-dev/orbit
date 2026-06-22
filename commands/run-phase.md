@@ -94,7 +94,7 @@ implement → review → fix → validate → report.
 - Verify as you go (imports resolve, types check)
 - **If this sub-phase touches UI:** before writing UI from scratch, consult the remote design library:
   - Read `reference/design-language.md` (the chosen design system for this product). All tokens live there.
-  - For animation/layout/interaction patterns, fetch the relevant skill: `curl -s https://raw.githubusercontent.com/ashesh2621/design-references/main/skills/INDEX.md` then fetch the chosen `.md` files.
+  - For animation/layout/interaction patterns, narrow the skills index before fetching (don't cat it whole): `curl -s https://raw.githubusercontent.com/ashesh2621/design-references/main/skills/INDEX.md | grep -iE '<keyword>'`, then fetch only the chosen `.md` files. See `design-references/RESOURCES.md` for the full recipe.
   - For starter HTML (hero, pricing, dashboard, card, etc), search components: `gh api -X GET search/code -f q="<keyword> repo:ashesh2621/design-references path:components" --jq '.items[].path'`, then fetch the HTML from `raw.githubusercontent.com/.../components/html/<slug>.html`.
   - Adapt the fetched HTML to match `reference/design-language.md` tokens; do not copy-paste raw. Credit the original creator in code comments per the meta JSON's `credit_name`.
 

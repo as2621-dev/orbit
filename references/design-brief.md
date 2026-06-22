@@ -2,10 +2,11 @@
 
 The self-contained look spec for the rendered daily digest. Authored here from the
 master-plan brief §3 Stage 7; iteration expected (this is M1's riskiest-assumption
-surface — running it on real subs tunes the look and the tier laddering). No remote
-design-references are used (explicitly out of scope per the master plan): the page
-is a single self-contained HTML file with an inline `<style>`, NO external/CDN
-fetches, NO `<link>` / `<script src>`.
+surface — running it on real subs tunes the look and the tier laddering). The
+palette/type layer is lifted from the "Aura Editorial Features" design system
+(see `reference/design-language.md`), but **tokens-only and inlined**: the page
+stays a single self-contained HTML file with an inline `<style>`, NO external/CDN
+fetches, NO `<link>` / `<script src>`, NO web-font fetch.
 
 ## 1. The one principle
 

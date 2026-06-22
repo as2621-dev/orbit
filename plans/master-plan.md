@@ -91,7 +91,7 @@ Orbit is a personal daily intelligence digest that pulls everything new from the
 - No OAuth or official YouTube/X API path — cookies-only.
 - No cloud scheduling (Trigger.dev, Claude Routines) in cookie mode.
 - No mobile/desktop native client — delivery is HTML file + iMessage/WhatsApp link.
-- No remote design-references library — the digest's look is governed solely by the brief's Design Brief (§3 Stage 7), self-contained in this repo.
+- The digest's look adopts a base design system ("Aura Editorial Features") from the design-references library, but **tokens-only**: they are inlined into the renderer (`reference/design-language.md` is the source of truth), so the page stays self-contained — no `<link>`, no `<script src>`, no web-font fetch. The framework/runtime-weight rationale above still holds.
 - WhatsApp delivery and Briefcast payload are explicitly *optional* (M4 stretch), not core.
 - No payments, accounts, or analytics telemetry.
 

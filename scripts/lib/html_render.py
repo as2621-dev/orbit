@@ -380,23 +380,33 @@ __BODY__
 # .hero / .standard / .compact / .index carry the density distinction.
 CSS: str = """
 :root {
-  --bg: #0f1115;
-  --surface: #181b22;
-  --surface-2: #1f232c;
-  --text: #e8eaed;
-  --muted: #9aa0aa;
-  --accent: #6ea8fe;
-  --border: #2a2f3a;
+  /* Palette lifted from the "Aura Editorial Features" design system on
+     aura.build — gold accent on near-black with zinc borders. The source's
+     web fonts (Inter / Playfair Display / JetBrains Mono) are adapted to
+     system serif / mono / sans stacks so the page stays self-contained
+     (design brief §4: no web-font fetch). See reference/design-language.md
+     for the full token map, rationale, and creator credit. */
+  --bg: #000000;
+  --surface: #141414;
+  --surface-2: #1c1c1c;
+  --text: #ffffff;
+  --muted: #a1a1aa;
+  --accent: #e0a94e;
+  --border: #27272a;
+  --radius: 8px;
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 }
 @media (prefers-color-scheme: light) {
   :root {
-    --bg: #f7f8fa;
+    --bg: #faf8f4;
     --surface: #ffffff;
-    --surface-2: #f0f2f5;
-    --text: #1a1d23;
-    --muted: #5a6270;
-    --accent: #2563eb;
-    --border: #dfe3ea;
+    --surface-2: #f3f1ec;
+    --text: #18181b;
+    --muted: #52525b;
+    --accent: #9a6b1e;
+    --border: #e4e4e7;
   }
 }
 * { box-sizing: border-box; }
@@ -404,7 +414,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-family: var(--font-ui);
   line-height: 1.5;
 }
 .digest { max-width: 820px; margin: 0 auto; padding: 24px 20px 64px; }
@@ -417,9 +427,10 @@ a:hover { text-decoration: underline; }
   margin-bottom: 24px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--radius);
 }
 .tldr-label {
+  font-family: var(--font-mono);
   font-size: 0.7rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -427,6 +438,7 @@ a:hover { text-decoration: underline; }
   margin-right: 8px;
 }
 .section-heading {
+  font-family: var(--font-mono);
   font-size: 0.8rem;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -436,11 +448,11 @@ a:hover { text-decoration: underline; }
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--radius);
   padding: 16px 18px;
   margin-bottom: 14px;
 }
-.card-title { margin: 0 0 6px; line-height: 1.3; }
+.card-title { margin: 0 0 6px; line-height: 1.3; font-family: var(--font-serif); }
 .card.hero .card-title { font-size: 1.5rem; }
 .card.standard .card-title { font-size: 1.2rem; }
 .card-meta { color: var(--muted); font-size: 0.9rem; }
@@ -450,6 +462,7 @@ a:hover { text-decoration: underline; }
 .chapter-link { display: flex; gap: 10px; }
 .chapter-time {
   flex: 0 0 auto;
+  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   color: var(--muted);
   min-width: 3.5em;
@@ -472,7 +485,7 @@ a:hover { text-decoration: underline; }
   padding: 14px 18px;
   background: var(--surface-2);
   border: 1px solid var(--accent);
-  border-radius: 10px;
+  border-radius: var(--radius);
 }
 .scoops-heading { margin-top: 0; color: var(--accent); }
 .scoops-list { list-style: none; margin: 0; padding: 0; }
@@ -492,7 +505,7 @@ a:hover { text-decoration: underline; }
 .overlap-cluster {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--radius);
   padding: 12px 16px;
   margin-bottom: 12px;
 }
@@ -505,7 +518,7 @@ a:hover { text-decoration: underline; }
   padding: 12px 16px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--radius);
 }
 .trending-list { list-style: none; margin: 0; padding: 0; }
 .trending-row { padding: 6px 0; display: flex; gap: 8px; align-items: baseline; justify-content: space-between; }

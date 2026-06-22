@@ -99,20 +99,25 @@ The design reference library lives in a separate public repo, not in this projec
 
 If the product has a frontend:
 
-1. **Skim the design-systems index:**
+1. **Narrow the design-systems index — do NOT cat it whole.** The index is ~113 KB
+   / 511 rows; catting it floods context with a wall of raw markdown (this was a
+   real bug). Filter to candidate rows first, matching the product brief's target
+   user, mood (technical/playful/serious), density (information-dense vs spacious),
+   era (retro/contemporary/futuristic):
    ```bash
-   curl -s https://raw.githubusercontent.com/ashesh2621/design-references/main/design-systems/INDEX.md
+   BASE=https://raw.githubusercontent.com/ashesh2621/design-references/main
+   curl -s "$BASE/design-systems/INDEX.md" | grep -iE '<keyword1>|<keyword2>' | head -15
    ```
-   The index lists all 511 design systems (featured ones first). Match against the product brief's: target user, mood (technical/playful/serious), density (information-dense vs spacious), era (retro/contemporary/futuristic).
-
-2. **Pick 2-3 candidates by name/slug.** Fetch each candidate's full `.md` and (optionally) HTML preview:
-   ```bash
-   curl -s https://raw.githubusercontent.com/ashesh2621/design-references/main/design-systems/<slug>.md
-   curl -s https://raw.githubusercontent.com/ashesh2621/design-references/main/design-systems-html-previews/<slug>.html
-   ```
-   Or use GitHub code search:
+   Or skip the index entirely with GitHub code search (MCP `search_code`, or `gh`):
    ```bash
    gh api -X GET search/code -f q="<keyword> repo:ashesh2621/design-references path:design-systems" --jq '.items[].path'
+   ```
+
+2. **Pick 2-3 candidates by name/slug.** Fetch each candidate's full `.md` (small,
+   ~4-5 KB) and (optionally) its HTML preview:
+   ```bash
+   curl -s "$BASE/design-systems/<slug>.md"
+   curl -s "$BASE/design-systems-html-previews/<slug>.html"
    ```
 
 3. **Propose ONE** to the user with a one-sentence rationale per candidate. Let the user pick or override.
