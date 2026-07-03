@@ -31,8 +31,8 @@ from lib.bird_x import Follow, Tweet, XAuthError  # noqa: E402
 from lib.classify import LlmClassifier, _default_llm_classifier  # noqa: E402
 from lib.cluster import Cluster, cluster_overlaps  # noqa: E402
 from lib.config import OrbitConfig, load_config  # noqa: E402
-from lib.density import TieredItem, assign_density_tiers  # noqa: E402
-from lib.llm import load_dotenv, make_llm_classifier  # noqa: E402
+from lib.density import TIER_HERO, TIER_STANDARD, TieredItem, assign_density_tiers  # noqa: E402
+from lib.llm import LlmCliError, load_dotenv, make_llm_classifier  # noqa: E402
 from lib.external_trending import (  # noqa: E402
     build_trending_multiplier_map,
     detect_scoops,
@@ -40,6 +40,7 @@ from lib.external_trending import (  # noqa: E402
 )
 from lib.rerank import RankableItem, derank_items  # noqa: E402
 from lib.setup_wizard import run_setup_wizard  # noqa: E402
+from lib.summarize import summarize_items, synthesize_verdict  # noqa: E402
 from lib.trending import TrendingItem, compute_internal_trending  # noqa: E402
 from lib.youtube_yt import (  # noqa: E402
     Subscription,
@@ -381,12 +382,28 @@ def run_stage1_build_x_items(
     rankable_items: list[RankableItem] = []
     for tweet in new_tweets:
         channel_category = category_by_handle.get(tweet.handle, "signal")
-        classification = classify.classify_item(
-            tweet,
-            channel_category=channel_category,
-            interests=config.interests,
-            llm_classifier=llm_classifier,
-        )
+        try:
+            classification = classify.classify_item(
+                tweet,
+                channel_category=channel_category,
+                interests=config.interests,
+                llm_classifier=llm_classifier,
+            )
+        except LlmCliError as exc:
+            # A transient ``claude -p`` hang/timeout must not abort the digest (Rule 12).
+            # Skip just this tweet; the rest still process. (X items are not delta-marked
+            # here, so it is naturally reconsidered on the next run.)
+            log.log_warning(
+                "x_stage1_item_classify_skipped",
+                platform="x",
+                handle=tweet.handle,
+                fix_suggestion=(
+                    "Classifying this tweet failed (claude -p timeout/transient); skipped "
+                    "for this run. Other items still processed."
+                ),
+                error_message=str(exc),
+            )
+            continue
         rankable_items.append(
             RankableItem.from_tweet(tweet, classification, creator_external_id=tweet.handle)
         )
@@ -559,12 +576,29 @@ def run_stage1_build_youtube_items(
         remaining_budget = _STAGE1_MAX_CLASSIFIED_UPLOADS - classified_count
         for upload in recent_uploads[:remaining_budget]:
             classified_count += 1
-            classification = classify.classify_item(
-                upload,
-                channel_category=channel_category,
-                interests=config.interests,
-                llm_classifier=llm_classifier,
-            )
+            try:
+                classification = classify.classify_item(
+                    upload,
+                    channel_category=channel_category,
+                    interests=config.interests,
+                    llm_classifier=llm_classifier,
+                )
+            except LlmCliError as exc:
+                # A transient ``claude -p`` hang/timeout must not abort the whole digest
+                # (Rule 12). Skip just this upload; it stays unseen (mark_seen not reached)
+                # and is reconsidered next run. Every other item still processes.
+                log.log_warning(
+                    "youtube_stage1_item_classify_skipped",
+                    platform="youtube",
+                    source_id=source_id,
+                    item_external_id=upload.video_id,
+                    fix_suggestion=(
+                        "Classifying this upload failed (claude -p timeout/transient); skipped "
+                        "for this run, left unseen for the next. Other items still processed."
+                    ),
+                    error_message=str(exc),
+                )
+                continue
 
             # Only a long-form upload WITHOUT creator chapters needs a transcript (the LLM
             # segmentation path); short items and creator-chaptered items need none. Fetch
@@ -579,7 +613,23 @@ def run_stage1_build_youtube_items(
             if needs_transcript and transcripts_fetched < transcript_limit:
                 transcript = active_transcript_fetcher(upload.video_id, depth)
                 transcripts_fetched += 1
-            chapters = chapterize_episode(upload, transcript, segmenter=segmenter)
+            try:
+                chapters = chapterize_episode(upload, transcript, segmenter=segmenter)
+            except LlmCliError as exc:
+                # Chapter segmentation is best-effort: a transient ``claude -p`` failure
+                # degrades to no chapters (still a valid tile), never aborts the run (Rule 12).
+                log.log_warning(
+                    "youtube_stage1_item_chapterize_degraded",
+                    platform="youtube",
+                    source_id=source_id,
+                    item_external_id=upload.video_id,
+                    fix_suggestion=(
+                        "Chapterizing this upload failed (claude -p timeout/transient); "
+                        "rendering it without chapters. Re-run later for chapter deep-links."
+                    ),
+                    error_message=str(exc),
+                )
+                chapters = []
 
             rankable_items.append(
                 RankableItem.from_parts(
@@ -751,6 +801,9 @@ def run_stage7_render(
     clusters: Optional[list[Cluster]] = None,
     trending_items: Optional[list[TrendingItem]] = None,
     scoops: Optional[list[TrendingItem]] = None,
+    verdict: str = "",
+    summaries: Optional[dict[str, str]] = None,
+    inline_image: Optional[Callable[[str], Optional[str]]] = None,
 ) -> list[Path]:
     """Stage 7: render the tiered items to HTML and write page 1 (and page 2 if spilled).
 
@@ -774,6 +827,12 @@ def run_stage7_render(
     page_1_path = html_path if html_path is not None else _resolve_html_path(config)
     page_2_path = page_1_path.parent / render.DEFAULT_PAGE_2_FILENAME
 
+    # The inline_image seam defaults to render's real build-time fetch; tests pass a stub
+    # so the render path never touches the network.
+    render_kwargs: dict[str, Any] = {}
+    if inline_image is not None:
+        render_kwargs["inline_image"] = inline_image
+
     pages = render.render_digest_pages(
         tiered_items,
         config,
@@ -781,6 +840,9 @@ def run_stage7_render(
         clusters=clusters,
         trending_items=trending_items,
         scoops=scoops,
+        verdict=verdict,
+        summaries=summaries,
+        **render_kwargs,
     )
 
     written_paths: list[Path] = [page_1_path]
@@ -939,8 +1001,28 @@ def run_pipeline(depth: str) -> int:
     tiered_items = run_stage6_rank_and_tier(
         rankable_items, config, trending_multipliers=trending_multipliers
     )
+
+    # LLM editorial prose (Rule 5 — summarizing the day's feed is a valid model use).
+    # Both go through the live claude-CLI boundary and are FAIL-SOFT (a flaky/absent LLM
+    # returns ""/{} so the digest degrades to structural-only, never crashes the pipeline,
+    # Rule 12). Only Hero/Standard items get per-item blurbs (cost control); the verdict is
+    # grounded in the scoop + cluster + top-headline context.
+    verdict = synthesize_verdict(tiered_items, scoops, clusters)
+    hero_standard_items = [
+        tiered_item.scored_item.item
+        for tiered_item in tiered_items
+        if tiered_item.density_tier in (TIER_HERO, TIER_STANDARD)
+    ]
+    summaries = summarize_items(hero_standard_items)
+
     written_paths = run_stage7_render(
-        tiered_items, config, clusters=clusters, trending_items=trending_items, scoops=scoops
+        tiered_items,
+        config,
+        clusters=clusters,
+        trending_items=trending_items,
+        scoops=scoops,
+        verdict=verdict,
+        summaries=summaries,
     )
 
     # Stage 7 (deliver) — notify the user the digest is ready. iMessage is opt-in: on

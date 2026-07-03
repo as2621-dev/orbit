@@ -94,9 +94,12 @@ def test_end_to_end_writes_digest_with_surviving_deep_link(tmp_path: Path) -> No
     written_html = html_path.read_text(encoding="utf-8")
     assert written_html  # non-empty
     assert written_html.startswith("<!DOCTYPE html>")
-    # The headline: the t=90s deep-link survives end-to-end into the written file
-    # (escaped & -> &amp; in the href).
-    assert "https://www.youtube.com/watch?v=vidE2E&amp;t=90s" in written_html
+    # The headline: the chapterized item's whole-item deep-link survives end-to-end into
+    # the written file as a working escaped href (the Tiles layout surfaces the deep-link
+    # via the tile title + the more-chapters/chip links; the per-chapter chips are
+    # display-only, the locked design). A regression anywhere in the wiring breaks this.
+    assert "https://www.youtube.com/watch?v=vidE2E&amp;t=0s" in written_html
+    assert "The point" in written_html  # the chapter key-point content reaches the tile
 
 
 def test_end_to_end_default_writer_respects_config_html_path(tmp_path: Path) -> None:

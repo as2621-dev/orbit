@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700;9..144,900&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:#EDE7DA}
+  .ph{background-image:repeating-linear-gradient(135deg,rgba(31,27,22,.07) 0 7px,rgba(31,27,22,.02) 7px 14px);background-color:#e3dccc;display:flex;align-items:flex-end;justify-content:flex-start;overflow:hidden;position:relative;flex:none}
+  .ph span{font-family:'JetBrains Mono',monospace;font-size:8.5px;letter-spacing:.04em;color:#8a7f6c;text-transform:uppercase;padding:4px 5px;background:rgba(244,240,232,.82)}
+  a{color:inherit;text-decoration:none}
+  .tile{break-inside:avoid;background:#F7F3EA;border:1px solid rgba(31,27,22,.14);margin-bottom:18px;transition:border-color .15s,box-shadow .15s}
+  .tile:hover{border-color:rgba(183,71,42,.55);box-shadow:0 2px 10px rgba(31,27,22,.07)}
+  .chip{font-family:'JetBrains Mono',monospace;font-size:10.5px;font-weight:500;color:#B7472A;background:rgba(183,71,42,.1);padding:2px 6px;border-radius:2px;white-space:nowrap}
+  .kp{display:flex;gap:9px;align-items:baseline;padding:5px 0;border-bottom:1px dotted rgba(31,27,22,.16)}
+  .kp:last-child{border-bottom:none}
+  .kp span.t{font-size:13.5px;color:#2a251e;line-height:1.3;flex:1}
+</style>
+</helmet>
+
+<div data-screen-label="Orbit tiles" style="min-height:100vh;background:#EDE7DA;color:#1F1B16;font-family:'Newsreader',serif;padding:0 0 60px;">
+  <div style="max-width:1360px;margin:0 auto;padding:0 40px;">
+
+    <!-- masthead -->
+    <div style="display:flex;align-items:flex-end;justify-content:space-between;padding:34px 0 16px;border-bottom:3px double #1F1B16;">
+      <div>
+        <div style="font-family:'Fraunces',serif;font-weight:900;font-size:52px;line-height:.9;letter-spacing:-.02em;">Orbit</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.18em;color:#8a7f6c;text-transform:uppercase;margin-top:7px;">Your people, today — ranked</div>
+      </div>
+      <div style="text-align:right;font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.07em;color:#5a5240;line-height:1.7;">
+        <div>TUESDAY · 17 JUN 2026 · 06:14</div>
+        <div><b style="color:#1F1B16;">26 sources · 26 accounted for</b></div>
+        <div style="color:#B7472A;">1 scoop · 1 dormant · 2 clusters</div>
+      </div>
+    </div>
+
+    <!-- verdict -->
+    <div style="padding:26px 0 24px;">
+      <div style="font-family:'Fraunces',serif;font-weight:500;font-size:30px;line-height:1.3;letter-spacing:-.01em;max-width:1060px;">Quiet day. The only real story is <span style="color:#B7472A;">Nano Banana 2 pricing</span>, which three of your people landed on independently — plus one genuine scoop from <span style="font-style:italic;">@swyx</span> and a rare post from <span style="font-style:italic;">@karpathy</span>.</div>
+    </div>
+
+    <!-- ===== AHEAD OF THE CURVE ===== -->
+    <div style="margin-bottom:32px;">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;">
+        <div style="font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.18em;color:#B7472A;text-transform:uppercase;">Ahead of the curve</div>
+        <div style="flex:1;height:1px;background:rgba(183,71,42,.3);"></div>
+      </div>
+      <div style="display:grid;grid-template-columns:1.15fr 1fr 1fr;gap:16px;align-items:stretch;">
+
+        <!-- SCOOP — loudest -->
+        <div class="tile" style="background:#B7472A;border-color:#B7472A;padding:22px 24px;color:#F7F3EA;display:flex;flex-direction:column;margin-bottom:0;">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase;opacity:.85;margin-bottom:12px;">◆ The scoop · @swyx · X</div>
+          <div style="font-family:'Fraunces',serif;font-weight:600;font-size:24px;line-height:1.16;margin-bottom:11px;">Open-sources “Briar,” a 40×-cheaper eval harness</div>
+          <div style="font-size:14.5px;line-height:1.45;opacity:.92;margin-bottom:auto;">Nobody else has it yet. Drops agent-eval cost from dollars to cents per run — directly relevant if you ship agents.</div>
+          <a style="font-family:'JetBrains Mono',monospace;font-size:11px;margin-top:16px;border-top:1px solid rgba(247,243,234,.35);padding-top:11px;">→ read the thread</a>
+        </div>
+
+        <!-- TRENDING NOW — bullets -->
+        <div class="tile" style="padding:22px 24px;display:flex;flex-direction:column;margin-bottom:0;">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:#5a5240;margin-bottom:14px;">↗ Trending now</div>
+          <div style="display:flex;flex-direction:column;gap:0;">
+            <a style="display:flex;align-items:baseline;gap:10px;padding:9px 0;border-bottom:1px solid rgba(31,27,22,.1);">
+              <span style="color:#B7472A;font-family:'JetBrains Mono',monospace;font-size:12px;width:12px;flex:none;">◆</span>
+              <span style="font-size:15px;line-height:1.25;flex:1;">@karpathy breaks a 6-week silence</span>
+              <span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;color:#8a7f6c;white-space:nowrap;">dormant</span>
+            </a>
+            <a style="display:flex;align-items:baseline;gap:10px;padding:9px 0;border-bottom:1px solid rgba(31,27,22,.1);">
+              <span style="color:#B7472A;font-family:'JetBrains Mono',monospace;font-size:12px;width:12px;flex:none;">↗</span>
+              <span style="font-size:15px;line-height:1.25;flex:1;">Nano Banana 2 pricing</span>
+              <span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;color:#B7472A;white-space:nowrap;">4 of yours</span>
+            </a>
+            <a style="display:flex;align-items:baseline;gap:10px;padding:9px 0;border-bottom:1px solid rgba(31,27,22,.1);">
+              <span style="color:#B7472A;font-family:'JetBrains Mono',monospace;font-size:12px;width:12px;flex:none;">↗</span>
+              <span style="font-size:15px;line-height:1.25;flex:1;">Cheap eval harnesses</span>
+              <span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;color:#B7472A;white-space:nowrap;">3 of yours</span>
+            </a>
+            <a style="display:flex;align-items:baseline;gap:10px;padding:9px 0;border-bottom:1px solid rgba(31,27,22,.1);">
+              <span style="color:#8a7f6c;font-family:'JetBrains Mono',monospace;font-size:12px;width:12px;flex:none;">○</span>
+              <span style="font-size:15px;line-height:1.25;flex:1;">EU AI Act enforcement date</span>
+              <span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;color:#8a7f6c;white-space:nowrap;">external</span>
+            </a>
+            <a style="display:flex;align-items:baseline;gap:10px;padding:9px 0;">
+              <span style="color:#8a7f6c;font-family:'JetBrains Mono',monospace;font-size:12px;width:12px;flex:none;">○</span>
+              <span style="font-size:15px;line-height:1.25;flex:1;">Apple LLM rumor cycle</span>
+              <span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;color:#8a7f6c;white-space:nowrap;">external</span>
+            </a>
+          </div>
+        </div>
+
+        <!-- HIDDEN GEM -->
+        <div class="tile" style="padding:0;display:flex;flex-direction:column;margin-bottom:0;overflow:hidden;">
+          <div style="background:#2a251e;color:#e8a594;font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.12em;text-transform:uppercase;padding:9px 18px;display:flex;justify-content:space-between;align-items:center;">
+            <span>✦ Hidden gem</span><span style="color:#F7F3EA;">+900% today</span>
+          </div>
+          <div style="padding:18px 20px;display:flex;flex-direction:column;flex:1;">
+            <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8a7f6c;margin-bottom:8px;">TRELIS RESEARCH · 14:20 · 3.1k subs</div>
+            <div style="font-family:'Fraunces',serif;font-weight:600;font-size:20px;line-height:1.16;margin-bottom:9px;">“Why your RAG eval is quietly lying to you”</div>
+            <div style="font-size:14px;line-height:1.45;color:#3a342b;margin-bottom:auto;">A tiny channel outpacing everything in your feed today — picking up fast outside your network too.</div>
+            <a style="display:flex;gap:7px;align-items:baseline;margin-top:14px;border-top:1px solid rgba(31,27,22,.12);padding-top:11px;"><span class="chip">02:50</span><span style="font-size:13px;color:#2a251e;">the contamination demo</span></a>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== FROM YOUR FEED : ranked masonry ===== -->
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
+      <div style="font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.18em;color:#5a5240;text-transform:uppercase;">From your feed · ranked</div>
+      <div style="flex:1;height:1px;background:rgba(31,27,22,.18);"></div>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8a7f6c;">bigger tile = higher signal</div>
+    </div>
+
+    <div style="column-count:3;column-gap:18px;">
+
+      <!-- HERO tile (most content) -->
+      <div class="tile">
+        <div class="ph" style="height:188px;width:100%;"><span>thumbnail · dwarkesh patel</span></div>
+        <div style="padding:16px 18px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:7px;">
+            <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8a7f6c;">DWARKESH PATEL · 1:52:14 · YouTube</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:#B7472A;letter-spacing:.08em;">▲ TOP SIGNAL</div>
+          </div>
+          <div style="font-family:'Fraunces',serif;font-weight:600;font-size:23px;line-height:1.16;margin-bottom:9px;">Leopold Aschenbrenner returns: the compute wall &amp; what 2027 looks like</div>
+          <div style="font-size:14px;line-height:1.45;color:#3a342b;margin-bottom:12px;">A 6-chapter interview on why scaling continues — and the physical limits that actually bind it.</div>
+          <div>
+            <div class="kp"><span class="chip">04:20</span><span class="t">GPU shortage isn’t the bottleneck</span></div>
+            <div class="kp"><span class="chip">22:48</span><span class="t">the power-grid constraint, mapped</span></div>
+            <div class="kp"><span class="chip">58:10</span><span class="t">are we mispricing inference?</span></div>
+            <div class="kp"><span class="chip">1:31:00</span><span class="t">the 2027 base case</span></div>
+          </div>
+          <a style="font-family:'JetBrains Mono',monospace;font-size:11px;color:#8a7f6c;display:inline-block;margin-top:10px;">+ 2 more chapters</a>
+        </div>
+      </div>
+
+      <!-- NB2 pricing — primary pick, cross-linked -->
+      <div class="tile">
+        <div class="ph" style="height:140px;width:100%;"><span>thumb · lenny</span></div>
+        <div style="padding:15px 17px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:7px;">
+            <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8a7f6c;">LENNY’S PODCAST · 1:04:09</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:#B7472A;letter-spacing:.08em;">▲ BEST ON NB2</div>
+          </div>
+          <div style="font-family:'Fraunces',serif;font-weight:600;font-size:20px;line-height:1.16;margin-bottom:9px;">What Nano Banana 2’s new pricing actually means</div>
+          <div style="font-size:13.5px;line-height:1.45;color:#3a342b;margin-bottom:11px;">The clearest breakdown of the three you got — the others mostly react to it.</div>
+          <div>
+            <div class="kp"><span class="chip">08:40</span><span class="t">per-image vs flat-rate tiers</span></div>
+            <div class="kp"><span class="chip">21:30</span><span class="t">who it undercuts, and how hard</span></div>
+            <div class="kp"><span class="chip">44:55</span><span class="t">the hidden enterprise floor</span></div>
+          </div>
+          <div style="margin-top:12px;border-top:1px solid rgba(31,27,22,.14);padding-top:10px;">
+            <div style="font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.1em;color:#8a7f6c;text-transform:uppercase;margin-bottom:6px;">Same story, also covered</div>
+            <div style="display:flex;flex-wrap:wrap;gap:6px 12px;font-family:'JetBrains Mono',monospace;font-size:11px;color:#B7472A;">
+              <a>Dwarkesh · 1:12:30</a><a>MKBHD · 04:11</a><a>@swyx · the leak</a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Evals — primary pick, cross-linked -->
+      <div class="tile">
+        <div class="ph" style="height:120px;width:100%;"><span>thumb · latent space</span></div>
+        <div style="padding:15px 17px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:7px;">
+            <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8a7f6c;">LATENT SPACE · 1:14:00</div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:9px;color:#B7472A;letter-spacing:.08em;">▲ BEST ON EVALS</div>
+          </div>
+          <div style="font-family:'Fraunces',serif;font-weight:600;font-size:19px;line-height:1.16;margin-bottom:9px;">A field guide to cheap evals, with the Briar author</div>
+          <div>
+            <div class="kp"><span class="chip">04:00</span><span class="t">why evals got expensive</span></div>
+            <div class="kp"><span class="chip">22:05</span><span class="t">how Briar caches runs</span></div>
+            <div class="kp"><span class="chip">41:30</span><span class="t">live demo, real numbers</span></div>
+          </div>
+          <div style="margin-top:12px;border-top:1px solid rgba(31,27,22,.14);padding-top:10px;">
+            <div style="font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.1em;color:#8a7f6c;text-transform:uppercase;margin-bottom:6px;">Same story, also covered</div>
+            <div style="display:flex;flex-wrap:wrap;gap:6px 12px;font-family:'JetBrains Mono',monospace;font-size:11px;color:#B7472A;">
+              <a>Yannic · 31:40</a><a>@simonw · agent-loop post</a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- No Priors -->
+      <div class="tile">
+        <div class="ph" style="height:120px;width:100%;"><span>thumb · no priors</span></div>
+        <div style="padding:14px 16px;">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8a7f6c;margin-bottom:6px;">NO PRIORS · 49:20</div>
+          <div style="font-family:'Fraunces',serif;font-weight:600;font-size:18px;line-height:1.16;margin-bottom:8px;">A robotics CEO on the data wall</div>
+          <div style="font-size:13.5px;line-height:1.4;color:#3a342b;margin-bottom:10px;">Why robotics is bottlenecked on real-world data, not models.</div>
+          <div>
+            <div class="kp"><span class="chip">11:05</span><span class="t">simulation isn’t enough</span></div>
+            <div class="kp"><span class="chip">33:50</span><span class="t">the teleop data play</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- a16z -->
+      <div class="tile">
+        <div class="ph" style="height:120px;width:100%;"><span>thumb · a16z</span></div>
+        <div style="padding:14px 16px;">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8a7f6c;margin-bottom:6px;">a16z · 31:00</div>
+          <div style="font-family:'Fraunces',serif;font-weight:600;font-size:18px;line-height:1.16;margin-bottom:8px;">State of consumer AI 2026</div>
+          <div style="font-size:13.5px;line-height:1.4;color:#3a342b;margin-bottom:10px;">Where the spend and retention actually are this year.</div>
+          <div>
+            <div class="kp"><span class="chip">07:30</span><span class="t">the top-10 apps shift</span></div>
+            <div class="kp"><span class="chip">19:15</span><span class="t">retention vs novelty</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Theo -->
+      <div class="tile">
+        <div style="padding:14px 16px;">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8a7f6c;margin-bottom:6px;">THEO · t3.gg · 41:00</div>
+          <div style="font-family:'Fraunces',serif;font-weight:600;font-size:18px;line-height:1.16;margin-bottom:8px;">“I was wrong about RSC”</div>
+          <div style="font-size:13.5px;line-height:1.4;color:#3a342b;margin-bottom:10px;">A reversal worth the watch if you ship React.</div>
+          <a style="display:flex;gap:7px;align-items:baseline;"><span class="chip">18:20</span><span style="font-size:12.5px;color:#2a251e;">“what changed my mind”</span></a>
+        </div>
+      </div>
+
+      <!-- tweet: levelsio -->
+      <div class="tile" style="background:#F2ECE0;">
+        <div style="padding:13px 15px;">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:9.5px;color:#8a7f6c;margin-bottom:6px;">@levelsio · X</div>
+          <div style="font-size:13.5px;line-height:1.4;color:#2a251e;">Shipped a micro-SaaS over the weekend — posts the revenue screenshot.</div>
+          <a style="font-family:'JetBrains Mono',monospace;font-size:10.5px;color:#B7472A;margin-top:9px;display:inline-block;">→ post</a>
+        </div>
+      </div>
+
+      <!-- Fireship -->
+      <div class="tile">
+        <div style="padding:14px 16px;">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#8a7f6c;margin-bottom:6px;">FIRESHIP · 02:30</div>
+          <div style="font-family:'Fraunces',serif;font-weight:600;font-size:17px;line-height:1.16;margin-bottom:8px;">100 seconds of the new SDK</div>
+          <a style="display:flex;gap:7px;align-items:baseline;"><span class="chip">00:40</span><span style="font-size:12.5px;color:#2a251e;">“the one new primitive”</span></a>
+        </div>
+      </div>
+
+      <!-- tweet: stratechery -->
+      <div class="tile" style="background:#F2ECE0;">
+        <div style="padding:13px 15px;">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:9.5px;color:#8a7f6c;margin-bottom:6px;">STRATECHERY · post</div>
+          <div style="font-size:13.5px;line-height:1.4;color:#2a251e;">Argues the pricing move is really about distribution, not margin.</div>
+          <a style="font-family:'JetBrains Mono',monospace;font-size:10.5px;color:#B7472A;margin-top:9px;display:inline-block;">→ read</a>
+        </div>
+      </div>
+
+      <!-- tweet: nutlope -->
+      <div class="tile" style="background:#F2ECE0;">
+        <div style="padding:13px 15px;">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:9.5px;color:#8a7f6c;margin-bottom:6px;">@nutlope · X</div>
+          <div style="font-size:13.5px;line-height:1.4;color:#2a251e;">Open-sourced a demo app built on the new SDK in an afternoon.</div>
+          <a style="font-family:'JetBrains Mono',monospace;font-size:10.5px;color:#B7472A;margin-top:9px;display:inline-block;">→ repo</a>
+        </div>
+      </div>
+
+      <!-- tweet: amasad -->
+      <div class="tile" style="background:#F2ECE0;">
+        <div style="padding:13px 15px;">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:9.5px;color:#8a7f6c;margin-bottom:6px;">@amasad · X</div>
+          <div style="font-size:13.5px;line-height:1.4;color:#2a251e;">Replit agent update — now handles multi-file refactors end to end.</div>
+          <a style="font-family:'JetBrains Mono',monospace;font-size:10.5px;color:#B7472A;margin-top:9px;display:inline-block;">→ post</a>
+        </div>
+      </div>
+
+    </div>
+
+    <div style="margin-top:26px;padding-top:16px;border-top:3px double #1F1B16;display:flex;justify-content:space-between;font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.06em;color:#8a7f6c;">
+      <span>26 OF 26 SOURCES ACCOUNTED FOR</span>
+      <a style="color:#B7472A;">Full archive · page 2 →</a>
+    </div>
+
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

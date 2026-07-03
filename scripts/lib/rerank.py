@@ -57,6 +57,7 @@ for _candidate_dir in (_SCRIPTS_DIR, _LIB_DIR):
         sys.path.insert(0, str(_candidate_dir))
 
 from lib import log  # noqa: E402  (import must follow the sys.path inserts above)
+from lib.images import derive_avatar_url, derive_youtube_thumb_url  # noqa: E402
 
 # --- Named weight constants (the formula's tunable surface) -----------------
 # Kept at module top per the brief so the maintainer tunes the derank shape here,
@@ -133,6 +134,15 @@ class RankableItem:
             (so a YouTube item is byte-for-byte unchanged). An X item sets this to its
             ``https://x.com/{handle}/status/{tweet_id}`` permalink so it renders a real
             x.com card link in the same unified digest.
+        image_url: OPTIONAL source image URL for the tile thumbnail / avatar (Phase 7).
+            For a YouTube item this is the ``i.ytimg.com`` thumbnail derived from the
+            ``video_id`` (:func:`lib.images.derive_youtube_thumb_url`); for an X item it
+            is the ``unavatar.io`` avatar derived from the handle. Empty by default — the
+            renderer falls back to the hatched ``.ph`` placeholder. The image is fetched
+            + base64-inlined at render time, never at digest open (self-contained brief).
+        summary: OPTIONAL ≤140-char LLM editorial blurb for the tile (Phase 7, populated
+            by Sub-phase 2's ``lib.summarize``, NOT here). Empty by default — an absent
+            blurb renders no element (graceful degradation, never fabricated).
     """
 
     item_external_id: str
@@ -146,6 +156,8 @@ class RankableItem:
     classification: Any = None
     chapters: list = field(default_factory=list)
     card_url: str = ""
+    image_url: str = ""
+    summary: str = ""
 
     @classmethod
     def from_parts(
@@ -187,8 +199,9 @@ class RankableItem:
             >>> item.item_external_id
             'abc'
         """
+        video_id = str(getattr(upload, "video_id", ""))
         return cls(
-            item_external_id=str(getattr(upload, "video_id", "")),
+            item_external_id=video_id,
             title=str(getattr(upload, "title", "") or ""),
             channel_name=str(getattr(upload, "channel_name", "") or ""),
             creator_external_id=creator_external_id,
@@ -198,6 +211,9 @@ class RankableItem:
             upload_date=str(getattr(upload, "upload_date", "") or ""),
             classification=classification,
             chapters=list(chapters) if chapters else [],
+            # Reason: the tile thumbnail is the YouTube mqdefault frame derived from the
+            # video id; fetched + base64-inlined at render time (Phase 7 self-contained).
+            image_url=derive_youtube_thumb_url(video_id) if video_id else "",
         )
 
     @classmethod
@@ -259,6 +275,9 @@ class RankableItem:
             classification=classification,
             chapters=[],
             card_url=f"https://x.com/{handle}/status/{tweet_id}",
+            # Reason: tweet tiles carry the author's unavatar.io profile pic (a deliberate
+            # design extension — the base design has none); inlined at render time.
+            image_url=derive_avatar_url(handle) if handle else "",
         )
 
 

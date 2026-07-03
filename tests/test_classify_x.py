@@ -27,9 +27,11 @@ from unittest.mock import MagicMock
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import orbit  # noqa: E402
 import store  # noqa: E402
 from lib import classify, paths  # noqa: E402
 from lib.bird_x import Tweet  # noqa: E402
+from lib.config import OrbitConfig  # noqa: E402
 
 
 def _fresh_store(tmp_dir: Path) -> None:
@@ -38,6 +40,22 @@ def _fresh_store(tmp_dir: Path) -> None:
     os.environ[paths.ORBIT_DB_PATH_ENV_VAR] = str(db_path)
     store._db_override = db_path
     store.init_db()
+
+
+def _fresh_store_with_x_handles(tmp_dir: Path, handles: list[str]) -> None:
+    """Point the store at a temp DB, init it, and persist one X source per handle.
+
+    The X producer keys each tweet's Axis-A prior off the source row whose ``external_id``
+    matches the tweet's ``handle``, so the handles here must match the tweets under test.
+    """
+    _fresh_store(tmp_dir)
+    for handle in handles:
+        store.upsert_source(
+            platform="x",
+            external_id=handle,
+            display_name=f"@{handle}",
+            category="signal",
+        )
 
 
 def _tweet(tweet_id: str = "1900000000000000001") -> Tweet:
@@ -149,3 +167,65 @@ def test_x_tweet_user_override_respected_on_shared_path() -> None:
     assert result.is_user_override == 1
     assert result.axis_a_signal == 0
     assert result.axis_b_on_topic == 1
+
+
+def test_x_producer_skips_tweet_when_classify_times_out(capsys) -> None:  # noqa: ANN001
+    """A transient classify LLM timeout skips ONE tweet, never aborts the digest.
+
+    WHY (Rule 9): the X half shares the same robustness contract as YouTube — a single
+    ``claude -p`` timeout raised by ``classify.classify_item`` for one tweet must degrade
+    to skipping that tweet, while every other tweet still reaches the unified digest.
+    Before the per-item try/except a lone timeout aborted the ENTIRE pipeline. We persist
+    two X sources, inject a delta that returns two tweets and a classifier that raises the
+    real ``LlmCliError`` for one (routed by its text), then assert: the producer returns
+    WITHOUT raising; the timed-out tweet is ABSENT from the returned items; the healthy
+    tweet survives; and the ``x_stage1_item_classify_skipped`` warning was logged. Reverting
+    the try/except re-raises here and fails the test.
+    """
+    healthy_tweet = Tweet(
+        text="A sharp, healthy take on attention scaling.",
+        tweet_id="1900000000000000010",
+        handle="alice",
+        created_at="2026-06-18T00:00:00Z",
+        like_count=120,
+        retweet_count=45,
+        reply_count=8,
+        quote_count=3,
+    )
+    doomed_tweet = Tweet(
+        text="TIMEOUT this tweet please.",
+        tweet_id="1900000000000000011",
+        handle="bob",
+        created_at="2026-06-18T00:00:00Z",
+        like_count=90,
+        retweet_count=10,
+        reply_count=2,
+        quote_count=1,
+    )
+
+    def _flaky_classifier(prompt: str) -> str:
+        # Route the failure by the tweet text, which reaches the shared prompt body.
+        if "TIMEOUT this tweet please." in prompt:
+            raise orbit.LlmCliError("claude -p timed out")
+        return '{"axis_a_signal": 1, "axis_b_on_topic": 1}'
+
+    def _mock_x_delta(x_sources, depth, ordinal):  # noqa: ANN001 — test stub
+        return [healthy_tweet, doomed_tweet]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store_with_x_handles(Path(tmp), ["alice", "bob"])
+        config = OrbitConfig(interests=["ai", "transformers"])
+        items = orbit.run_stage1_build_x_items(
+            config,
+            depth="default",
+            x_delta=_mock_x_delta,
+            llm_classifier=_flaky_classifier,
+        )
+
+    # The run survived the timeout and dropped ONLY the doomed tweet.
+    built_ids = [item.item_external_id for item in items]
+    assert built_ids == [healthy_tweet.tweet_id], "the timed-out tweet must be skipped, the healthy one kept"
+    assert doomed_tweet.tweet_id not in built_ids
+
+    # The skip was surfaced (Rule 12), not swallowed.
+    assert "x_stage1_item_classify_skipped" in capsys.readouterr().out

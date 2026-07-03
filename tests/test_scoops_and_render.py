@@ -239,25 +239,23 @@ def test_three_m3_sections_render_with_deep_links() -> None:
         clusters=[cluster],
         trending_items=[trending_entry, scoop_entry],
         scoops=scoops,
+        inline_image=lambda url: None,
     )
 
-    # 1. Overlap block present, with the cross-link chapter deep-link into the episode.
-    assert 'class="overlap-block"' in output_html
-    assert "Everyone&#x27;s talking about" in output_html or "Everyone's talking about" in output_html
+    # 1. Cluster cross-link rendered on the representative tile as "same story, also
+    #    covered", carrying the chapter deep-link into the episode moment (the never-shred
+    #    deep-link surviving render).
+    assert "Same story, also covered" in output_html
     assert 'href="https://www.youtube.com/watch?v=vidEP&amp;t=90s"' in output_html
 
-    # 2. Right-rail trending present, tagged, with a working item deep-link.
-    assert 'class="trending-rail"' in output_html
-    assert "Trending in your network" in output_html
-    assert "corroborated" in output_html
+    # 2. The "Trending now" trio tile renders, with a working item deep-link.
+    assert "↗ Trending now" in output_html
     assert 'href="https://www.youtube.com/watch?v=twReact&amp;t=0s"' in output_html
 
-    # 3. Scoops strip present, loud, with the scoop item's deep-link.
-    assert 'class="scoops-strip"' in output_html
-    assert "SCOOP" in output_html
-    # The scoop links to the episode card (youtube fallback for vidEP).
-    scoops_section = output_html.split('class="scoops-strip"', 1)[1].split("</section>", 1)[0]
-    assert "vidEP" in scoops_section
+    # 3. The loud scoop tile renders, and the masthead reflects the scoop + cluster counts.
+    assert "The scoop ·" in output_html
+    assert "1 scoop ·" in output_html  # masthead scoop count
+    assert "1 clusters" in output_html  # masthead cluster count
 
 
 # --- DoD #4: M1 regression — no M3 data -> the M1 page, unchanged -------------
@@ -271,14 +269,15 @@ def test_no_m3_data_renders_m1_page_without_new_sections() -> None:
     pure no-op on the M1 inputs (the existing 110 tests pin the rest of M1 render).
     """
     tiered_items = [_tiered("vidA", TIER_HERO, title="A talk")]
-    output_html = render.render_digest_html(tiered_items)
+    output_html = render.render_digest_html(tiered_items, inline_image=lambda url: None)
 
-    assert 'class="overlap-block"' not in output_html
-    assert 'class="trending-rail"' not in output_html
-    assert 'class="scoops-strip"' not in output_html
-    # The M1 spine is still there.
-    assert 'class="card hero"' in output_html
-    assert 'class="tldr"' in output_html
+    # No M3 data -> no "Ahead of the curve" trio, no cross-links, all zero counts.
+    assert "Ahead of the curve" not in output_html
+    assert "Same story, also covered" not in output_html
+    assert "0 scoop · 0 dormant · 0 clusters" in output_html
+    # The M1 spine is still there: the masthead + a feature tile for the item.
+    assert ">Orbit</div>" in output_html
+    assert 'class="tile"' in output_html
 
 
 # --- Authorized-divergence wiring: orbit.py Stage 5 invokes M3 end-to-end ------
@@ -363,10 +362,14 @@ def test_orbit_stage5_wires_overlap_trending_scoops_through_rank_and_render(tmp_
     # (c) Stage 7 writes a file with all three M3 sections populated.
     html_path = tmp_path / "out" / "today.html"
     written = orbit.run_stage7_render(
-        tiered, config, html_path=html_path, clusters=clusters, trending_items=trending_items, scoops=scoops
+        tiered, config, html_path=html_path, clusters=clusters, trending_items=trending_items,
+        scoops=scoops, inline_image=lambda url: None,
     )
     assert html_path in written and html_path.exists()
     written_html = html_path.read_text(encoding="utf-8")
-    assert 'class="overlap-block"' in written_html
-    assert 'class="trending-rail"' in written_html
-    assert 'class="scoops-strip"' in written_html
+    # The M3 payload surfaces in the Tiles layout: the "Ahead of the curve" trio with the
+    # loud scoop tile + the "Trending now" tile, and a non-zero scoop count in the masthead.
+    assert "Ahead of the curve" in written_html
+    assert "The scoop ·" in written_html
+    assert "↗ Trending now" in written_html
+    assert "0 scoop · 0 dormant · 0 clusters" not in written_html

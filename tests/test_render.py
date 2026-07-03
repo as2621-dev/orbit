@@ -88,52 +88,53 @@ def _chapter(title: str, start_seconds: float, video_id: str) -> Chapter:
     )
 
 
-def test_chapterized_hero_chapter_deep_link_survives_to_html() -> None:
-    """A Hero chapter's watch?v=...&t=90s deep-link reaches the HTML (DoD #1).
+def test_chapterized_hero_chapter_content_and_deep_link_survive_to_html() -> None:
+    """A Hero tile surfaces its chapter content + the whole-item deep-link (DoD #1).
 
-    WHY: the deep-link into the exact moment is the product's headline feature. This
-    asserts the FULL path — Chapter.deep_link -> render -> escaped href — preserves a
-    clickable, correctly-timestamped link. A wrong timestamp, a dropped chapter list,
-    or an over-escaped href would fail here, not silently degrade the one feature
-    that justifies the digest.
+    WHY: the Tiles layout shows chapter key-points as ``.kp`` chip rows and surfaces the
+    whole-video deep-link via the tile title + the "+ N more chapters" overflow link
+    (the design does not per-chapter-link every row). This asserts the FULL path — the
+    chapter timestamps/text reach the tile AND a clickable, correctly-built whole-item
+    deep-link survives (escaped & -> &amp;). A dropped chapter list, a wrong timestamp
+    chip, or an over-escaped href would fail here, not silently degrade the feature.
     """
-    chapters = [
-        _chapter("Intro", 0.0, "vidHERO"),
-        _chapter("The point", 90.0, "vidHERO"),
-    ]
+    chapters = [_chapter(f"Ch{n}", float(n * 60), "vidHERO") for n in range(6)]
+    chapters[2] = _chapter("The point", 120.0, "vidHERO")
     tiered = [_tiered("vidHERO", TIER_HERO, chapters=chapters)]
 
-    output_html = render.render_digest_html(tiered)
+    output_html = render.render_digest_html(tiered, inline_image=lambda url: None)
 
-    # &t=90s present (correct timestamp), as a real href (escaped & -> &amp;).
-    assert 'href="https://www.youtube.com/watch?v=vidHERO&amp;t=90s"' in output_html
+    # Chapter content reaches the tile as chip + text.
     assert "The point" in output_html
+    assert '<span class="chip">2:00</span>' in output_html
+    # Six chapters, four shown -> the "+ 2 more chapters" overflow link to the whole item.
+    assert "+ 2 more chapters" in output_html
+    # The whole-item deep-link survives as a real escaped href (title + more-chapters link).
+    assert 'href="https://www.youtube.com/watch?v=vidHERO&amp;t=0s"' in output_html
 
 
-def test_hero_gets_chapters_index_goes_to_also_posted_section() -> None:
-    """Tier controls density: Hero renders a card+chapters; Index renders in the strip (DoD #2).
+def test_tier_controls_tile_density_every_item_appears() -> None:
+    """Tier controls density: a Hero is a chapter-bearing feature tile, an Index a compact tile (DoD #2).
 
-    WHY: "rank controls density, never inclusion." A regression that flattened the
-    tiers (no chapter lists, or no separate index section) would erase the visual
-    hierarchy that IS the ranking. We assert structural tier markers AND that the
-    index item lands specifically in the "they also posted" strip, not in a card.
+    WHY: "rank controls density, never inclusion." Every item must appear as exactly
+    one tile — a Hero as a loud feature tile carrying its ``.kp`` chapter rows, an Index
+    item as a thumbnail-less compact tile. A regression that flattened the tiers (chapters
+    everywhere, or an item silently dropped) would erase the hierarchy that IS the ranking.
     """
     hero = _tiered("vidHERO", TIER_HERO, chapters=[_chapter("Seg", 30.0, "vidHERO")])
     index = _tiered("vidINDEX", TIER_INDEX, title="Minor clip")
-    output_html = render.render_digest_html([hero, index])
+    output_html = render.render_digest_html([hero, index], inline_image=lambda url: None)
 
-    # Hero rendered as a hero card carrying its chapter list.
-    assert 'class="card hero"' in output_html
-    assert 'class="chapters"' in output_html
-
-    # The index item lands in the "they also posted" strip, not a card. Slice the
-    # index section and assert the id appears there (and not as a hero card).
-    assert 'class="index-strip"' in output_html
-    index_section = output_html.split('class="index-strip"', 1)[1]
-    assert "vidINDEX" in index_section
-    # The hero's chapter link is in a CARD, before the index strip — not in the strip.
-    cards_section = output_html.split('class="index-strip"', 1)[0]
-    assert "vidHERO&amp;t=30s" in cards_section
+    # Exactly two tiles (one per item) — nothing dropped, nothing duplicated.
+    assert output_html.count('class="tile"') == 2
+    # The Hero carries its chapter ``.kp`` row; the Index item appears as a compact tile.
+    assert 'class="kp"' in output_html
+    assert "vidHERO" in output_html
+    assert "vidINDEX" in output_html
+    assert "Minor clip" in output_html
+    # The Index item, having no chapters, contributes NO ``.kp`` chapter row of its own —
+    # the only kp row is the Hero's (density differs by tier).
+    assert output_html.count('class="kp"') == 1
 
 
 def test_malicious_title_and_url_are_neutralized() -> None:
@@ -159,31 +160,31 @@ def test_malicious_title_and_url_are_neutralized() -> None:
             chapters=[malicious_chapter],
         )
     ]
-    output_html = render.render_digest_html(tiered)
+    output_html = render.render_digest_html(tiered, inline_image=lambda url: None)
 
-    # The javascript: scheme is never emitted as a clickable href.
+    # The javascript: scheme is never emitted as a clickable href (the whole-item link
+    # is the safe constructed watch?v= URL; the malicious chapter deep-link never reaches
+    # an href — chapters render as inert chip+text).
     assert 'href="javascript:alert(1)"' not in output_html
     assert "javascript:alert" not in output_html
-    # The unsafe chapter href fell back to the non-clickable placeholder.
-    assert 'class="chapter-link" href="#"' in output_html
     # No raw executable tags survived — titles/channel are escaped to inert text.
     assert "<script>" not in output_html
     assert "<img src=x onerror" not in output_html
     assert "&lt;script&gt;" in output_html
 
 
-def test_tldr_header_present() -> None:
-    """The one-line TL;DR header renders with a correct pure-count summary (DoD #4).
+def test_masthead_present_with_pure_counts() -> None:
+    """The masthead renders the wordmark + a correct pure-count line (DoD #4).
 
-    WHY: the TL;DR is the glance that tells the user whether to read on. The count is
+    WHY: the masthead is the glance that tells the user the day's shape. The counts are
     deterministic (Rule 5, no LLM) — 2 items from 2 distinct creators must read
-    "2 episodes from 2 creators". A regression in counting or a missing header fails.
+    "2 sources · 2 accounted for". A regression in counting or a missing masthead fails.
     """
     items = [_tiered("vidA", TIER_HERO), _tiered("vidB", TIER_STANDARD)]
-    output_html = render.render_digest_html(items)
+    output_html = render.render_digest_html(items, inline_image=lambda url: None)
 
-    assert 'class="tldr"' in output_html
-    assert "2 episodes from 2 creators today" in output_html
+    assert ">Orbit</div>" in output_html  # the masthead wordmark
+    assert "2 sources · 2 accounted for" in output_html
 
 
 def test_happy_path_is_valid_html_document() -> None:
@@ -198,12 +199,15 @@ def test_happy_path_is_valid_html_document() -> None:
         _tiered("vidS", TIER_STANDARD),
         _tiered("vidI", TIER_INDEX),
     ]
-    output_html = render.render_digest_html(items)
+    output_html = render.render_digest_html(items, inline_image=lambda url: None)
 
     assert output_html.startswith("<!DOCTYPE html>")
     assert "</html>" in output_html
     assert "<style>" in output_html
-    # Self-contained: no external stylesheet or script fetches.
+    # Self-contained Tiles page: inlined fonts + tile markup, no external fetch / CDN.
+    assert "@font-face" in output_html
+    assert 'class="tile"' in output_html
+    assert "fonts.googleapis.com" not in output_html
     assert "<link" not in output_html
     assert "<script src" not in output_html
 
@@ -219,7 +223,8 @@ def test_empty_tiered_items_still_valid_page() -> None:
 
     assert output_html.startswith("<!DOCTYPE html>")
     assert "</html>" in output_html
-    assert "0 episodes from 0 creators today" in output_html
+    assert ">Orbit</div>" in output_html  # a valid masthead still renders
+    assert "0 sources · 0 accounted for" in output_html
 
 
 def test_hero_without_chapters_renders_card_without_chapter_list() -> None:
@@ -231,12 +236,12 @@ def test_hero_without_chapters_renders_card_without_chapter_list() -> None:
     list, would fail.
     """
     tiered = [_tiered("vidNoChap", TIER_HERO, chapters=[])]
-    output_html = render.render_digest_html(tiered)
+    output_html = render.render_digest_html(tiered, inline_image=lambda url: None)
 
-    assert 'class="card hero"' in output_html
+    assert 'class="tile"' in output_html
     assert "vidNoChap" in output_html
-    # No chapter list container emitted for a chapter-less card.
-    assert 'class="chapters"' not in output_html
+    # No chapter ``.kp`` rows emitted for a chapter-less tile (no empty container).
+    assert 'class="kp"' not in output_html
 
 
 from lib.density import TIER_COMPACT  # noqa: E402
@@ -267,9 +272,9 @@ def test_small_digest_is_single_page_with_no_spill_link() -> None:
     ]
     assert render.estimate_page_height(tiered) <= render.PAGE_1_BUDGET_PX
 
-    pages = render.render_digest_pages(tiered)
+    pages = render.render_digest_pages(tiered, inline_image=lambda url: None)
     assert len(pages) == 1
-    assert "Continued on page 2" not in pages[0]
+    assert "Full archive · page 2" not in pages[0]
     assert render.DEFAULT_PAGE_2_FILENAME not in pages[0]
 
 
@@ -291,22 +296,28 @@ def test_oversized_digest_spills_low_tiers_to_page_two() -> None:
     )
     assert render.estimate_page_height(tiered) > render.PAGE_1_BUDGET_PX
 
-    pages = render.render_digest_pages(tiered)
+    pages = render.render_digest_pages(tiered, inline_image=lambda url: None)
     assert len(pages) == 2
     page1, page2 = pages
 
-    # Page 1 carries the continued link; Hero + Standard stayed on page 1.
-    assert "Continued on page 2" in page1
-    assert "HEROID" in page1
-    assert "HEROID&amp;t=90s" in page1  # the hero chapter deep-link survives on page 1
-    assert "STDID" in page1
+    # Compare against the BODY region (after the inlined base64 font ``<style>``) so a
+    # short fixture id can't false-collide with the base64 font blob (which contains
+    # arbitrary alnum runs). The ids live in tile titles/links in the body, not the CSS.
+    page1_body = page1.split("</style>", 1)[1]
+    page2_body = page2.split("</style>", 1)[1]
+
+    # Page 1 carries the footer page-2 link; Hero + Standard stayed on page 1.
+    assert "Full archive · page 2" in page1
+    assert "HEROID" in page1_body
+    assert "watch?v=HEROID&amp;t=0s" in page1_body  # the hero's whole-item deep-link survives on page 1
+    assert "STDID" in page1_body
 
     # The Hero must NOT have leaked onto page 2 (spill-the-low-tiers, not arbitrary).
-    assert "HEROID" not in page2
+    assert "HEROID" not in page2_body
 
-    # Compact + Index moved to page 2 and are NOT in page 1.
-    assert "CMP0" in page2 and "CMP0" not in page1
-    assert "IDX0" in page2 and "IDX0" not in page1
+    # Compact + Index moved to page 2 and are NOT in page 1's body.
+    assert "CMP0" in page2_body and "CMP0" not in page1_body
+    assert "IDX0" in page2_body and "IDX0" not in page1_body
 
 
 def test_two_page_hard_cap_holds_even_when_page_two_overflows() -> None:
@@ -327,7 +338,7 @@ def test_two_page_hard_cap_holds_even_when_page_two_overflows() -> None:
     page2_only = _many(TIER_COMPACT, 80, prefix="CMP") + _many(TIER_INDEX, 80, prefix="IDX")
     assert render.estimate_page_height(page2_only) > render.PAGE_1_BUDGET_PX
 
-    pages = render.render_digest_pages(tiered)
+    pages = render.render_digest_pages(tiered, inline_image=lambda url: None)
     assert len(pages) == 2  # hard cap: never 3
 
 
@@ -343,3 +354,167 @@ def test_safe_href_allowlist_unit() -> None:
     assert safe == "https://www.youtube.com/watch?v=abc&amp;t=90s"
     assert html_render.safe_href("javascript:alert(1)") == "#"
     assert html_render.safe_href("data:text/html,<script>") == "#"
+
+
+# === Phase 7 / Sub-phase 3: Tiles markup + CSS builders ======================
+#
+# These pin the Tiles-layout builders (lib.tiles, re-exported via lib.html_render).
+# Per Rule 9 each test encodes WHY the behavior matters:
+#   * Escaping a <script> title is the stored-XSS guard for a file the user opens.
+#   * safe_img_src on every <img> is the data:-URI XSS guard at the image sink.
+#   * The .ph fallback on an empty image_url is the "never a broken <img>" invariant.
+#   * The trending markers encode the WHERE-the-signal-comes-from semantics (◆/↗/○).
+#   * Empty verdict/blurb omitting their element is the no-fabrication degrade path.
+#   * The assembled page carrying @font-face + class="tile" and NOT googleapis is the
+#     self-contained-offline invariant the whole "base64-inlined" decision rests on.
+
+from lib import tiles  # noqa: E402
+
+_XSS_TITLE = "<script>alert('pwn')</script>"
+_INERT_TITLE = "&lt;script&gt;alert(&#x27;pwn&#x27;)&lt;/script&gt;"
+
+
+def test_tiles_every_builder_escapes_script_title_to_inert_text() -> None:
+    """Every Tiles builder html-escapes a ``<script>`` title to inert text (XSS guard).
+
+    WHY: the digest is opened in a browser straight off disk. A creator title /
+    tweet text containing ``<script>`` MUST render as visible text, never an
+    executable tag — a regression in any single builder is a stored-XSS hole.
+    """
+    chapters = [tiles.ChapterRow(chip="04:20", text=_XSS_TITLE)]
+    cross = [tiles.CrossLink(label=_XSS_TITLE, url="https://x.com")]
+    builders_output = [
+        tiles.render_masthead(_XSS_TITLE, 1, 1, 1, 1, 1),
+        tiles.render_verdict(_XSS_TITLE),
+        tiles.render_scoop_tile(_XSS_TITLE, _XSS_TITLE, _XSS_TITLE, "https://x.com"),
+        tiles.render_trending_now([tiles.TrendingRow(title=_XSS_TITLE, category=tiles.CATEGORY_YOURS, your_count=3)]),
+        tiles.render_hidden_gem(_XSS_TITLE, 900, _XSS_TITLE, _XSS_TITLE, chip_time="02:50", chip_label=_XSS_TITLE),
+        tiles.render_hero_tile(
+            meta_label=_XSS_TITLE, title=_XSS_TITLE, summary=_XSS_TITLE, chapters=chapters, cross_links=cross
+        ),
+        tiles.render_standard_tile(meta_label=_XSS_TITLE, title=_XSS_TITLE, summary=_XSS_TITLE, chapters=chapters),
+        tiles.render_compact_tile(meta_label=_XSS_TITLE, title=_XSS_TITLE, summary=_XSS_TITLE, chip_time="1:00",
+                                  chip_label=_XSS_TITLE),
+        tiles.render_tweet_tile(source_label=_XSS_TITLE, text=_XSS_TITLE),
+        tiles.render_footer(_XSS_TITLE, "page2.html"),
+    ]
+    for output_html in builders_output:
+        assert "<script>" not in output_html, output_html[:120]
+        assert _INERT_TITLE in output_html, output_html[:200]
+
+
+def test_tiles_feature_tile_uses_safe_img_src_for_thumbnail() -> None:
+    """A feature tile routes its thumbnail through ``safe_img_src`` (image-sink guard).
+
+    WHY: thumbnails are base64 ``data:`` URIs — the ONE place ``data:`` is allowed.
+    A ``data:text/html`` payload must never reach an ``<img src>``. A safe base64
+    image URI must survive; the html-injection payload must be dropped to the ``.ph``
+    fallback (no ``<img>`` at all).
+    """
+    safe_data_uri = "data:image/jpeg;base64,/9j/4AAQSkZJRg=="
+    good = tiles.render_hero_tile(meta_label="M", title="T", image_url=safe_data_uri)
+    assert f'<img src="{safe_data_uri}"' in good
+
+    evil = tiles.render_hero_tile(
+        meta_label="M", title="T", image_url="data:text/html,<script>alert(1)</script>",
+        placeholder_label="thumb",
+    )
+    assert "<img" not in evil  # payload rejected, no <img> emitted
+    assert 'class="ph"' in evil  # fell back to the hatched placeholder
+
+
+def test_tiles_empty_image_url_falls_back_to_ph_placeholder() -> None:
+    """An empty ``image_url`` falls back to the ``.ph`` placeholder, never a broken <img>.
+
+    WHY: most items will not have an inlinable thumbnail on a given run. The tile
+    must still render with the hatched placeholder + caption — emitting ``<img src="">``
+    would show a broken-image icon in the user's inbox.
+    """
+    output_html = tiles.render_standard_tile(meta_label="M", title="T", placeholder_label="thumb · lenny")
+    assert "<img" not in output_html
+    assert 'class="ph"' in output_html
+    assert "thumb · lenny" in output_html
+
+
+def test_tiles_trending_now_renders_correct_marker_per_category() -> None:
+    """Each trending category renders its distinct marker + right-label (signal semantics).
+
+    WHY: the marker is the WHOLE point of the trending tile — ◆ a dormant creator
+    breaking silence, ↗ "N of yours" (consensus inside your network), ○ external
+    (trending outside it). Collapsing them would erase the "ahead of the curve"
+    meaning. We assert all three coexist with the right glyph and label.
+    """
+    output_html = tiles.render_trending_now(
+        [
+            tiles.TrendingRow(title="karpathy breaks silence", category=tiles.CATEGORY_DORMANT),
+            tiles.TrendingRow(title="Nano Banana 2 pricing", category=tiles.CATEGORY_YOURS, your_count=4),
+            tiles.TrendingRow(title="EU AI Act date", category=tiles.CATEGORY_EXTERNAL),
+        ]
+    )
+    assert "◆" in output_html and "dormant" in output_html
+    assert "↗" in output_html and "4 of yours" in output_html
+    assert "○" in output_html and "external" in output_html
+
+
+def test_tiles_empty_verdict_and_blurb_omit_their_element() -> None:
+    """An empty verdict / blurb omits its element entirely (no-fabrication degrade).
+
+    WHY: when the LLM is unavailable the prose must be ABSENT, not an empty styled
+    container hinting content was lost. A regression that always emitted the wrapper
+    would leave a dangling empty box on a quiet/LLM-down day.
+    """
+    assert tiles.render_verdict("") == ""
+    assert tiles.render_verdict("   ") == ""
+
+    # A standard tile with no summary must not carry an empty blurb div.
+    no_blurb = tiles.render_standard_tile(meta_label="M", title="T", summary="")
+    assert "line-height:1.45" not in no_blurb  # the blurb div's signature style is absent
+    with_blurb = tiles.render_standard_tile(meta_label="M", title="T", summary="why it matters")
+    assert "why it matters" in with_blurb
+
+
+def test_tiles_verdict_italicizes_handles() -> None:
+    """The verdict italicizes ``@handle`` mentions (the design's masthead accent).
+
+    WHY: the masthead verdict styles mentions in italic; this is the deterministic,
+    code-driven (Rule 5) accent. The transform must run on the escaped string and not
+    introduce active markup.
+    """
+    output_html = tiles.render_verdict("a scoop from @swyx and @karpathy today")
+    assert output_html.count("font-style:italic") == 2
+    assert "<script>" not in output_html
+
+
+def test_tiles_assembled_page_is_self_contained_with_fonts_and_no_cdn() -> None:
+    """The assembled page inlines ``@font-face`` + carries ``class="tile"`` + no CDN.
+
+    WHY (the load-bearing structural invariant): the entire "base64-inline everything"
+    decision exists so the digest opens identically offline. The page MUST carry the
+    inlined ``@font-face`` rules and the Tiles markup, and MUST NOT reference
+    ``fonts.googleapis.com`` (or any CDN) — a regression that dropped the inline fonts
+    or re-added a Google Fonts ``<link>`` breaks offline rendering.
+    """
+    body = (
+        tiles.render_masthead("MON · 1 JAN 2026 · 06:14", 26, 26, 1, 1, 2)
+        + tiles.render_verdict("the only real story is evals")
+        + tiles.render_feed_masonry(tiles.render_hero_tile(meta_label="DWARKESH · 1:52 · YouTube", title="Hi"))
+        + tiles.render_footer("26 OF 26 SOURCES ACCOUNTED FOR", "")
+    )
+    page = html_render.wrap_page("Orbit · Today", body)
+
+    assert page.startswith("<!DOCTYPE html>")
+    assert "@font-face" in page
+    assert 'class="tile"' in page
+    assert "fonts.googleapis.com" not in page
+    assert "<link" not in page
+    assert "<script src" not in page
+
+
+def test_tiles_footer_omits_page2_link_when_no_href() -> None:
+    """The footer omits the page-2 link on a single-page digest (no phantom spill link).
+
+    WHY: a quiet day fits one page; surfacing a "page 2 →" link to nowhere would be a
+    broken affordance. With a non-empty href the link must appear (the spill path).
+    """
+    assert "page 2" not in tiles.render_footer("ALL ACCOUNTED FOR", "")
+    assert "page 2" in tiles.render_footer("ALL ACCOUNTED FOR", "page2.html")

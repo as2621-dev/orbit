@@ -57,11 +57,17 @@ def _upload(
     *,
     duration: int | None,
     chapters: list[dict] | None = None,
+    title: str = "A talk",
 ) -> Upload:
-    """Build an Upload (mocks one yt-dlp delta entry)."""
+    """Build an Upload (mocks one yt-dlp delta entry).
+
+    ``title`` defaults to ``"A talk"`` (unchanged for existing callers); a distinct title
+    lets a test route a mocked classifier failure to one specific upload, since the title
+    is what reaches the classify prompt body.
+    """
     return Upload(
         video_id=video_id,
-        title="A talk",
+        title=title,
         description="about ai agents",
         # Reason: dated "today" so it clears the stage-1 recency gate (last N days). The
         # date is incidental to what this fixture exercises (classify/chapterize/mark_seen);
@@ -192,3 +198,115 @@ def test_youtube_producer_no_sources_is_noop(tmp_path: Path) -> None:
         items = orbit.run_stage1_build_youtube_items(OrbitConfig(), depth="default")
 
     assert items == []
+
+
+def test_youtube_producer_skips_item_when_classify_times_out(capsys) -> None:  # noqa: ANN001
+    """A transient classify LLM timeout skips ONE upload, never aborts the digest.
+
+    WHY (Rule 9): a single ``claude -p`` timeout raised by ``classify.classify_item`` for
+    one upload must degrade to skipping that item — the run keeps going and every other
+    upload still reaches the digest. Before the per-item try/except a lone timeout aborted
+    the ENTIRE pipeline (a YouTube-only user got nothing). We inject a classifier that
+    raises the real ``LlmCliError`` for one upload (routed by its distinct title) and
+    returns a valid verdict otherwise, then assert: the producer returns WITHOUT raising;
+    the failing upload is ABSENT from the returned items; the healthy upload is present;
+    the ``youtube_stage1_item_classify_skipped`` warning was logged; and — the correctness
+    crux — the skipped upload was NOT marked seen, so the delta engine reconsiders it next
+    run. Reverting the try/except re-raises here and fails the test.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store_with_channel(Path(tmp))
+
+        good_upload = _upload("vidGOOD", duration=300, title="A good talk")
+        doomed_upload = _upload("vidDOOMED", duration=300, title="TIMEOUT this one")
+
+        def _mock_delta(source, depth):  # noqa: ANN001 — test stub
+            return [good_upload, doomed_upload]
+
+        def _flaky_classifier(prompt: str) -> str:
+            # Route the failure by the upload's title, which reaches the prompt body — the
+            # doomed upload times out, the good one classifies cleanly.
+            if "TIMEOUT this one" in prompt:
+                raise orbit.LlmCliError("claude -p timed out")
+            return '{"axis_a_signal": 1, "axis_b_on_topic": 1}'
+
+        seen_marks: list[tuple[int, str]] = []
+
+        def _spy_mark_seen(source_id, video_id):  # noqa: ANN001 — test stub
+            seen_marks.append((source_id, video_id))
+
+        config = OrbitConfig(creator_weights={"UC_chan": 1.0}, interests=["ai"])
+
+        items = orbit.run_stage1_build_youtube_items(
+            config,
+            depth="default",
+            upload_delta=_mock_delta,
+            transcript_fetcher=lambda video_id, depth: None,  # noqa: ANN001,ARG005
+            llm_classifier=_flaky_classifier,
+            segmenter=lambda prompt: "[]",
+            mark_seen=_spy_mark_seen,
+        )
+
+    # The run survived the timeout and dropped ONLY the doomed upload.
+    built_ids = [item.item_external_id for item in items]
+    assert built_ids == ["vidGOOD"], "the timed-out upload must be skipped, the healthy one kept"
+    assert "vidDOOMED" not in built_ids
+
+    # The skip was surfaced (Rule 12), not swallowed.
+    assert "youtube_stage1_item_classify_skipped" in capsys.readouterr().out
+
+    # The correctness crux: a skipped upload is left UNSEEN so it is reconsidered next run.
+    marked_ids = {video_id for _source_id, video_id in seen_marks}
+    assert "vidDOOMED" not in marked_ids, "a skipped upload must NOT be marked seen"
+    assert "vidGOOD" in marked_ids, "a successfully built upload is still marked seen"
+
+
+def test_youtube_producer_degrades_chapters_when_chapterize_times_out(capsys) -> None:  # noqa: ANN001
+    """A transient chapterize LLM timeout degrades to NO chapters, still builds the item.
+
+    WHY (Rule 9): chapter segmentation is best-effort. A ``claude -p`` timeout raised by
+    ``chapterize_episode`` for a long-form upload must degrade to an empty chapter list —
+    the tile still renders and the run never aborts. Before the try/except this timeout
+    propagated and killed the whole digest. We inject a segmenter that raises the real
+    ``LlmCliError`` while the classifier stays healthy, then assert: the item is STILL
+    returned (classified), its ``chapters`` are empty, the run does not raise, and the
+    ``youtube_stage1_item_chapterize_degraded`` warning was logged. Reverting the
+    try/except re-raises here and fails the test.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store_with_channel(Path(tmp))
+
+        long_upload = _upload("vidLONG", duration=1800)  # long-form, no creator chapters
+
+        def _mock_delta(source, depth):  # noqa: ANN001 — test stub
+            return [long_upload]
+
+        transcript = Transcript(
+            video_id="vidLONG",
+            cues=[TranscriptCue(cue_start_seconds=0.0, cue_end_seconds=5.0, text="intro")],
+        )
+
+        def _mock_transcript_fetcher(video_id, depth):  # noqa: ANN001 — test stub
+            return transcript
+
+        def _timeout_segmenter(prompt: str) -> str:
+            raise orbit.LlmCliError("claude -p timed out during segmentation")
+
+        config = OrbitConfig(creator_weights={"UC_chan": 1.0}, interests=["ai"])
+
+        items = orbit.run_stage1_build_youtube_items(
+            config,
+            depth="default",
+            upload_delta=_mock_delta,
+            transcript_fetcher=_mock_transcript_fetcher,
+            llm_classifier=lambda prompt: '{"axis_a_signal": 1, "axis_b_on_topic": 1}',
+            segmenter=_timeout_segmenter,
+        )
+
+    # The item survived the chapterize timeout — built and classified, just chapter-less.
+    assert [item.item_external_id for item in items] == ["vidLONG"], "the item must still build"
+    assert items[0].classification is not None
+    assert items[0].chapters == [], "a chapterize timeout degrades to no chapters"
+
+    # The degrade was surfaced (Rule 12), not swallowed.
+    assert "youtube_stage1_item_chapterize_degraded" in capsys.readouterr().out

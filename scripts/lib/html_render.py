@@ -26,6 +26,7 @@ Rule 5: no LLM here — this is pure deterministic string building.
 from __future__ import annotations
 
 import html
+import re
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -49,6 +50,24 @@ _SAFE_LINK_SCHEMES: frozenset[str] = frozenset({"http", "https", "mailto"})
 # href emitted when a candidate URL fails the allowlist — a no-op anchor that is
 # never a script payload.
 _UNSAFE_HREF_PLACEHOLDER: str = "#"
+
+# --- Image-src safety allowlist (the <img src> sink, Phase 7) ----------------
+# The Tiles digest inlines images as base64 ``data:`` URIs (self-contained, no CDN at
+# open). The ``<img src>`` sink needs its OWN allowlist, distinct from the href one:
+# `data:` is REJECTED for hrefs (XSS) but REQUIRED here — yet ONLY for real image
+# payloads. A `data:text/html,<script>` src is a stored-XSS vector, so we allow only
+# `data:image/<fmt>;base64,...` for a known raster format, plus plain http(s) URLs.
+_SAFE_IMG_DATA_URI_PATTERN: re.Pattern[str] = re.compile(
+    r"^data:image/(?:png|jpe?g|webp|gif|avif);base64,[A-Za-z0-9+/=\s]+$",
+    re.IGNORECASE,
+)
+
+# Schemes permitted for a remote (non-data) image src.
+_SAFE_IMG_SCHEMES: frozenset[str] = frozenset({"http", "https"})
+
+# src emitted when a candidate fails the allowlist — empty so the renderer drops the
+# <img> entirely (falls back to the .ph placeholder), never emits a broken/unsafe src.
+_UNSAFE_IMG_SRC_PLACEHOLDER: str = ""
 
 
 def escape(text: Any) -> str:
@@ -144,6 +163,59 @@ def safe_href(url: str) -> str:
     if is_safe_link_url(url):
         return html.escape(url, quote=True)
     return _UNSAFE_HREF_PLACEHOLDER
+
+
+def safe_img_src(src: str) -> str:
+    """Return an escaped, allowlist-checked ``<img src>`` value — or ``""`` if unsafe.
+
+    The image-sink analog of :func:`safe_href`. Allows exactly two safe shapes and
+    rejects everything else to ``""`` (so the renderer drops the ``<img>`` and falls
+    back to the hatched ``.ph`` placeholder rather than emitting an unsafe src):
+
+      * a base64 image ``data:`` URI — ``data:image/(png|jpe?g|webp|gif|avif);base64,...``
+        (the build-time inlined thumbnails/avatars from :mod:`lib.images`);
+      * a plain ``http`` / ``https`` URL.
+
+    Rejected: ``data:text/html,...`` (stored-XSS via an HTML payload), ``javascript:``,
+    any other scheme, and any string carrying a control character (a smuggled
+    ``data:image/png\\x00;...``). The check runs on the RAW string first, then the
+    result is ``html.escape``-d for safe embedding in a double-quoted attribute.
+
+    Args:
+        src: The candidate image source (a ``data:`` URI from :func:`lib.images.fetch_and_inline`
+            or a remote http(s) URL).
+
+    Returns:
+        An escaped src string safe to drop into ``src="..."`` — the original value if
+        allowlisted, else ``""``.
+
+    Example:
+        >>> safe_img_src("data:image/png;base64,iVBORw0KGgo=")
+        'data:image/png;base64,iVBORw0KGgo='
+        >>> safe_img_src("data:text/html,<script>alert(1)</script>")
+        ''
+        >>> safe_img_src("javascript:alert(1)")
+        ''
+        >>> safe_img_src("https://i.ytimg.com/vi/abc/mqdefault.jpg")
+        'https://i.ytimg.com/vi/abc/mqdefault.jpg'
+    """
+    stripped = src.strip()
+    if not stripped:
+        return _UNSAFE_IMG_SRC_PLACEHOLDER
+    # Reject control characters up front — a NUL/CR/LF inside the value can smuggle a
+    # payload past the scheme/format check the same way it can for hrefs.
+    if any(ord(character) < 0x20 for character in stripped):
+        return _UNSAFE_IMG_SRC_PLACEHOLDER
+    # Allowed shape 1: a base64 raster image data URI.
+    if _SAFE_IMG_DATA_URI_PATTERN.match(stripped):
+        return html.escape(stripped, quote=True)
+    # Allowed shape 2: a plain http(s) remote URL.
+    colon_index = stripped.find(":")
+    if colon_index != -1:
+        scheme = stripped[:colon_index].lower()
+        if scheme in _SAFE_IMG_SCHEMES:
+            return html.escape(stripped, quote=True)
+    return _UNSAFE_IMG_SRC_PLACEHOLDER
 
 
 def _format_timestamp(start_seconds: float) -> str:
@@ -356,7 +428,9 @@ def render_tldr(episode_count: int, creator_count: int) -> str:
 
 # --- Self-contained page template (sentinel-replacement, lifted in shape) ----
 # __TITLE__ / __CSS__ / __BODY__ are swapped by wrap_page via str.replace. No
-# external fetches: the <style> is inline, there is no <link> or <script src>.
+# external fetches: the <style> is inline (base64 fonts + the Tiles classes), there
+# is no <link> or <script src>. The Tiles body carries its OWN outer wrapper divs
+# (matching out/orbit-tiles-reference.html), so there is no forced <main> wrapper.
 HTML_TEMPLATE: str = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -368,186 +442,150 @@ __CSS__
 </style>
 </head>
 <body>
-<main class="digest">
 __BODY__
-</main>
 </body>
 </html>
 """
 
-# Self-contained stylesheet. Dark-friendly neutral palette with a light fallback
-# via prefers-color-scheme. System font stack (no web-font fetch). Tier classes
-# .hero / .standard / .compact / .index carry the density distinction.
-CSS: str = """
-:root {
-  --bg: #0f1115;
-  --surface: #181b22;
-  --surface-2: #1f232c;
-  --text: #e8eaed;
-  --muted: #9aa0aa;
-  --accent: #6ea8fe;
-  --border: #2a2f3a;
-}
-@media (prefers-color-scheme: light) {
-  :root {
-    --bg: #f7f8fa;
-    --surface: #ffffff;
-    --surface-2: #f0f2f5;
-    --text: #1a1d23;
-    --muted: #5a6270;
-    --accent: #2563eb;
-    --border: #dfe3ea;
-  }
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  line-height: 1.5;
-}
-.digest { max-width: 820px; margin: 0 auto; padding: 24px 20px 64px; }
-a { color: var(--accent); text-decoration: none; }
-a:hover { text-decoration: underline; }
-.tldr {
-  font-size: 1.15rem;
-  font-weight: 600;
-  padding: 14px 18px;
-  margin-bottom: 24px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-}
-.tldr-label {
-  font-size: 0.7rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--accent);
-  margin-right: 8px;
-}
-.section-heading {
-  font-size: 0.8rem;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--muted);
-  margin: 28px 0 12px;
-}
-.card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 16px 18px;
-  margin-bottom: 14px;
-}
-.card-title { margin: 0 0 6px; line-height: 1.3; }
-.card.hero .card-title { font-size: 1.5rem; }
-.card.standard .card-title { font-size: 1.2rem; }
-.card-meta { color: var(--muted); font-size: 0.9rem; }
-.card-meta .channel { font-weight: 600; color: var(--text); }
-.chapters { list-style: none; margin: 12px 0 0; padding: 0; border-top: 1px solid var(--border); }
-.chapters li { padding: 4px 0; }
-.chapter-link { display: flex; gap: 10px; }
-.chapter-time {
-  flex: 0 0 auto;
-  font-variant-numeric: tabular-nums;
-  color: var(--muted);
-  min-width: 3.5em;
-}
-.chapter-title { color: var(--text); }
-.card.compact {
-  padding: 8px 14px;
-  margin-bottom: 6px;
-  background: var(--surface-2);
-  font-size: 0.95rem;
-}
-.card.compact .channel { color: var(--muted); }
-.index-strip { margin-top: 36px; border-top: 2px solid var(--border); padding-top: 8px; }
-.index-list { list-style: none; margin: 0; padding: 0; }
-.index-line { padding: 5px 0; font-size: 0.9rem; border-bottom: 1px solid var(--border); }
-.index-line .channel { color: var(--muted); }
-/* M3 sections (Phase 5): scoops strip, overlap block, right-rail trending. */
-.scoops-strip {
-  margin: 0 0 24px;
-  padding: 14px 18px;
-  background: var(--surface-2);
-  border: 1px solid var(--accent);
-  border-radius: 10px;
-}
-.scoops-heading { margin-top: 0; color: var(--accent); }
-.scoops-list { list-style: none; margin: 0; padding: 0; }
-.scoop-row { padding: 6px 0; font-weight: 600; }
-.scoop-flag {
-  display: inline-block;
-  font-size: 0.65rem;
-  letter-spacing: 0.08em;
-  background: var(--accent);
-  color: var(--bg);
-  padding: 2px 7px;
-  border-radius: 4px;
-  margin-right: 8px;
-  vertical-align: middle;
-}
-.overlap-block { margin: 0 0 24px; }
-.overlap-cluster {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 12px 16px;
-  margin-bottom: 12px;
-}
-.overlap-topic { font-weight: 600; font-size: 1.05rem; }
-.overlap-meta { color: var(--muted); font-size: 0.85rem; margin-top: 2px; }
-.overlap-crosslinks { list-style: none; margin: 8px 0 0; padding: 0; border-top: 1px solid var(--border); }
-.overlap-crosslinks li { padding: 4px 0; }
-.trending-rail {
-  margin: 0 0 24px;
-  padding: 12px 16px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-}
-.trending-list { list-style: none; margin: 0; padding: 0; }
-.trending-row { padding: 6px 0; display: flex; gap: 8px; align-items: baseline; justify-content: space-between; }
-.trending-tag {
-  flex: 0 0 auto;
-  font-size: 0.65rem;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  padding: 1px 6px;
-  border-radius: 4px;
-  border: 1px solid var(--border);
-  color: var(--muted);
-}
-.trending-tag.tag-scoop { color: var(--accent); border-color: var(--accent); }
-.trending-tag.tag-corroborated { color: var(--text); }
+# --- Tiles stylesheet (Phase 7) ----------------------------------------------
+# The newspaper "Tiles" design (scripts/assets/orbit-tiles.dc.html) is mostly
+# inline-styled per element; only a handful of shared classes live here. This block
+# is the CLASS layer (.ph hatched placeholder / .tile card / .chip timestamp / .kp
+# key-point row) ported verbatim from the design's <style>. The base64 @font-face
+# rules are NOT here — wrap_page prepends them from the prebuilt
+# scripts/assets/fonts/fonts-inline.css so the page stays self-contained (no CDN).
+CSS: str = """  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:#EDE7DA}
+  .ph{background-image:repeating-linear-gradient(135deg,rgba(31,27,22,.07) 0 7px,rgba(31,27,22,.02) 7px 14px);background-color:#e3dccc;display:flex;align-items:flex-end;justify-content:flex-start;overflow:hidden;position:relative;flex:none}
+  .ph span{font-family:'JetBrains Mono',monospace;font-size:8.5px;letter-spacing:.04em;color:#8a7f6c;text-transform:uppercase;padding:4px 5px;background:rgba(244,240,232,.82)}
+  a{color:inherit;text-decoration:none}
+  .tile{break-inside:avoid;background:#F7F3EA;border:1px solid rgba(31,27,22,.14);margin-bottom:18px;transition:border-color .15s,box-shadow .15s}
+  .tile:hover{border-color:rgba(183,71,42,.55);box-shadow:0 2px 10px rgba(31,27,22,.07)}
+  .chip{font-family:'JetBrains Mono',monospace;font-size:10.5px;font-weight:500;color:#B7472A;background:rgba(183,71,42,.1);padding:2px 6px;border-radius:2px;white-space:nowrap}
+  .kp{display:flex;gap:9px;align-items:baseline;padding:5px 0;border-bottom:1px dotted rgba(31,27,22,.16)}
+  .kp:last-child{border-bottom:none}
+  .kp span.t{font-size:13.5px;color:#2a251e;line-height:1.3;flex:1}
 """
+
+# --- Inlined font CSS (read once, cached) ------------------------------------
+# wrap_page prepends these base64 woff2 @font-face rules so the digest renders the
+# Fraunces / Newsreader / JetBrains Mono families fully offline. The file is built by
+# ``python scripts/build_fonts.py`` (Sub-phase 0). We FAIL LOUD (Rule 12) if it is
+# absent rather than silently dropping fonts to system defaults.
+_FONTS_INLINE_CSS_PATH: Path = _SCRIPTS_DIR / "assets" / "fonts" / "fonts-inline.css"
+_inlined_font_css_cache: str | None = None
+
+
+def _load_inlined_font_css() -> str:
+    """Return the base64 ``@font-face`` CSS block, read once and cached.
+
+    Reads :data:`_FONTS_INLINE_CSS_PATH` on first call and memoizes it for the
+    process (a single disk read regardless of how many pages are rendered).
+
+    Returns:
+        The full ``@font-face`` CSS string (latin-subset, base64 woff2).
+
+    Raises:
+        FileNotFoundError: If the prebuilt font CSS is missing — the message tells
+            the user to run ``python scripts/build_fonts.py`` first. We never fall
+            back silently to system fonts (Rule 12: fail loud, no silent degrade).
+    """
+    global _inlined_font_css_cache
+    if _inlined_font_css_cache is None:
+        if not _FONTS_INLINE_CSS_PATH.is_file():
+            raise FileNotFoundError(
+                f"Inlined font CSS not found at {_FONTS_INLINE_CSS_PATH}. "
+                "Run `python scripts/build_fonts.py` first to vendor the base64 woff2 fonts."
+            )
+        _inlined_font_css_cache = _FONTS_INLINE_CSS_PATH.read_text(encoding="utf-8")
+    return _inlined_font_css_cache
 
 
 def wrap_page(title: str, body_html: str) -> str:
     """Swap the page-template sentinels and return the full self-contained HTML.
 
-    Replaces ``__TITLE__`` (escaped), ``__CSS__`` (the inline stylesheet), and
-    ``__BODY__`` (the caller's already-built, already-escaped body markup). The
-    body is inserted verbatim — :mod:`lib.render` is responsible for having escaped
-    every user-controlled string inside it via the element builders here.
+    Replaces ``__TITLE__`` (escaped), ``__CSS__`` (the inlined base64 ``@font-face``
+    block from :func:`_load_inlined_font_css` followed by the Tiles :data:`CSS`
+    classes), and ``__BODY__`` (the caller's already-built, already-escaped body
+    markup). The body is inserted verbatim — :mod:`lib.render` is responsible for
+    having escaped every user-controlled string inside it via the builders here.
+
+    The base64 font alphabet (``[A-Za-z0-9+/=]``) contains no underscores, so the
+    font CSS can never re-introduce a ``__TITLE__`` / ``__BODY__`` sentinel.
 
     Args:
         title: The page ``<title>`` text (escaped before insertion).
-        body_html: The fully built ``<main>`` body markup.
+        body_html: The fully built body markup (carries its own outer wrappers).
 
     Returns:
-        The complete ``<!DOCTYPE html>...`` page string.
+        The complete self-contained ``<!DOCTYPE html>...`` page string, fonts inlined.
+
+    Raises:
+        FileNotFoundError: If the prebuilt font CSS is absent (see
+            :func:`_load_inlined_font_css`) — fail loud, never drop fonts silently.
 
     Example:
-        >>> page = wrap_page("Orbit", "<p>hi</p>")
+        >>> page = wrap_page("Orbit", '<div class="tile">hi</div>')
         >>> page.startswith("<!DOCTYPE html>")
         True
-        >>> "</html>" in page
+        >>> "@font-face" in page and "</html>" in page
         True
     """
+    combined_css = f"{_load_inlined_font_css()}\n{CSS}"
     return (
         HTML_TEMPLATE.replace("__TITLE__", escape(title))
-        .replace("__CSS__", CSS)
+        .replace("__CSS__", combined_css)
         .replace("__BODY__", body_html)
     )
+
+
+# --- Tiles builder re-exports (Phase 7, Sub-phase 3) -------------------------
+# The Tiles markup builders live in :mod:`lib.tiles` (file-size discipline keeps
+# this module under the 1000-line cap). They are re-exported here via PEP 562
+# module ``__getattr__`` so callers can keep using ``html_render.render_*`` paths.
+# The import is LAZY (resolved on first attribute access, after both modules have
+# finished importing), which avoids the import-time circular reference between this
+# module and ``lib.tiles`` (tiles imports ``escape`` / ``safe_href`` / ``safe_img_src``
+# from here at its top level).
+_TILES_REEXPORTS: frozenset[str] = frozenset(
+    {
+        "render_masthead",
+        "render_verdict",
+        "render_ahead_trio",
+        "render_scoop_tile",
+        "render_trending_now",
+        "render_hidden_gem",
+        "render_feed_masonry",
+        "render_hero_tile",
+        "render_standard_tile",
+        "render_compact_tile",
+        "render_tweet_tile",
+        "render_footer",
+        "TrendingRow",
+        "ChapterRow",
+        "CrossLink",
+        "CATEGORY_DORMANT",
+        "CATEGORY_YOURS",
+        "CATEGORY_EXTERNAL",
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily resolve Tiles builder names from :mod:`lib.tiles` (PEP 562).
+
+    Args:
+        name: The attribute being accessed on this module.
+
+    Returns:
+        The corresponding object from :mod:`lib.tiles` when ``name`` is a known
+        Tiles re-export.
+
+    Raises:
+        AttributeError: For any other name (standard module-attribute behaviour).
+    """
+    if name in _TILES_REEXPORTS:
+        from lib import tiles
+
+        return getattr(tiles, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

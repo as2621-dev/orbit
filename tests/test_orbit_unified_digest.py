@@ -136,7 +136,11 @@ def test_unified_digest_contains_both_youtube_and_x_cards(tmp_path: Path) -> Non
 
         html_path = tmp_path / "out" / "today.html"
         tiered = orbit.run_stage6_rank_and_tier(unified_items, config)
-        written = orbit.run_stage7_render(tiered, config, html_path=html_path)
+        # Stub the image-inline seam so the tweet avatar (unavatar.io) is NOT fetched —
+        # the render path must stay offline in tests (no network).
+        written = orbit.run_stage7_render(
+            tiered, config, html_path=html_path, inline_image=lambda url: None
+        )
 
         written_html = html_path.read_text(encoding="utf-8")
 
