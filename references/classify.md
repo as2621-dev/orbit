@@ -21,8 +21,14 @@ anything — you only return the two axis values.
 
 - **Axis A — signal vs. noise** (`axis_a_signal`): Is this item substantive,
   durable content the user would value (a real talk, analysis, tutorial,
-  release) rather than low-value churn (shorts bait, reposts, pure promo,
-  giveaways, "subscribe" filler)? `1` = signal, `0` = noise.
+  release, a concrete claim/insight/data point) rather than low-value churn?
+  `1` = signal, `0` = noise. Mark `0` for: shorts bait, reposts, pure promo,
+  giveaways, "subscribe" filler, AND — for short posts especially — generic
+  low-information content: greetings and check-ins ("gm", "good morning"),
+  platitudes and motivational one-liners, vague hot-takes with no specific
+  claim, pure engagement-bait ("like if you agree", "reply with…", polls for
+  reach), and standalone emoji/reaction posts. If a post carries no specific,
+  reusable information a reader could act on or learn from, it is noise (`0`).
 
 - **Axis B — on-topic vs. off-topic** (`axis_b_on_topic`): Does this item match
   the user's stated interests below? `1` = on-topic, `0` = off-topic. If the

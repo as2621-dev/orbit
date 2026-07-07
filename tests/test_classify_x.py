@@ -229,3 +229,63 @@ def test_x_producer_skips_tweet_when_classify_times_out(capsys) -> None:  # noqa
 
     # The skip was surfaced (Rule 12), not swallowed.
     assert "x_stage1_item_classify_skipped" in capsys.readouterr().out
+
+
+def test_x_producer_drops_axis_a_noise_tweet(capsys) -> None:  # noqa: ANN001
+    """A tweet the classifier judges noise (axis_a_signal == 0) is EXCLUDED from the digest.
+
+    WHY (Rule 9): the user asked to "extract alpha, drop generic". Ranking already pushes
+    low-signal tweets down, but density controls only WHERE a tweet renders, never WHETHER
+    it renders — so generic posts ("gm", platitudes, engagement-bait) still leaked into the
+    index tier. This test pins the X-only alpha gate: a tweet classified axis_a_signal=0 must
+    NOT reach the returned items, a substantive tweet in the same batch MUST survive (the gate
+    must not over-drop), and the drop count must be surfaced. Reverting the gate re-admits the
+    noise tweet and fails the first assertion. YouTube inclusion is deliberately not gated.
+    """
+    signal_tweet = Tweet(
+        text="Concrete benchmark: MoE routing cut inference cost 38% at our scale.",
+        tweet_id="1900000000000000020",
+        handle="alice",
+        created_at="2026-06-18T00:00:00Z",
+        like_count=200,
+        retweet_count=60,
+        reply_count=12,
+        quote_count=5,
+    )
+    noise_tweet = Tweet(
+        text="gm everyone, happy monday, blessed to be here",
+        tweet_id="1900000000000000021",
+        handle="bob",
+        created_at="2026-06-18T00:00:00Z",
+        like_count=3,
+        retweet_count=0,
+        reply_count=0,
+        quote_count=0,
+    )
+
+    def _axis_a_classifier(prompt: str) -> str:
+        # Route the verdict by the tweet text, which reaches the shared prompt body.
+        if "happy monday" in prompt:
+            return '{"axis_a_signal": 0, "axis_b_on_topic": 1}'
+        return '{"axis_a_signal": 1, "axis_b_on_topic": 1}'
+
+    def _mock_x_delta(x_sources, depth, ordinal):  # noqa: ANN001 — test stub
+        return [signal_tweet, noise_tweet]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store_with_x_handles(Path(tmp), ["alice", "bob"])
+        config = OrbitConfig(interests=["ai", "transformers"])
+        items = orbit.run_stage1_build_x_items(
+            config,
+            depth="default",
+            x_delta=_mock_x_delta,
+            llm_classifier=_axis_a_classifier,
+        )
+
+    built_ids = [item.item_external_id for item in items]
+    assert built_ids == [signal_tweet.tweet_id], "the axis-A noise tweet must be dropped, the signal tweet kept"
+    assert noise_tweet.tweet_id not in built_ids
+    # The drop count was surfaced (Rule 12), not swallowed.
+    out = capsys.readouterr().out
+    assert "x_stage1_build_completed" in out
+    assert '"dropped_noise_count": 1' in out

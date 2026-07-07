@@ -583,6 +583,11 @@ def _parse_tweets(parsed: Any, handle: str) -> List[Tweet]:
             author_handle = str(author.get("username") or author.get("screen_name") or "").strip()
         author_handle = (author_handle or handle).lstrip("@")
         text = str(_first_present(entry.get("text"), entry.get("full_text"), "") or "").strip()
+        # Reason: defense-in-depth for the ``-filter:retweets`` query filter — a classic
+        # retweet still surfaces its "RT @author: ..." prefix, so drop it even if the
+        # server-side filter let it through.
+        if text.startswith("RT @"):
+            continue
         created_at = str(_first_present(entry.get("createdAt"), entry.get("created_at"), "") or "").strip()
         tweets.append(
             Tweet(
@@ -628,7 +633,10 @@ def _pull_handle_tweets(handle: str, depth: str) -> List[Tweet]:
     command = [
         "node",
         str(_BIRD_SEARCH_MJS),
-        f"from:{handle}",
+        # Reason: a bare ``from:<handle>`` search returns the handle's retweets and replies
+        # too, which are noise for a daily digest. The search-operator filters exclude both
+        # at the source so we never fetch or classify them.
+        f"from:{handle} -filter:retweets -filter:replies",
         "--count",
         str(per_handle_count),
         "--json",

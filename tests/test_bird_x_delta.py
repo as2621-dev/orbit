@@ -33,7 +33,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 from unittest.mock import patch
 
 # Make ``scripts`` importable so ``import store`` and ``from lib import ...``
@@ -90,16 +90,26 @@ def _tweet_payload(handle: str, tweet_ids: List[str]) -> str:
     )
 
 
-def _make_subproc_stub(payload_by_handle: Dict[str, str], queried_handles: List[str]):
+def _make_subproc_stub(
+    payload_by_handle: Dict[str, str],
+    queried_handles: List[str],
+    queried_queries: Optional[List[str]] = None,
+):
     """Build a fake run_with_timeout that records the queried handle and returns its payload.
 
-    The command's positional query is ``from:<handle>``; we extract the handle, record it
-    (for the rotation test's coverage assertion), and return that handle's canned payload.
+    The command's positional query is ``from:<handle> -filter:retweets -filter:replies``; we
+    take the handle from the first whitespace-delimited token after ``from:``, record it (for
+    the rotation test's coverage assertion) and, when provided, record the FULL query string
+    (for the retweets/replies-filter assertion), then return that handle's canned payload.
     """
 
     def _fake_run(cmd, *, timeout, env=None, on_pid=None):  # noqa: ANN001, ARG001
         query = next((arg for arg in cmd if isinstance(arg, str) and arg.startswith("from:")), "")
-        handle = query[len("from:") :]
+        if queried_queries is not None:
+            queried_queries.append(query)
+        # Reason: the query now carries trailing search operators, so the handle is the token
+        # between ``from:`` and the first space, not the whole remainder of the string.
+        handle = query[len("from:") :].split()[0] if query else ""
         queried_handles.append(handle)
         return subproc.SubprocResult(returncode=0, stdout=payload_by_handle.get(handle, "[]"), stderr="")
 
@@ -211,3 +221,38 @@ def test_inter_request_delay_is_invoked_between_handles() -> None:
         assert len(sleep_calls) == len(handles) - 1
         # And it sleeps the configured conservative inter-request delay each time.
         assert all(seconds == bird_x.INTER_REQUEST_DELAY_SECONDS for seconds in sleep_calls)
+
+
+def test_query_excludes_retweets_and_replies() -> None:
+    """WHY: a bare ``from:<handle>`` search returns the handle's retweets and replies, which
+    are digest noise (the user asked for original posts only). The query must carry the
+    ``-filter:retweets -filter:replies`` operators so they are excluded AT THE SOURCE, before
+    we ever fetch or classify them. This assertion fails if the operators are dropped."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store(Path(tmp))
+        _seed_x_sources(["alice"])
+        payloads = {"alice": _tweet_payload("alice", ["t1"])}
+        queried: List[str] = []
+        queries: List[str] = []
+        sources = store.list_sources(platform="x")
+
+        with patch.object(bird_x.subproc, "run_with_timeout", _make_subproc_stub(payloads, queried, queries)):
+            bird_x.fetch_new_tweets(sources, depth="default", run_day_ordinal=0, sleeper=lambda _s: None)
+
+        assert queries, "the handle must have been queried"
+        assert queries[0] == "from:alice -filter:retweets -filter:replies"
+
+
+def test_parse_tweets_drops_retweet_prefixed_text() -> None:
+    """WHY: defense-in-depth for the ``-filter:retweets`` query operator. A retweet that slips
+    past the server-side filter still surfaces its ``RT @author: ...`` prefix, and a retweet
+    is not the followed account's own content — it must never enter the digest. A genuine
+    original tweet in the SAME payload must still survive (the guard must not over-drop)."""
+    parsed = [
+        {"id": "rt1", "text": "RT @someone: hot take", "author": {"username": "alice"}},
+        {"id": "orig1", "text": "my own original thought", "author": {"username": "alice"}},
+    ]
+
+    tweets = bird_x._parse_tweets(parsed, handle="alice")
+
+    assert [tweet.tweet_id for tweet in tweets] == ["orig1"], "RT-prefixed dropped, original kept"

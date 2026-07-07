@@ -37,7 +37,7 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from lib import html_render, render  # noqa: E402
+from lib import html_render, render, trending  # noqa: E402
 from lib.chapterize import Chapter  # noqa: E402
 from lib.classify import Classification  # noqa: E402
 from lib.density import TIER_HERO, TIER_INDEX, TIER_STANDARD, TieredItem  # noqa: E402
@@ -518,3 +518,45 @@ def test_tiles_footer_omits_page2_link_when_no_href() -> None:
     """
     assert "page 2" not in tiles.render_footer("ALL ACCOUNTED FOR", "")
     assert "page 2" in tiles.render_footer("ALL ACCOUNTED FOR", "page2.html")
+
+
+def _trending_item(item_external_id: str, title: str) -> "trending.TrendingItem":
+    """Build a minimal external-category TrendingItem for the trending-cap test."""
+    return trending.TrendingItem(
+        item_external_id=item_external_id,
+        cluster_id=f"c_{item_external_id}",
+        creator_external_id=f"UC_{item_external_id}",
+        title=title,
+        card_url="",
+        velocity_score=1.0,
+        convergence_count=0,
+        baseline_relative_ratio=1.0,
+    )
+
+
+def test_trending_now_renders_at_most_five_rows() -> None:
+    """The "Trending now" tile renders at most 5 rows even when more are ranked.
+
+    WHY (Rule 9): the velocity ranker can surface many trending clusters, but the digest
+    is a glance surface — an unbounded list buries the top signal and blows the page budget.
+    We pass 7 velocity-ordered items and assert exactly the top 5 titles render in the
+    trending tile (and the 6th/7th do NOT). Removing the cap re-renders all 7 and fails this.
+    """
+    trending_items = [_trending_item(f"tr{n}", f"Trending headline {n}") for n in range(7)]
+
+    trio_html = render._build_ahead_trio(
+        scoops=[],
+        trending_items=trending_items,
+        items_by_id={},
+        summaries={},
+    )
+
+    # Each trending row carries this distinctive style fragment (the gem tile uses a
+    # different ``gap:7px`` ordering), so counting it counts trending rows exactly.
+    row_count = trio_html.count("align-items:baseline;gap:10px")
+    assert row_count == 5, f"trending tile must cap at 5 rows, rendered {row_count}"
+    # The top-5 headlines are present; the tail (6th/7th) are dropped.
+    for n in range(5):
+        assert f"Trending headline {n}" in trio_html
+    assert "Trending headline 5" not in trio_html
+    assert "Trending headline 6" not in trio_html

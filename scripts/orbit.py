@@ -380,6 +380,7 @@ def run_stage1_build_x_items(
     category_by_handle = {str(row["external_id"]): str(row.get("category") or "signal") for row in x_sources}
 
     rankable_items: list[RankableItem] = []
+    dropped_noise_count = 0
     for tweet in new_tweets:
         channel_category = category_by_handle.get(tweet.handle, "signal")
         try:
@@ -404,6 +405,12 @@ def run_stage1_build_x_items(
                 error_message=str(exc),
             )
             continue
+        # Alpha gate (X-only): drop generic/low-signal tweets outright rather than merely
+        # ranking them down. Axis-A == 0 means the classifier judged the post noise (gm,
+        # platitudes, engagement-bait). YouTube inclusion is deliberately left unchanged.
+        if classification.axis_a_signal == 0:
+            dropped_noise_count += 1
+            continue
         rankable_items.append(
             RankableItem.from_tweet(tweet, classification, creator_external_id=tweet.handle)
         )
@@ -414,6 +421,7 @@ def run_stage1_build_x_items(
         source_count=len(x_sources),
         tweet_count=len(new_tweets),
         rankable_count=len(rankable_items),
+        dropped_noise_count=dropped_noise_count,
     )
     return rankable_items
 

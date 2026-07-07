@@ -65,6 +65,11 @@ InlineImage = Callable[[str], Optional[str]]
 # link. Matches the design (3-4 visible rows, the rest behind the more-chapters link).
 _MAX_VISIBLE_CHAPTERS: int = 4
 
+# Max rows in the "Trending now" tile. The velocity ranker can surface many items;
+# the digest only wants the top few, so we render the highest-ranked rows and drop
+# the tail (trending_items is already velocity-ordered upstream).
+_TRENDING_MAX_ROWS: int = 5
+
 # --- Page-budget height heuristic (2-page spill) -----------------------------
 # FIRST-CUT, TUNABLE estimate-by-content table — NOT a measured layout (stdlib-first,
 # no headless browser). Page height is APPROXIMATED by summing a per-tier estimated px
@@ -566,7 +571,7 @@ def _build_ahead_trio(
     trending_tile = ""
     if trending_items:
         rows: list[tiles.TrendingRow] = []
-        for trending_item in trending_items:
+        for trending_item in trending_items[:_TRENDING_MAX_ROWS]:
             category, your_count = _trending_row_category(trending_item)
             rows.append(
                 tiles.TrendingRow(
