@@ -436,12 +436,18 @@ def _select_recent_uploads(
 
     Bounds the cold-DB first run (where the delta engine marks an entire back-catalogue
     "new"): only uploads with an ``upload_date`` (``YYYYMMDD``) on/after ``recency_cutoff``
-    survive, sorted newest-first, then truncated to the cap. Uploads with no date are
-    dropped — a daily digest can't place them in time, and including them would reopen the
-    back-catalogue blowup. ``YYYYMMDD`` strings compare lexically == chronologically.
+    survive, sorted newest-first, then truncated to the cap. ``YYYYMMDD`` strings compare
+    lexically == chronologically.
+
+    Positional fallback (fail loud): if the channel returns NO dated uploads at all
+    (yt-dlp's flat listing occasionally omits dates even with ``approximate_date``), we
+    can't drop the whole channel — that is exactly the YouTube-dropout bug. Instead we take
+    the newest ``per_channel_cap`` uploads by feed order (the channel ``/videos`` listing is
+    newest-first, and ``fetch_new_uploads`` preserves that order) and log a warning. When at
+    least one dated upload exists we trust the dates and never fall back.
 
     Args:
-        uploads: The channel's new (unseen) uploads from the delta engine.
+        uploads: The channel's new (unseen) uploads from the delta engine, in feed order.
         recency_cutoff: Inclusive lower bound as a ``YYYYMMDD`` string.
         per_channel_cap: Max uploads to return for this channel.
 
@@ -452,7 +458,24 @@ def _select_recent_uploads(
         >>> _select_recent_uploads(uploads, recency_cutoff="20260620", per_channel_cap=5)
         [<newest>, ...]
     """
-    recent = [upload for upload in uploads if upload.upload_date and upload.upload_date >= recency_cutoff]
+    dated = [upload for upload in uploads if upload.upload_date]
+    if not dated and uploads:
+        # Reason: zero dates for a non-empty channel means we cannot place any upload in
+        # time. Rather than silently dropping the channel (the dropout bug), fall back to
+        # newest-by-feed-order and surface it loudly (Rule 12).
+        log.log_warning(
+            "youtube_stage1_upload_dates_missing",
+            channel_name=uploads[0].channel_name,
+            upload_count=len(uploads),
+            per_channel_cap=per_channel_cap,
+            fix_suggestion=(
+                "yt-dlp returned no upload_date for this channel even with "
+                "youtubetab:approximate_date; using newest-by-feed-order fallback. If this "
+                "recurs widely, check the yt-dlp version / extractor args."
+            ),
+        )
+        return uploads[:per_channel_cap]
+    recent = [upload for upload in dated if upload.upload_date >= recency_cutoff]
     recent.sort(key=lambda upload: upload.upload_date, reverse=True)
     return recent[:per_channel_cap]
 

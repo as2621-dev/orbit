@@ -310,3 +310,80 @@ def test_youtube_producer_degrades_chapters_when_chapterize_times_out(capsys) ->
 
     # The degrade was surfaced (Rule 12), not swallowed.
     assert "youtube_stage1_item_chapterize_degraded" in capsys.readouterr().out
+
+
+def _dated_upload(video_id: str, upload_date: str) -> Upload:
+    """Build a minimal Upload with an explicit ``upload_date`` (may be empty)."""
+    return Upload(
+        video_id=video_id,
+        title=f"talk {video_id}",
+        description="",
+        upload_date=upload_date,
+        view_count=None,
+        like_count=None,
+        comment_count=None,
+        duration=None,
+        channel_name="A YT Channel",
+        chapters=None,
+    )
+
+
+def test_select_recent_uploads_windows_and_sorts_when_dates_present() -> None:
+    """WHY: with real dates the recency window is the correct gate — anything older than the
+    cutoff is dropped and the survivors come back newest-first, capped. This is the normal
+    daily-digest path (the cold-start back-catalogue bound)."""
+    uploads = [
+        _dated_upload("old", "20260101"),  # before cutoff -> dropped
+        _dated_upload("newest", "20260704"),
+        _dated_upload("mid", "20260702"),
+    ]
+
+    selected = orbit._select_recent_uploads(uploads, recency_cutoff="20260702", per_channel_cap=5)
+
+    assert [u.video_id for u in selected] == ["newest", "mid"], "windowed + newest-first"
+
+
+def test_select_recent_uploads_positional_fallback_when_no_dates(capsys) -> None:  # noqa: ANN001
+    """WHY: this is the YouTube-dropout bug. yt-dlp's flat listing can omit upload_date for a
+    whole channel; the old code then dropped every upload and the digest went X-only. The
+    fallback must keep the newest N by feed order (the listing is newest-first) AND surface a
+    warning so the silent dropout can never recur unnoticed (Rule 12)."""
+    uploads = [
+        _dated_upload("v1_newest", ""),
+        _dated_upload("v2", ""),
+        _dated_upload("v3", ""),
+    ]
+
+    selected = orbit._select_recent_uploads(uploads, recency_cutoff="20260702", per_channel_cap=2)
+
+    assert [u.video_id for u in selected] == ["v1_newest", "v2"], "newest-by-feed-order, capped"
+    assert "youtube_stage1_upload_dates_missing" in capsys.readouterr().out, "fallback must be loud"
+
+
+def test_select_recent_uploads_trusts_dates_when_only_some_missing(capsys) -> None:  # noqa: ANN001
+    """WHY: a single dateless entry must NOT trigger the positional fallback — the fallback is
+    only for a channel with ZERO usable dates. Otherwise one odd entry would reopen the
+    back-catalogue blowup by ignoring the recency window."""
+    uploads = [
+        _dated_upload("dated_new", "20260704"),
+        _dated_upload("dateless", ""),  # ignored, not a fallback trigger
+        _dated_upload("dated_old", "20260101"),  # before cutoff -> dropped
+    ]
+
+    selected = orbit._select_recent_uploads(uploads, recency_cutoff="20260702", per_channel_cap=5)
+
+    assert [u.video_id for u in selected] == ["dated_new"], "date window still applies"
+    assert "youtube_stage1_upload_dates_missing" not in capsys.readouterr().out, "no fallback here"
+
+
+def test_build_uploads_command_requests_approximate_dates() -> None:
+    """WHY: --flat-playlist alone emits no upload_date, which is the root cause of the dropout.
+    The approximate_date extractor arg must be present so yt-dlp populates dates and the
+    recency window works without a per-video metadata fetch."""
+    from lib import youtube_yt  # noqa: PLC0415
+
+    command = youtube_yt._build_uploads_command("UC_chan")
+
+    assert "--extractor-args" in command
+    arg_index = command.index("--extractor-args")
+    assert command[arg_index + 1] == "youtubetab:approximate_date"

@@ -452,6 +452,12 @@ def _build_uploads_command(channel_id: str) -> list[str]:
     return [
         "yt-dlp",
         "--flat-playlist",
+        # Reason: --flat-playlist alone emits no upload_date, so every upload looks
+        # dateless and the recency window drops the whole channel. This extractor arg
+        # makes yt-dlp populate an approximate upload_date from the tab listing, so
+        # "last N days" stays meaningful without a per-video metadata fetch.
+        "--extractor-args",
+        "youtubetab:approximate_date",
         "--dump-json",
         uploads_url,
     ]
