@@ -149,22 +149,30 @@ def group_items_by_tier(tiered_items: list[TieredItem]) -> dict[str, list[Tiered
 
 
 def _card_deep_link(item: Any) -> str:
-    """Build the whole-item deep-link: an item-supplied ``card_url`` if present, else YouTube.
+    """Build the whole-item deep-link: ``card_url``, else first chapter offset, else video start.
 
     Source-aware: an X item carries its ``https://x.com/{handle}/status/{tweet_id}``
-    permalink in ``card_url``; a YouTube item leaves it empty and falls back to the
-    whole-video ``watch?v=ID&t=0s`` deep-link. Both are trusted constructed ``https``
-    URLs that pass the :mod:`lib.tiles` allowlist.
+    permalink in ``card_url``; a YouTube item leaves it empty. For a chaptered YouTube
+    item the link lands on the FIRST chapter's ``deep_link`` (``watch?v=ID&t=Ns``) so a
+    click drops the reader where the content starts; a chapterless item falls back to the
+    whole-video ``watch?v=ID&t=0s``. All are trusted constructed URLs that the
+    :mod:`lib.tiles` allowlist re-validates at render time.
 
     Args:
         item: A :class:`lib.rerank.RankableItem`.
 
     Returns:
-        The item's ``card_url`` if set, else ``https://www.youtube.com/watch?v={id}&t=0s``.
+        The item's ``card_url`` if set; else the first chapter's ``deep_link`` when the
+        item has chapters; else ``https://www.youtube.com/watch?v={id}&t=0s``.
     """
     card_url = getattr(item, "card_url", "") or ""
     if card_url:
         return card_url
+    chapters = getattr(item, "chapters", None) or []
+    if chapters:
+        first_chapter_link = getattr(chapters[0], "deep_link", "") or ""
+        if first_chapter_link:
+            return first_chapter_link
     item_external_id = getattr(item, "item_external_id", "") or ""
     return f"https://www.youtube.com/watch?v={item_external_id}&t=0s"
 
@@ -253,6 +261,9 @@ def _chapter_rows(item: Any) -> tuple[list[tiles.ChapterRow], int]:
         tiles.ChapterRow(
             chip=_format_timestamp(getattr(chapter, "start_seconds", 0.0)),
             text=getattr(chapter, "title", "") or "",
+            # The chapter's own ``watch?v=ID&t=Ns`` deep-link makes the chip clickable
+            # straight into the moment; tiles.py neutralizes an empty/unsafe url.
+            url=getattr(chapter, "deep_link", "") or "",
         )
         for chapter in visible
     ]

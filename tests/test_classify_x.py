@@ -289,3 +289,62 @@ def test_x_producer_drops_axis_a_noise_tweet(capsys) -> None:  # noqa: ANN001
     out = capsys.readouterr().out
     assert "x_stage1_build_completed" in out
     assert '"dropped_noise_count": 1' in out
+
+
+def test_x_producer_drops_category_other_tweet(capsys) -> None:  # noqa: ANN001
+    """A tweet the classifier tags ``category == "other"`` is EXCLUDED from the digest.
+
+    WHY (Rule 9): the 2026-07-06 taxonomy ruling gates BOTH sources on the shared classify
+    path — an item outside the fixed taxonomy (``other``) is dropped, not merely deranked.
+    The X half must gate identically to YouTube: a substantive ``ai`` tweet survives, an
+    otherwise-substantive ``other`` tweet (signal on Axis A, so the noise gate does NOT catch
+    it) is dropped by the category gate, and the drop count is surfaced. Reverting the
+    category gate re-admits the ``other`` tweet and fails the first assertion.
+    """
+    kept_tweet = Tweet(
+        text="Concrete benchmark: MoE routing cut inference cost 38% at our scale.",
+        tweet_id="1900000000000000030",
+        handle="alice",
+        created_at="2026-06-18T00:00:00Z",
+        like_count=200,
+        retweet_count=60,
+        reply_count=12,
+        quote_count=5,
+    )
+    other_tweet = Tweet(
+        text="My cat did the funniest thing at brunch today, thread below.",
+        tweet_id="1900000000000000031",
+        handle="bob",
+        created_at="2026-06-18T00:00:00Z",
+        like_count=150,
+        retweet_count=40,
+        reply_count=9,
+        quote_count=2,
+    )
+
+    def _category_classifier(prompt: str) -> str:
+        # Both are Axis-A signal (so the noise gate does not catch the 'other' one); only
+        # the category axis differs. Route by tweet text, which reaches the prompt body.
+        if "My cat did the funniest thing" in prompt:
+            return '{"axis_a_signal": 1, "axis_b_on_topic": 1, "category": "other"}'
+        return '{"axis_a_signal": 1, "axis_b_on_topic": 1, "category": "ai"}'
+
+    def _mock_x_delta(x_sources, depth, ordinal):  # noqa: ANN001 — test stub
+        return [kept_tweet, other_tweet]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store_with_x_handles(Path(tmp), ["alice", "bob"])
+        config = OrbitConfig(interests=["ai", "transformers"])
+        items = orbit.run_stage1_build_x_items(
+            config,
+            depth="default",
+            x_delta=_mock_x_delta,
+            llm_classifier=_category_classifier,
+        )
+
+    built_ids = [item.item_external_id for item in items]
+    assert built_ids == [kept_tweet.tweet_id], "the 'other'-category tweet must be dropped, the 'ai' tweet kept"
+    assert other_tweet.tweet_id not in built_ids
+    # The category-drop count was surfaced (Rule 12), not swallowed.
+    out = capsys.readouterr().out
+    assert '"category_dropped_count": 1' in out

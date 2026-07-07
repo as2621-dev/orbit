@@ -43,7 +43,7 @@ for _candidate_dir in (_SCRIPTS_DIR, _LIB_DIR):
     if str(_candidate_dir) not in sys.path:
         sys.path.insert(0, str(_candidate_dir))
 
-from lib.html_render import escape, safe_href, safe_img_src  # noqa: E402
+from lib.html_render import escape, is_safe_link_url, safe_href, safe_img_src  # noqa: E402
 
 # --- Trending-now marker categories (the "ahead of the curve" middle tile) ----
 # The trending list marks each row by WHERE the signal comes from: a creator who
@@ -91,10 +91,14 @@ class ChapterRow(NamedTuple):
     Attributes:
         chip: The timestamp chip text (e.g. ``"04:20"`` / ``"1:31:00"``).
         text: The chapter title / key-point text (escaped on render).
+        url: The ``watch?v=ID&t=Ns`` deep-link the chip points at. A non-empty,
+            allowlist-safe url makes the chip a clickable ``<a>``; empty or unsafe
+            degrades to an inert ``<span>`` (Rule 12: degrade, don't break).
     """
 
     chip: str
     text: str
+    url: str = ""
 
 
 class CrossLink(NamedTuple):
@@ -166,11 +170,32 @@ def _render_kp_rows(chapters: tuple[ChapterRow, ...] | list[ChapterRow]) -> str:
     if not chapters:
         return ""
     rows = "".join(
-        f'<div class="kp"><span class="chip">{escape(chapter.chip)}</span>'
-        f'<span class="t">{escape(chapter.text)}</span></div>'
+        f'<div class="kp">{_render_kp_chip(chapter)}<span class="t">{escape(chapter.text)}</span></div>'
         for chapter in chapters
     )
     return f"<div>{rows}</div>"
+
+
+def _render_kp_chip(chapter: ChapterRow) -> str:
+    """Render one chapter's timestamp chip: a clickable ``<a>`` when the deep-link is safe.
+
+    A non-empty, allowlist-safe ``chapter.url`` renders the chip as
+    ``<a class="chip" href="...">`` so the reader clicks straight into the moment; an
+    empty or unsafe url (e.g. ``javascript:``) degrades to today's inert
+    ``<span class="chip">`` (Rule 12: degrade, don't break). Either way the visual
+    ``.chip`` class is kept, so the two forms look identical.
+
+    Args:
+        chapter: The :class:`ChapterRow` (read for ``chip`` text + ``url``).
+
+    Returns:
+        An ``<a class="chip">`` or ``<span class="chip">`` markup string.
+    """
+    chip_text = escape(chapter.chip)
+    url = getattr(chapter, "url", "") or ""
+    if url and is_safe_link_url(url):
+        return f'<a class="chip" href="{safe_href(url)}">{chip_text}</a>'
+    return f'<span class="chip">{chip_text}</span>'
 
 
 def _render_more_chapters(more_chapters_count: int, card_url: str) -> str:

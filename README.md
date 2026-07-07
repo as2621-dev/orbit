@@ -10,13 +10,17 @@ Read that before running Orbit.
 
 ## What's shipped
 
-- **YouTube half** — subscriptions → delta uploads → transcripts (with timestamps) →
-  chapterize → classify → derank → density-laddered HTML with deep-links and page-2 overflow.
-- **X half** — following → per-handle timelines → into the same classify/rank/render path.
+- **YouTube half** — subscriptions → delta uploads (long-form only, ≥10 min) → transcripts
+  (with timestamps) → chapterize → classify (signal/on-topic + a fixed
+  `{ai, business, tech, sports, other}` category, `other` dropped) → derank → density-laddered
+  HTML with clickable `watch?v=ID&t=Ns` chapter deep-links and page-2 overflow.
+- **X half** — following → per-handle timelines → the same classify/rank path, then a **top-8
+  by virality** cut (quote-tweets down-weighted) into the digest.
 - **Overlap, trending & scoop passes** — merge short-form reactions, cross-link long-form on a
   shared topic, detect internal/external trending, and flag dormant-account scoops.
 - **Delivery & onboarding** — iMessage delivery (AppleScript, opt-in), optional WhatsApp
-  (Twilio) and Briefcast payload, the `/orbit --setup` wizard, and OS-cron scheduling.
+  (Twilio) and Briefcast payload, the `/orbit --setup` wizard, and OS-cron scheduling the
+  wizard installs for you.
 
 ## Quick start
 
@@ -31,16 +35,27 @@ Read that before running Orbit.
 2. Confirm you're logged into YouTube and X in a supported browser
    (Chrome/Firefox/Safari/Edge/Brave).
 3. Run `/orbit --setup` — it reads your subs/follows, auto-classifies channels, has you
-   confirm categories and pick priority creators, seeds interests, and sets delivery +
-   schedule. It writes a validated `orbit.config.json` and prints a cron entry.
-4. Add the printed cron entry to your crontab. It runs `claude -p "/orbit"` daily on your
-   machine:
+   confirm categories and pick priority creators, seeds interests, and sets your delivery
+   target. It writes a validated `orbit.config.json` and **installs the daily cron entry for
+   you** at a fixed **7am** (`0 7 * * *`), tagged so re-running setup replaces it rather than
+   duplicating:
 
    ```
-   0 7 * * * cd /path/to/orbit && claude -p "/orbit"
+   0 7 * * * cd /path/to/orbit && claude -p "/orbit" # orbit-daily-digest
    ```
+
+   The schedule is fixed (not a prompt). If the crontab write fails (e.g. a sandboxed
+   environment with no `crontab` binary), setup still completes and prints the line for you to
+   add manually via `crontab -e`.
 
 The full 5-step setup is in [`SETUP.md`](SETUP.md) §8.3.
+
+## Delivery
+
+iMessage (AppleScript, opt-in) is the delivery channel for the TL;DR, alongside the HTML
+one-pager written locally. **Email delivery is explicitly out of scope** (decision 2026-07-06):
+Orbit is a local, on-device tool and does not send mail. Optional WhatsApp (Twilio) and a
+Briefcast payload remain available; see [`SETUP.md`](SETUP.md).
 
 ## Configuration & environment
 

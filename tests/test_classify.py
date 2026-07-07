@@ -24,6 +24,8 @@ the temp-DB setup in ``tests/test_delta_uploads.py``.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -59,6 +61,14 @@ def _upload(video_id: str = "vid000003") -> dict:
 def _verdict(axis_a_signal: int, axis_b_on_topic: int) -> str:
     """A clean strict-JSON verdict string the LLM boundary would return."""
     return f'{{"axis_a_signal": {axis_a_signal}, "axis_b_on_topic": {axis_b_on_topic}}}'
+
+
+def _verdict_with_category(axis_a_signal: int, axis_b_on_topic: int, category: str) -> str:
+    """A clean strict-JSON verdict string including the third (category) axis."""
+    return (
+        f'{{"axis_a_signal": {axis_a_signal}, "axis_b_on_topic": {axis_b_on_topic}, '
+        f'"category": "{category}"}}'
+    )
 
 
 def test_failing_axis_routes_to_also_posted_and_persists_never_dropped() -> None:
@@ -215,6 +225,127 @@ def test_default_llm_classifier_fails_loud() -> None:
         raised = exc
 
     assert raised is not None, "the default LLM boundary must raise NotImplementedError"
+
+
+def test_each_taxonomy_category_is_parsed_onto_the_classification() -> None:
+    """Each of ai/business/tech/sports is parsed verbatim onto ``Classification.category``.
+
+    WHY (Rule 9): the category axis is the Stage-1 taxonomy gate's input. orbit.py drops
+    only ``"other"`` and keeps every other taxonomy value, so if a clean ``ai`` verdict did
+    not survive onto ``classification.category`` the gate would drop good items (or keep the
+    wrong ones). We assert all four keep-categories round-trip exactly — a parser that
+    dropped or defaulted them would fail here, not silently empty the digest.
+    """
+    for category in ("ai", "business", "tech", "sports"):
+        with tempfile.TemporaryDirectory() as tmp:
+            _fresh_store(Path(tmp))
+            result = classify.classify_item(
+                _upload(),
+                channel_category="signal",
+                interests=["ai"],
+                llm_classifier=lambda prompt, _cat=category: _verdict_with_category(1, 1, _cat),
+            )
+        assert result.category == category, f"{category} verdict must round-trip onto the classification"
+        # A keep-category never routes to also-posted on the category axis (that is the
+        # gate's job in orbit.py); the two binary axes still decide also-posted.
+        assert result.is_also_posted is False
+
+
+def test_other_category_is_parsed_as_other_for_the_gate() -> None:
+    """A clean ``other`` verdict yields ``category == "other"`` so the Stage-1 gate can drop it.
+
+    WHY (Rule 9): the whole point of the taxonomy axis is that ``other`` is the drop signal.
+    If ``other`` were coerced away (to the keep-sentinel) the gate would never fire and
+    off-taxonomy noise would leak into the digest. classify.py must surface ``other``
+    verbatim; the DROP decision lives in orbit.py (tested there).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store(Path(tmp))
+        result = classify.classify_item(
+            _upload(),
+            channel_category="signal",
+            interests=["ai"],
+            llm_classifier=lambda prompt: _verdict_with_category(1, 1, "other"),
+        )
+
+    assert result.category == "other", "an explicit 'other' verdict must be surfaced for the gate to drop"
+
+
+def test_missing_category_defaults_to_keep_sentinel_and_logs() -> None:
+    """A verdict with NO category defaults to the keep-sentinel (NOT "other") and logs.
+
+    WHY (Rule 12): a prompt regression that stopped emitting ``category`` must NOT silently
+    empty the digest. If a missing category defaulted to ``"other"`` the Stage-1 gate would
+    drop EVERY item on such a regression. So a missing category fails OPEN — it defaults to
+    the keep-sentinel (outside the taxonomy, so the gate keeps it) and logs
+    ``classify_category_unparseable`` so the regression is visible, never swallowed. We feed
+    the legacy two-axis verdict (no category) and assert both the sentinel and the warning.
+    """
+    captured = io.StringIO()
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store(Path(tmp))
+        with contextlib.redirect_stdout(captured):
+            result = classify.classify_item(
+                _upload(),
+                channel_category="signal",
+                interests=["ai"],
+                llm_classifier=lambda prompt: _verdict(axis_a_signal=1, axis_b_on_topic=1),
+            )
+
+    assert result.category == classify._CATEGORY_KEEP_ON_PARSE_FAILURE
+    assert result.category != "other", "a missing category must NEVER default to the drop value"
+    assert "classify_category_unparseable" in captured.getvalue(), "the fallback must be surfaced, not swallowed"
+
+
+def test_garbled_off_taxonomy_category_defaults_to_keep_sentinel() -> None:
+    """An off-taxonomy label (e.g. "politics") defaults to the keep-sentinel, not "other".
+
+    WHY (Rule 12): the model must never invent its way into a DROP. If it returns a label
+    outside the fixed taxonomy, we do not trust it and we do not map it to ``"other"``
+    (which would drop the item) — we fail open to the keep-sentinel so the item survives and
+    the anomaly is logged. Guards against a fabricated category silently pruning the digest.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store(Path(tmp))
+        result = classify.classify_item(
+            _upload(),
+            channel_category="signal",
+            interests=["ai"],
+            llm_classifier=lambda prompt: _verdict_with_category(1, 1, "politics"),
+        )
+
+    assert result.category == classify._CATEGORY_KEEP_ON_PARSE_FAILURE
+    assert result.category != "other", "an off-taxonomy label must fail open to keep, not drop"
+
+
+def test_classify_prompt_renders_the_fixed_taxonomy() -> None:
+    """The rendered classify prompt carries the fixed taxonomy from references/classify.md.
+
+    WHY (Rule 9): the taxonomy lives in the prompt file (tuned without touching code). If a
+    prompt edit dropped the taxonomy the model would have no category vocabulary and every
+    verdict would garble — silently emptying the digest via the gate is avoided only because
+    classify.py fails open, but the digest would still be miscategorized. We capture the
+    exact prompt the LLM boundary receives and assert every taxonomy member is present.
+    """
+    captured_prompts: list[str] = []
+
+    def _capturing_llm(prompt: str) -> str:
+        captured_prompts.append(prompt)
+        return _verdict_with_category(1, 1, "ai")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store(Path(tmp))
+        classify.classify_item(
+            _upload(),
+            channel_category="signal",
+            interests=["ai"],
+            llm_classifier=_capturing_llm,
+        )
+
+    assert len(captured_prompts) == 1
+    rendered = captured_prompts[0]
+    for taxonomy_member in ("ai", "business", "tech", "sports", "other"):
+        assert taxonomy_member in rendered, f"the prompt must render the '{taxonomy_member}' category"
 
 
 def _run_all_standalone() -> int:

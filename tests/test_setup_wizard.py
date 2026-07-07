@@ -38,7 +38,8 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from lib.bird_x import XAuthError  # noqa: E402
 from lib.config import load_config  # noqa: E402
-from lib.setup_wizard import generate_cron_entry, run_setup_wizard  # noqa: E402
+from lib.setup_wizard import _ORBIT_CRON_MARKER, generate_cron_entry, install_cron_entry, run_setup_wizard  # noqa: E402
+from lib.subproc import SubprocResult  # noqa: E402
 from lib.youtube_yt import Subscription  # noqa: E402
 
 
@@ -49,6 +50,53 @@ def _scripted_input(answers: list[str]) -> MagicMock:
     prompt's default), so a test only scripts the answers whose value it asserts on.
     """
     return MagicMock(side_effect=lambda _prompt: answers.pop(0) if answers else "")
+
+
+class _FakeCrontab:
+    """An in-memory ``crontab_runner`` double so no test touches the real user crontab.
+
+    Simulates ``crontab -l`` (read) and ``crontab -`` (write) against a stored crontab
+    body. The read result is scriptable to reproduce the "no crontab for user" first-run
+    case (non-zero return code + that stderr) and a genuine binary failure (raising).
+
+    Attributes:
+        stored: The current crontab body returned by subsequent reads.
+        writes: Every crontab body written, in order (lets a test assert idempotency).
+        read_returncode: Return code the scripted ``crontab -l`` reports.
+        read_stderr: Stderr the scripted ``crontab -l`` reports.
+        raise_on: An exception to raise instead of running (simulates a missing binary).
+    """
+
+    def __init__(
+        self,
+        *,
+        stored: str = "",
+        read_returncode: int = 0,
+        read_stderr: str = "",
+        write_returncode: int = 0,
+        raise_on: BaseException | None = None,
+    ) -> None:
+        self.stored = stored
+        self.writes: list[str] = []
+        self.read_returncode = read_returncode
+        self.read_stderr = read_stderr
+        self.write_returncode = write_returncode
+        self.raise_on = raise_on
+
+    def __call__(self, command: list[str], stdin_text: str | None) -> SubprocResult:
+        if self.raise_on is not None:
+            raise self.raise_on
+        if command == ["crontab", "-l"]:
+            return SubprocResult(
+                returncode=self.read_returncode, stdout=self.stored, stderr=self.read_stderr
+            )
+        if command == ["crontab", "-"]:
+            self.writes.append(stdin_text or "")
+            self.stored = stdin_text or ""
+            self.read_returncode = 0
+            self.read_stderr = ""
+            return SubprocResult(returncode=self.write_returncode, stdout="", stderr="")
+        raise AssertionError(f"unexpected crontab command: {command!r}")
 
 
 def _fake_store() -> MagicMock:
@@ -94,8 +142,8 @@ def test_wizard_writes_loadable_config_with_choices(tmp_path: Path) -> None:
     # Scripted answers, in prompt order:
     #   cookie source, confirm cat #1, confirm cat #2,
     #   prioritize #1 (yes), prioritize #2 (no),
-    #   html_path, imessage (blank), schedule
-    answers = ["chrome", "y", "y", "y", "n", "~/orbit/out/today.html", "", "0 7 * * *"]
+    #   html_path, imessage (blank). The schedule is NO LONGER asked (fixed 7am).
+    answers = ["chrome", "y", "y", "y", "n", "~/orbit/out/today.html", ""]
 
     exit_code = run_setup_wizard(
         config_path=config_path,
@@ -105,6 +153,7 @@ def test_wizard_writes_loadable_config_with_choices(tmp_path: Path) -> None:
         llm_classifier=_signal_classifier(),
         input_fn=_scripted_input(answers),
         store_module=_fake_store(),
+        crontab_runner=_FakeCrontab(),
     )
 
     assert exit_code == 0
@@ -170,8 +219,8 @@ def test_wizard_auto_classifies_via_existing_classify_path(tmp_path: Path) -> No
     x_loader = MagicMock(return_value=[])
     llm = _signal_classifier()
 
-    # cookie, confirm cat, prioritize (no), html, imessage (blank), schedule
-    answers = ["chrome", "y", "n", "~/orbit/out/today.html", "", "0 7 * * *"]
+    # cookie, confirm cat, prioritize (no), html, imessage (blank). No schedule prompt.
+    answers = ["chrome", "y", "n", "~/orbit/out/today.html", ""]
 
     run_setup_wizard(
         config_path=config_path,
@@ -181,6 +230,7 @@ def test_wizard_auto_classifies_via_existing_classify_path(tmp_path: Path) -> No
         llm_classifier=llm,
         input_fn=_scripted_input(answers),
         store_module=_fake_store(),
+        crontab_runner=_FakeCrontab(),
     )
 
     # The classify path renders a prompt then calls the LLM boundary once per creator.
@@ -201,7 +251,7 @@ def test_wizard_continues_youtube_only_when_x_auth_fails(tmp_path: Path) -> None
     )
     x_loader = MagicMock(side_effect=XAuthError("X cookies missing"))
 
-    answers = ["chrome", "y", "n", "~/orbit/out/today.html", "", "0 7 * * *"]
+    answers = ["chrome", "y", "n", "~/orbit/out/today.html", ""]
 
     exit_code = run_setup_wizard(
         config_path=config_path,
@@ -211,6 +261,7 @@ def test_wizard_continues_youtube_only_when_x_auth_fails(tmp_path: Path) -> None
         llm_classifier=_signal_classifier(),
         input_fn=_scripted_input(answers),
         store_module=_fake_store(),
+        crontab_runner=_FakeCrontab(),
     )
 
     assert exit_code == 0
@@ -233,8 +284,8 @@ def test_wizard_writes_imessage_target_when_provided(tmp_path: Path) -> None:
     )
     x_loader = MagicMock(return_value=[])
 
-    # cookie, confirm cat, prioritize (no), html, imessage (+15551234567), schedule
-    answers = ["chrome", "y", "n", "~/orbit/out/today.html", "+15551234567", "0 7 * * *"]
+    # cookie, confirm cat, prioritize (no), html, imessage (+15551234567). No schedule prompt.
+    answers = ["chrome", "y", "n", "~/orbit/out/today.html", "+15551234567"]
 
     run_setup_wizard(
         config_path=config_path,
@@ -244,7 +295,185 @@ def test_wizard_writes_imessage_target_when_provided(tmp_path: Path) -> None:
         llm_classifier=_signal_classifier(),
         input_fn=_scripted_input(answers),
         store_module=_fake_store(),
+        crontab_runner=_FakeCrontab(),
     )
 
     loaded = load_config(config_path)
     assert loaded.delivery["imessage_to"] == "+15551234567"
+
+
+def test_install_cron_entry_fresh_install_writes_marker_tagged_line() -> None:
+    """A fresh install writes exactly the entry tagged with the Orbit marker.
+
+    WHY: the marker is what makes re-runs idempotent — the installed line MUST carry it,
+    or a second run can't find and replace it and would append a duplicate. On an empty
+    crontab the result is the single tagged line and nothing else.
+    """
+    fake = _FakeCrontab(stored="")
+
+    installed = install_cron_entry("0 7 * * * echo run", crontab_runner=fake)
+
+    assert installed is True
+    assert fake.writes == [f"0 7 * * * echo run {_ORBIT_CRON_MARKER}\n"]
+
+
+def test_install_cron_entry_replaces_orbit_line_not_duplicates() -> None:
+    """A second install REPLACES the marked Orbit line and leaves unrelated lines intact.
+
+    WHY: re-running the wizard must not accumulate stale Orbit cron lines (the machine
+    would then run Orbit twice, on the old and new schedule). The replacement matches on
+    the marker, so exactly one marked line survives; a user's unrelated crontab job is
+    never touched.
+    """
+    fake = _FakeCrontab(
+        stored=f"0 9 * * * cd /repo && claude -p \"/orbit\" {_ORBIT_CRON_MARKER}\n30 8 * * * my-backup-job\n"
+    )
+
+    installed = install_cron_entry("0 7 * * * new-orbit-command", crontab_runner=fake)
+
+    assert installed is True
+    final_crontab = fake.stored
+    assert final_crontab.count(_ORBIT_CRON_MARKER) == 1  # not duplicated
+    assert "new-orbit-command" in final_crontab  # the new schedule replaced the old
+    assert "0 9 * * *" not in final_crontab  # the stale Orbit line is gone
+    assert "my-backup-job" in final_crontab  # the unrelated job is preserved
+
+
+def test_install_cron_entry_treats_no_crontab_for_user_as_empty() -> None:
+    """The "no crontab for user" first-run case must be treated as an empty crontab.
+
+    WHY: on a machine that has never had a crontab, ``crontab -l`` exits non-zero with a
+    "no crontab for <user>" message. If that were treated as a hard read failure, a brand
+    new user could never get auto-installed. It must degrade to a clean fresh install.
+    """
+    fake = _FakeCrontab(stored="", read_returncode=1, read_stderr="no crontab for testuser")
+
+    installed = install_cron_entry("0 7 * * * run", crontab_runner=fake)
+
+    assert installed is True
+    assert fake.stored == f"0 7 * * * run {_ORBIT_CRON_MARKER}\n"
+
+
+def test_install_cron_entry_fails_soft_when_crontab_binary_missing(capsys: pytest.CaptureFixture[str]) -> None:
+    """A missing/unspawnable ``crontab`` binary must fail SOFT: return False + log the failure.
+
+    WHY: a sandboxed or CI environment may have no ``crontab`` at all. Setup must still
+    complete (the caller falls back to printing the entry), so install returns False rather
+    than raising, and logs an actionable ``setup_cron_install_failed`` for the user.
+    """
+    fake = _FakeCrontab(raise_on=FileNotFoundError("crontab: command not found"))
+
+    installed = install_cron_entry("0 7 * * * run", crontab_runner=fake)
+
+    assert installed is False
+    assert "setup_cron_install_failed" in capsys.readouterr().out
+
+
+def test_install_cron_entry_fails_soft_on_unreadable_crontab_without_clobbering(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A genuine (non "no crontab") read error must fail soft AND never write a new crontab.
+
+    WHY: if ``crontab -l`` fails for a real reason (e.g. permissions) we do NOT know the
+    current crontab, so piping a fresh one would clobber the user's existing jobs. The
+    function must refuse to write and fall back — return False, write nothing, log why.
+    """
+    fake = _FakeCrontab(stored="", read_returncode=1, read_stderr="crontab: permission denied")
+
+    installed = install_cron_entry("0 7 * * * run", crontab_runner=fake)
+
+    assert installed is False
+    assert fake.writes == []  # never overwrote the crontab we couldn't read
+    assert "setup_cron_install_failed" in capsys.readouterr().out
+
+
+def test_wizard_installs_single_marker_line_at_fixed_schedule(tmp_path: Path) -> None:
+    """End-to-end: the wizard installs exactly one marker-tagged 7am Orbit crontab line.
+
+    WHY: this is the phase DoD — a scripted wizard run must auto-install (via the injected
+    runner) exactly one ``0 7 * * *`` marker-tagged line, and the written config must carry
+    that same fixed schedule. Proves the install path is wired into step 5 and the schedule
+    is the fixed default, not something the user typed.
+    """
+    config_path = tmp_path / "orbit.config.json"
+    fake = _FakeCrontab(stored="")
+
+    # cookie, confirm cat, prioritize (no), html, imessage (blank) — no schedule prompt.
+    answers = ["chrome", "y", "n", "~/orbit/out/today.html", ""]
+
+    exit_code = run_setup_wizard(
+        config_path=config_path,
+        repo_path=tmp_path,
+        youtube_loader=MagicMock(return_value=[Subscription(channel_id="UC_x", display_name="X Chan")]),
+        x_loader=MagicMock(return_value=[]),
+        llm_classifier=_signal_classifier(),
+        input_fn=_scripted_input(answers),
+        store_module=_fake_store(),
+        crontab_runner=fake,
+    )
+
+    assert exit_code == 0
+    assert fake.stored.count(_ORBIT_CRON_MARKER) == 1  # exactly one Orbit line installed
+    assert fake.stored.startswith("0 7 * * * ")  # the fixed 7am schedule
+    assert load_config(config_path).schedule == "0 7 * * *"  # config carries it too
+
+
+def test_wizard_no_longer_prompts_for_a_schedule(tmp_path: Path) -> None:
+    """The wizard must NOT ask the user for a schedule anymore (fixed 7am decision).
+
+    WHY: the 2026-07-06 ruling made the schedule a fixed local-auto-cron default, not a
+    config knob. If a schedule prompt survived, a user could still set a non-7am schedule,
+    contradicting the decision. We assert no prompt mentions schedule/cron, and the config
+    still carries the fixed default.
+    """
+    config_path = tmp_path / "orbit.config.json"
+    input_mock = _scripted_input(["chrome", "y", "n", "~/orbit/out/today.html", ""])
+
+    run_setup_wizard(
+        config_path=config_path,
+        repo_path=tmp_path,
+        youtube_loader=MagicMock(return_value=[Subscription(channel_id="UC_x", display_name="X Chan")]),
+        x_loader=MagicMock(return_value=[]),
+        llm_classifier=_signal_classifier(),
+        input_fn=input_mock,
+        store_module=_fake_store(),
+        crontab_runner=_FakeCrontab(),
+    )
+
+    prompt_texts = [call.args[0].lower() for call in input_mock.call_args_list]
+    assert not any("schedule" in text or "cron" in text for text in prompt_texts), (
+        f"the wizard must not prompt for a schedule anymore; prompts were: {prompt_texts}"
+    )
+    assert load_config(config_path).schedule == "0 7 * * *"
+
+
+def test_wizard_falls_back_to_printed_entry_when_crontab_write_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A failing ``crontab`` write must degrade to printing the entry — setup still succeeds.
+
+    WHY: a sandboxed/CI run where the crontab write fails must not abort onboarding. The
+    wizard completes (exit 0), logs the failure, and prints the manual `crontab -e` fallback
+    with the exact 7am line so the user can paste it themselves.
+    """
+    config_path = tmp_path / "orbit.config.json"
+    fake = _FakeCrontab(write_returncode=1)
+
+    answers = ["chrome", "y", "n", "~/orbit/out/today.html", ""]
+
+    exit_code = run_setup_wizard(
+        config_path=config_path,
+        repo_path=tmp_path,
+        youtube_loader=MagicMock(return_value=[Subscription(channel_id="UC_x", display_name="X Chan")]),
+        x_loader=MagicMock(return_value=[]),
+        llm_classifier=_signal_classifier(),
+        input_fn=_scripted_input(answers),
+        store_module=_fake_store(),
+        crontab_runner=fake,
+    )
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "setup_cron_install_failed" in output  # the failure was surfaced, not hidden
+    assert "crontab -e" in output  # the manual fallback instruction
+    assert "0 7 * * *" in output  # the exact entry to paste

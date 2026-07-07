@@ -143,6 +143,70 @@ def test_summarize_items_unparseable_json_degrades_to_empty_map() -> None:
     assert blurbs == {}
 
 
+class _FakeChapter:
+    """A minimal Chapter stand-in exposing the ``title`` the outline builder reads."""
+
+    def __init__(self, title: str) -> None:
+        self.title = title
+
+
+class _FakeChapteredRankable(_FakeRankable):
+    """A RankableItem stand-in that also carries a chapter list (the grounding source)."""
+
+    def __init__(self, item_external_id: str, title: str, chapter_titles: list[str]) -> None:
+        super().__init__(item_external_id, title)
+        self.chapters = [_FakeChapter(chapter_title) for chapter_title in chapter_titles]
+
+
+def test_summarize_items_prompt_carries_chapter_outline_and_truncates() -> None:
+    """The blurb prompt threads each item's chapter outline and truncates a long one.
+
+    WHY (Rule 9): blurbs must be GROUNDED in the item's real chapter content, not
+    invented — transcripts are dropped after chapterize, so the chapter titles are the
+    only grounding the model gets. The prompt must therefore carry a chapter-outline
+    column AND cap it (Rule 6 token discipline): a runaway outline can't be allowed to
+    blow the single-call budget. A regression that stopped threading the outline (blurbs
+    ungrounded) or stopped truncating (budget blown) fails here.
+    """
+    long_chapter_titles = [f"Chapter {n} " + "x" * 40 for n in range(12)]
+    item = _FakeChapteredRankable("abc", "The long talk", long_chapter_titles)
+    captured_prompt: dict[str, str] = {}
+
+    def _capture(prompt: str) -> str:
+        captured_prompt["value"] = prompt
+        return '{"abc": "A grounded blurb."}'
+
+    summarize.summarize_items([item], llm_call=_capture)
+
+    prompt = captured_prompt["value"]
+    # The chapter-outline column is described in the prompt AND grounded in real titles.
+    assert "chapter outline" in prompt
+    assert "Chapter 0" in prompt
+    # Truncated: neither the beyond-first-6 chapters nor the char tail survive (Rule 6).
+    assert "Chapter 11" not in prompt
+
+
+def test_summarize_items_chapterless_item_gets_empty_outline_column() -> None:
+    """A chapterless item threads an EMPTY outline column, never a fabricated one.
+
+    WHY (Rule 12): X tweets and short YouTube items have no chapters. Their prompt line
+    must carry an empty 4th column so the model grounds the blurb in the title alone —
+    inventing chapter content would be fabrication. We assert the item's line ends with a
+    trailing tab (empty outline), not invented text.
+    """
+    item = _FakeRankable("bare", "A tweet-length take")  # no ``chapters`` attribute
+    captured_prompt: dict[str, str] = {}
+
+    def _capture(prompt: str) -> str:
+        captured_prompt["value"] = prompt
+        return '{"bare": "ok"}'
+
+    summarize.summarize_items([item], llm_call=_capture)
+
+    # The item's tab-separated line carries an empty 4th column (ends with the tab).
+    assert "bare\tSome Channel\tA tweet-length take\t" in captured_prompt["value"]
+
+
 def test_summarize_items_supports_monkeypatched_module_boundary(monkeypatch) -> None:
     """The default boundary is resolved at call time, so a module patch reaches the seam.
 

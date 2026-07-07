@@ -91,12 +91,12 @@ def _chapter(title: str, start_seconds: float, video_id: str) -> Chapter:
 def test_chapterized_hero_chapter_content_and_deep_link_survive_to_html() -> None:
     """A Hero tile surfaces its chapter content + the whole-item deep-link (DoD #1).
 
-    WHY: the Tiles layout shows chapter key-points as ``.kp`` chip rows and surfaces the
-    whole-video deep-link via the tile title + the "+ N more chapters" overflow link
-    (the design does not per-chapter-link every row). This asserts the FULL path — the
-    chapter timestamps/text reach the tile AND a clickable, correctly-built whole-item
-    deep-link survives (escaped & -> &amp;). A dropped chapter list, a wrong timestamp
-    chip, or an over-escaped href would fail here, not silently degrade the feature.
+    WHY: the Tiles layout shows chapter key-points as ``.kp`` chip rows — each chip now a
+    clickable ``<a>`` into its own moment — and surfaces the whole-video deep-link via the
+    tile title + the "+ N more chapters" overflow link. This asserts the FULL path — the
+    chapter timestamps/text reach the tile as clickable chips AND a correctly-built
+    whole-item deep-link survives (escaped & -> &amp;). A dropped chapter list, a wrong
+    timestamp chip, or an over-escaped href would fail here, not silently degrade it.
     """
     chapters = [_chapter(f"Ch{n}", float(n * 60), "vidHERO") for n in range(6)]
     chapters[2] = _chapter("The point", 120.0, "vidHERO")
@@ -104,9 +104,9 @@ def test_chapterized_hero_chapter_content_and_deep_link_survive_to_html() -> Non
 
     output_html = render.render_digest_html(tiered, inline_image=lambda url: None)
 
-    # Chapter content reaches the tile as chip + text.
+    # Chapter content reaches the tile as a clickable chip (into its own offset) + text.
     assert "The point" in output_html
-    assert '<span class="chip">2:00</span>' in output_html
+    assert '<a class="chip" href="https://www.youtube.com/watch?v=vidHERO&amp;t=120s">2:00</a>' in output_html
     # Six chapters, four shown -> the "+ 2 more chapters" overflow link to the whole item.
     assert "+ 2 more chapters" in output_html
     # The whole-item deep-link survives as a real escaped href (title + more-chapters link).
@@ -244,6 +244,86 @@ def test_hero_without_chapters_renders_card_without_chapter_list() -> None:
     assert 'class="kp"' not in output_html
 
 
+# === Phase 8 / Sub-phase 1: clickable timestamps + first-chapter card links ===
+
+
+def test_chapter_chip_with_deep_link_renders_clickable_anchor() -> None:
+    """A chapter chip carrying a safe deep-link renders as a clickable ``<a>`` (DoD).
+
+    WHY (Rule 9): the whole product bet is landing the reader ON the moment. A chapter
+    with a real ``watch?v=ID&t=Ns`` deep-link must become an ``<a class="chip">`` whose
+    href is the escaped URL — not an inert ``<span>``. A regression that dropped the
+    anchor (back to a span) silently kills the headline feature; this fails then.
+    """
+    tiered = [_tiered("vidLINK", TIER_HERO, chapters=[_chapter("The reveal", 90.0, "vidLINK")])]
+    output_html = render.render_digest_html(tiered, inline_image=lambda url: None)
+
+    assert '<a class="chip" href="https://www.youtube.com/watch?v=vidLINK&amp;t=90s">1:30</a>' in output_html
+
+
+def test_chapter_chip_without_url_degrades_to_inert_span() -> None:
+    """A chapter with NO deep-link keeps today's inert ``<span>`` chip (degrade, don't break).
+
+    WHY (Rule 12): a chapter can lack a deep-link (a bad/empty offset upstream). The chip
+    must still render its timestamp as an inert ``<span class="chip">`` — never an
+    ``<a href="">`` empty-link affordance. A regression that always emitted an anchor
+    would ship dangling empty hrefs.
+    """
+    chapterless_link = Chapter(title="No link", start_seconds=30.0, deep_link="")
+    tiered = [_tiered("vidNoUrl", TIER_HERO, chapters=[chapterless_link])]
+    output_html = render.render_digest_html(tiered, inline_image=lambda url: None)
+
+    assert '<span class="chip">0:30</span>' in output_html
+    assert '<a class="chip"' not in output_html  # no chapter anchor emitted at all
+    assert 'href=""' not in output_html  # never an empty-href affordance
+
+
+def test_chapter_chip_with_javascript_url_is_neutralized_to_span() -> None:
+    """A ``javascript:`` chapter deep-link is neutralized to the inert span form (XSS guard).
+
+    WHY: chapter deep-links can be attacker-influenced text. An unsafe scheme must NOT
+    become a clickable ``<a href="javascript:...">`` — the chip degrades to the inert
+    ``<span>`` form (the allowlist rejects the scheme). A regression here is a stored-XSS
+    hole in a file the user opens in their browser.
+    """
+    evil_link = Chapter(title="Evil", start_seconds=10.0, deep_link="javascript:alert(1)")
+    tiered = [_tiered("vidJs", TIER_HERO, chapters=[evil_link])]
+    output_html = render.render_digest_html(tiered, inline_image=lambda url: None)
+
+    assert '<span class="chip">0:10</span>' in output_html
+    assert "javascript:alert" not in output_html
+    assert '<a class="chip"' not in output_html
+
+
+def test_card_link_lands_on_first_chapter_offset_when_chaptered() -> None:
+    """A chaptered item's card link lands on its FIRST chapter offset, not the video start (DoD).
+
+    WHY (Rule 9): clicking a card should drop the reader where the content actually
+    starts, not at ``t=0s`` intros/sponsor reads. The card title link must carry the
+    first chapter's ``watch?v=ID&t=Ns`` offset. A regression back to the hardcoded
+    ``&t=0s`` fallback would land every click on the video's cold open.
+    """
+    tiered = [_tiered("vidCh", TIER_HERO, chapters=[_chapter("Start", 45.0, "vidCh")])]
+    output_html = render.render_digest_html(tiered, inline_image=lambda url: None)
+
+    assert 'href="https://www.youtube.com/watch?v=vidCh&amp;t=45s"' in output_html
+    assert "watch?v=vidCh&amp;t=0s" not in output_html  # NOT the cold-open fallback
+
+
+def test_card_link_falls_back_to_video_start_when_chapterless() -> None:
+    """A chapterless item's card link keeps the ``&t=0s`` whole-video fallback (DoD).
+
+    WHY: not every item has chapters (short videos, no transcript). Those must still be
+    clickable to their source at the video start — the fallback is preserved, not
+    dropped. A regression that produced a broken/empty href on chapterless items would
+    make those cards un-openable.
+    """
+    tiered = [_tiered("vidBare", TIER_HERO, chapters=[])]
+    output_html = render.render_digest_html(tiered, inline_image=lambda url: None)
+
+    assert 'href="https://www.youtube.com/watch?v=vidBare&amp;t=0s"' in output_html
+
+
 from lib.density import TIER_COMPACT  # noqa: E402
 
 
@@ -309,7 +389,9 @@ def test_oversized_digest_spills_low_tiers_to_page_two() -> None:
     # Page 1 carries the footer page-2 link; Hero + Standard stayed on page 1.
     assert "Full archive · page 2" in page1
     assert "HEROID" in page1_body
-    assert "watch?v=HEROID&amp;t=0s" in page1_body  # the hero's whole-item deep-link survives on page 1
+    # The hero's whole-item deep-link survives on page 1 — and now lands on its first
+    # chapter's offset (90s), not the video start (the clickable-timestamp change).
+    assert "watch?v=HEROID&amp;t=90s" in page1_body
     assert "STDID" in page1_body
 
     # The Hero must NOT have leaked onto page 2 (spill-the-low-tiers, not arbitrary).

@@ -38,7 +38,7 @@ from lib.external_trending import (  # noqa: E402
     detect_scoops,
     tag_external_corroboration,
 )
-from lib.rerank import RankableItem, derank_items  # noqa: E402
+from lib.rerank import RankableItem, cap_x_items, derank_items  # noqa: E402
 from lib.setup_wizard import run_setup_wizard  # noqa: E402
 from lib.summarize import summarize_items, synthesize_verdict  # noqa: E402
 from lib.trending import TrendingItem, compute_internal_trending  # noqa: E402
@@ -57,6 +57,10 @@ from lib.chapterize import (  # noqa: E402
     LONG_FORM_THRESHOLD_SECONDS,
     _default_chapter_segmenter,
     chapterize_episode,
+)
+from lib.stage1_youtube import (  # noqa: E402
+    _select_recent_uploads,
+    drop_short_form_uploads,
 )
 
 # Weekly-cache window (brief §3 Stage 0): sources are re-loaded at most once per
@@ -381,6 +385,7 @@ def run_stage1_build_x_items(
 
     rankable_items: list[RankableItem] = []
     dropped_noise_count = 0
+    category_dropped_count = 0
     for tweet in new_tweets:
         channel_category = category_by_handle.get(tweet.handle, "signal")
         try:
@@ -411,6 +416,14 @@ def run_stage1_build_x_items(
         if classification.axis_a_signal == 0:
             dropped_noise_count += 1
             continue
+        # Category gate (2026-07-06 taxonomy ruling): drop items outside the fixed
+        # taxonomy (category == "other") outright, same as the YouTube half — a shared
+        # classify path, so a shared drop rule. A missing/garbled category defaults to a
+        # keep sentinel in classify.py (never "other"), so a prompt regression can't
+        # silently empty the digest (Rule 12).
+        if classification.category == "other":
+            category_dropped_count += 1
+            continue
         rankable_items.append(
             RankableItem.from_tweet(tweet, classification, creator_external_id=tweet.handle)
         )
@@ -422,62 +435,9 @@ def run_stage1_build_x_items(
         tweet_count=len(new_tweets),
         rankable_count=len(rankable_items),
         dropped_noise_count=dropped_noise_count,
+        category_dropped_count=category_dropped_count,
     )
     return rankable_items
-
-
-def _select_recent_uploads(
-    uploads: list[Upload],
-    *,
-    recency_cutoff: str,
-    per_channel_cap: int,
-) -> list[Upload]:
-    """Keep a channel's recent uploads, newest first, capped to ``per_channel_cap``.
-
-    Bounds the cold-DB first run (where the delta engine marks an entire back-catalogue
-    "new"): only uploads with an ``upload_date`` (``YYYYMMDD``) on/after ``recency_cutoff``
-    survive, sorted newest-first, then truncated to the cap. ``YYYYMMDD`` strings compare
-    lexically == chronologically.
-
-    Positional fallback (fail loud): if the channel returns NO dated uploads at all
-    (yt-dlp's flat listing occasionally omits dates even with ``approximate_date``), we
-    can't drop the whole channel — that is exactly the YouTube-dropout bug. Instead we take
-    the newest ``per_channel_cap`` uploads by feed order (the channel ``/videos`` listing is
-    newest-first, and ``fetch_new_uploads`` preserves that order) and log a warning. When at
-    least one dated upload exists we trust the dates and never fall back.
-
-    Args:
-        uploads: The channel's new (unseen) uploads from the delta engine, in feed order.
-        recency_cutoff: Inclusive lower bound as a ``YYYYMMDD`` string.
-        per_channel_cap: Max uploads to return for this channel.
-
-    Returns:
-        The newest in-window uploads, at most ``per_channel_cap`` of them.
-
-    Example:
-        >>> _select_recent_uploads(uploads, recency_cutoff="20260620", per_channel_cap=5)
-        [<newest>, ...]
-    """
-    dated = [upload for upload in uploads if upload.upload_date]
-    if not dated and uploads:
-        # Reason: zero dates for a non-empty channel means we cannot place any upload in
-        # time. Rather than silently dropping the channel (the dropout bug), fall back to
-        # newest-by-feed-order and surface it loudly (Rule 12).
-        log.log_warning(
-            "youtube_stage1_upload_dates_missing",
-            channel_name=uploads[0].channel_name,
-            upload_count=len(uploads),
-            per_channel_cap=per_channel_cap,
-            fix_suggestion=(
-                "yt-dlp returned no upload_date for this channel even with "
-                "youtubetab:approximate_date; using newest-by-feed-order fallback. If this "
-                "recurs widely, check the yt-dlp version / extractor args."
-            ),
-        )
-        return uploads[:per_channel_cap]
-    recent = [upload for upload in dated if upload.upload_date >= recency_cutoff]
-    recent.sort(key=lambda upload: upload.upload_date, reverse=True)
-    return recent[:per_channel_cap]
 
 
 def run_stage1_build_youtube_items(
@@ -550,6 +510,8 @@ def run_stage1_build_youtube_items(
     transcripts_fetched = 0
     total_new_uploads = 0
     classified_count = 0
+    short_form_dropped_count = 0
+    category_dropped_count = 0
 
     # Recency cutoff (YYYYMMDD) — only uploads on/after this date are eligible. Bounds a
     # cold-DB first run to genuinely-recent items instead of whole back-catalogues.
@@ -604,8 +566,13 @@ def run_stage1_build_youtube_items(
             recency_cutoff=recency_cutoff,
             per_channel_cap=_STAGE1_MAX_UPLOADS_PER_CHANNEL,
         )
+        # Long-form floor (2026-07-06 ruling): drop known-short clips BEFORE the classify
+        # call so the LLM budget is only ever spent on long-form candidates. A missing
+        # duration is kept (fail-open) — see drop_short_form_uploads.
+        long_form_uploads, short_form_dropped = drop_short_form_uploads(recent_uploads)
+        short_form_dropped_count += short_form_dropped
         remaining_budget = _STAGE1_MAX_CLASSIFIED_UPLOADS - classified_count
-        for upload in recent_uploads[:remaining_budget]:
+        for upload in long_form_uploads[:remaining_budget]:
             classified_count += 1
             try:
                 classification = classify.classify_item(
@@ -629,6 +596,16 @@ def run_stage1_build_youtube_items(
                     ),
                     error_message=str(exc),
                 )
+                continue
+
+            # Category gate (2026-07-06 taxonomy ruling): an item the classifier placed
+            # outside the user's world (category == "other") is dropped outright, mirroring
+            # the X alpha gate. A missing/garbled category defaults to a keep sentinel in
+            # classify.py (never "other"), so a prompt regression can't silently empty the
+            # digest (Rule 12). This upload is left UNSEEN (mark_seen not reached) so a later
+            # prompt fix reconsiders it.
+            if classification.category == "other":
+                category_dropped_count += 1
                 continue
 
             # Only a long-form upload WITHOUT creator chapters needs a transcript (the LLM
@@ -679,6 +656,8 @@ def run_stage1_build_youtube_items(
         classified_count=classified_count,
         transcripts_fetched=transcripts_fetched,
         rankable_count=len(rankable_items),
+        short_form_dropped_count=short_form_dropped_count,
+        category_dropped_count=category_dropped_count,
     )
     return rankable_items
 
@@ -772,24 +751,24 @@ def run_stage6_rank_and_tier(
 ) -> list[TieredItem]:
     """Stage 6: score the rankable items, then sort them into density tiers.
 
-    Pure delegation to ``lib.rerank.derank_items`` (weighted score, descending) then
-    ``lib.density.assign_density_tiers`` (rank -> hero/standard/compact/index). Rank
-    controls density, NEVER inclusion — ``len(out) == len(items)``; nothing dropped.
-    No LLM (Rule 5 — deterministic math in lib/); orbit.py stays wiring-only.
+    Pure delegation to ``lib.rerank.derank_items`` (weighted score, descending), the X-half
+    top-N cap (``lib.rerank.cap_x_items`` — Phase 8 Sub-phase 3: at most
+    :data:`lib.rerank.X_DIGEST_TWEET_CAP` tweets survive, YouTube never capped, run BEFORE
+    tiering so tiering keeps its ``len(out) == len(items)`` invariant for what it receives),
+    then ``lib.density.assign_density_tiers``. No LLM; orbit.py stays wiring-only (Rule 5).
 
     Args:
         items: The :class:`RankableItem`s from the (upstream) classify/chapterize half.
         config: The loaded :class:`OrbitConfig` (supplies ``creator_weights``).
-        trending_multipliers: OPTIONAL ``item_external_id`` -> trending/scoop multiplier
-            map from Stage 5 (M3). None (the M1/M2 path) leaves every multiplier neutral,
-            so ranking is byte-for-byte unchanged.
+        trending_multipliers: OPTIONAL Stage-5 (M3) multiplier map; None leaves it neutral.
 
     Returns:
-        The tiered, rank-ordered items ready for the renderer.
+        The tiered, rank-ordered items ready for the renderer (YouTube in full, X capped).
     """
     scored_items = derank_items(items, config, trending_multipliers=trending_multipliers)
-    tiered_items = assign_density_tiers(scored_items)
-    log.log_info("rank_and_tier_completed", item_count=len(tiered_items))
+    capped_items, x_cap_dropped_count = cap_x_items(scored_items)
+    tiered_items = assign_density_tiers(capped_items)
+    log.log_info("rank_and_tier_completed", item_count=len(tiered_items), x_cap_dropped_count=x_cap_dropped_count)
     return tiered_items
 
 

@@ -135,6 +135,9 @@ class Tweet:
         retweet_count: Retweet count, or None if absent.
         reply_count: Reply count, or None if absent.
         quote_count: Quote count, or None if absent.
+        is_quote: True when this tweet QUOTES another tweet (the vendored CLI attaches a
+            ``quotedTweet`` object at ``quoteDepth`` 1). Downstream ranking down-weights a
+            quote of someone else's take relative to an original. Defaults False.
     """
 
     text: str
@@ -145,6 +148,7 @@ class Tweet:
     retweet_count: Optional[int] = None
     reply_count: Optional[int] = None
     quote_count: Optional[int] = None
+    is_quote: bool = False
 
 
 def set_credentials(auth_token: Optional[str], ct0: Optional[str]) -> None:
@@ -495,6 +499,34 @@ def _first_present(*values: Any) -> Any:
     return None
 
 
+def _detect_is_quote(entry: Dict[str, Any]) -> bool:
+    """Decide whether a parsed tweet entry QUOTES another tweet.
+
+    The vendored bird-search CLI builds each tweet via ``mapTweetResult`` with a
+    ``quotedTweet`` object attached when the source tweet has a ``quoted_status_result``
+    and the client's ``quoteDepth`` is > 0 (its default is 1). ``JSON.stringify`` omits
+    the key entirely for a non-quote tweet, so presence of a truthy quote marker is the
+    signal. We read tolerantly across the CLI's ``quotedTweet`` shape and the raw-API
+    ``quoted_status`` / ``quoted_status_id`` / ``isQuote`` variants so a payload-shape
+    change degrades to "not a quote" rather than crashing (Rule 12), never a false True.
+
+    Args:
+        entry: One parsed tweet dict from the CLI payload.
+
+    Returns:
+        True when a quote marker is present and truthy, else False.
+    """
+    quote_marker = _first_present(
+        entry.get("quotedTweet"),
+        entry.get("quoted_status"),
+        entry.get("quoted_status_result"),
+        entry.get("quoted_status_id"),
+        entry.get("quoted_status_id_str"),
+        entry.get("isQuote"),
+    )
+    return bool(quote_marker)
+
+
 def _coerce_optional_int(value: Any) -> Optional[int]:
     """Coerce a raw engagement value to ``int``, returning None when not coercible.
 
@@ -607,6 +639,7 @@ def _parse_tweets(parsed: Any, handle: str) -> List[Tweet]:
                 quote_count=_coerce_optional_int(
                     _first_present(entry.get("quoteCount"), entry.get("quote_count"))
                 ),
+                is_quote=_detect_is_quote(entry),
             )
         )
     return tweets

@@ -1,10 +1,14 @@
 """Two-axis item classification with a channel prior (Phase 2 / Stage 2).
 
-Each feed item is judged on two independent binary axes:
+Each feed item is judged on two independent binary axes plus a fixed-taxonomy category:
 
   - **Axis A — signal/noise** (``axis_a_signal``): 1 = substantive signal, 0 = noise.
   - **Axis B — on/off-topic** (``axis_b_on_topic``): 1 = matches the user's interests,
     0 = off-topic.
+  - **Category** (``category``, Phase 8): one of the fixed taxonomy
+    ``{ai, business, tech, sports, other}``. Stage 1 (orbit.py) drops ``"other"`` items
+    outright; a missing/garbled category fails OPEN to a keep-sentinel (never "other"),
+    so a prompt regression can't silently empty the digest.
 
 The ONLY model use here (Rule 5) is the judgment call: render a prompt and ask the
 host LLM for a strict-JSON verdict. Everything else is deterministic code — the
@@ -59,6 +63,19 @@ _NO_INTERESTS_PLACEHOLDER: str = "(no interests stated yet — treat the item as
 # bury an item on a parse failure.
 _AXIS_B_PRIOR_DEFAULT: int = 1
 
+# The FIXED category taxonomy (2026-07-06 ruling): a third classify axis. Stage 1 drops
+# items whose category is "other" outright (the taxonomy-gate, in orbit.py). The five
+# values are the ONLY valid ones — the model must pick one.
+_CATEGORY_TAXONOMY: tuple[str, ...] = ("ai", "business", "tech", "sports", "other")
+
+# Fallback category when the model omits/garbles it. Deliberately OUTSIDE the taxonomy so
+# it is distinguishable AND passes the gate (only "other" drops). Fail-open: a missing
+# category must default to KEEP, never to "other" (which would drop the item) — a prompt
+# regression must never silently empty the digest (Rule 12). Also the default for the
+# dataclass field, so the user-override short-circuit (which never re-asks the model) can
+# never be dropped by the category gate.
+_CATEGORY_KEEP_ON_PARSE_FAILURE: str = "unknown"
+
 
 @dataclass
 class Classification:
@@ -69,12 +86,17 @@ class Classification:
         axis_a_signal: 1 = signal, 0 = noise.
         axis_b_on_topic: 1 = on-topic, 0 = off-topic.
         is_user_override: 1 if the user corrected this item (sacred — never re-classified).
+        category: The third axis — one of the fixed taxonomy
+            ``{ai, business, tech, sports, other}``, or the keep-sentinel
+            ``"unknown"`` when the model omitted/garbled it. Stage 1 drops ``"other"``
+            outright; every other value (including the sentinel) is kept.
     """
 
     item_external_id: str
     axis_a_signal: int
     axis_b_on_topic: int
     is_user_override: int
+    category: str = _CATEGORY_KEEP_ON_PARSE_FAILURE
 
     @property
     def is_also_posted(self) -> bool:
@@ -209,7 +231,28 @@ def _coerce_axis(raw_value: Any) -> Optional[int]:
     return None
 
 
-def _parse_verdict(raw: str, channel_category: str) -> tuple[int, int]:
+def _coerce_category(raw_value: Any) -> Optional[str]:
+    """Coerce a raw category value to a taxonomy member, or None if it is not one.
+
+    Case-insensitive and whitespace-tolerant. Only the five fixed taxonomy values
+    (:data:`_CATEGORY_TAXONOMY`) are accepted; anything else (missing key, empty string,
+    an off-taxonomy label the model invented) yields None so the caller can fail-open to
+    the keep-sentinel rather than trust a fabricated label.
+
+    Args:
+        raw_value: The value pulled from the parsed JSON verdict.
+
+    Returns:
+        The normalized taxonomy category, or None when the value is not a clean member.
+    """
+    if isinstance(raw_value, str):
+        normalized = raw_value.strip().lower()
+        if normalized in _CATEGORY_TAXONOMY:
+            return normalized
+    return None
+
+
+def _parse_verdict(raw: str, channel_category: str) -> tuple[int, int, str]:
     """Parse the strict-JSON verdict; fall back to the channel prior on any failure.
 
     On malformed JSON, a non-object payload, or missing/uncoercible axis keys, this
@@ -218,12 +261,19 @@ def _parse_verdict(raw: str, channel_category: str) -> tuple[int, int]:
     ``classify_verdict_unparseable`` warning — it NEVER crashes (a flaky model line must
     not lose the whole classify run).
 
+    The third axis (``category``) is fail-open to KEEP: a missing/garbled category
+    defaults to :data:`_CATEGORY_KEEP_ON_PARSE_FAILURE` (outside the taxonomy, so it
+    passes the Stage-1 gate) and logs ``classify_category_unparseable`` — never to
+    "other", which would DROP the item and let a prompt regression silently empty the
+    digest (Rule 12).
+
     Args:
         raw: The model's raw response string.
         channel_category: The channel-level Axis-A prior used as the fallback seed.
 
     Returns:
-        A ``(axis_a_signal, axis_b_on_topic)`` tuple of 0/1 ints.
+        A ``(axis_a_signal, axis_b_on_topic, category)`` tuple: two 0/1 ints plus the
+        taxonomy category (or the keep-sentinel).
     """
     prior_axis_a = 1 if channel_category == "signal" else 0
     try:
@@ -238,10 +288,11 @@ def _parse_verdict(raw: str, channel_category: str) -> tuple[int, int]:
             channel_category=channel_category,
             fix_suggestion=(
                 "model did not return a strict JSON object; seeded Axis A from the "
-                "channel prior. Tune references/classify.md's output contract if frequent."
+                "channel prior and the category from the keep-sentinel (item kept, not "
+                "dropped). Tune references/classify.md's output contract if frequent."
             ),
         )
-        return prior_axis_a, _AXIS_B_PRIOR_DEFAULT
+        return prior_axis_a, _AXIS_B_PRIOR_DEFAULT, _CATEGORY_KEEP_ON_PARSE_FAILURE
 
     axis_a = _coerce_axis(parsed.get("axis_a_signal"))
     axis_b = _coerce_axis(parsed.get("axis_b_on_topic"))
@@ -259,7 +310,20 @@ def _parse_verdict(raw: str, channel_category: str) -> tuple[int, int]:
         axis_a = prior_axis_a if axis_a is None else axis_a
         axis_b = _AXIS_B_PRIOR_DEFAULT if axis_b is None else axis_b
 
-    return axis_a, axis_b
+    category = _coerce_category(parsed.get("category"))
+    if category is None:
+        log.log_warning(
+            "classify_category_unparseable",
+            channel_category=channel_category,
+            fix_suggestion=(
+                "model JSON lacked a category in {ai, business, tech, sports, other}; "
+                "defaulted to KEEP (the item is NOT dropped) so a prompt regression can't "
+                "silently empty the digest. Tune references/classify.md if frequent."
+            ),
+        )
+        category = _CATEGORY_KEEP_ON_PARSE_FAILURE
+
+    return axis_a, axis_b, category
 
 
 def classify_item(
@@ -331,9 +395,10 @@ def classify_item(
     # 2. The model judgment call (the only model use here, Rule 5).
     prompt = _render_prompt(item, channel_category, interests)
     raw_verdict = llm_classifier(prompt)
-    axis_a_signal, axis_b_on_topic = _parse_verdict(raw_verdict, channel_category)
+    axis_a_signal, axis_b_on_topic, category = _parse_verdict(raw_verdict, channel_category)
 
-    # 3. Persist (deterministic) and return.
+    # 3. Persist (deterministic) and return. Category is NOT persisted — it is a Stage-1
+    # inclusion gate consumed from the returned Classification, not a stored axis.
     store_module.set_classification(
         item_external_id=item_external_id,
         axis_a_signal=axis_a_signal,
@@ -345,6 +410,7 @@ def classify_item(
         item_external_id=item_external_id,
         axis_a_signal=axis_a_signal,
         axis_b_on_topic=axis_b_on_topic,
+        category=category,
         channel_category=channel_category,
     )
     return Classification(
@@ -352,4 +418,5 @@ def classify_item(
         axis_a_signal=axis_a_signal,
         axis_b_on_topic=axis_b_on_topic,
         is_user_override=0,
+        category=category,
     )

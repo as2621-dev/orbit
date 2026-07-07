@@ -345,6 +345,176 @@ def test_from_parts_defaults_chapters_and_creator_id() -> None:
     assert item.creator_external_id == ""
 
 
+# --- Phase 8 Sub-phase 3 — X virality selection -----------------------------
+
+
+def _x_item(
+    item_external_id: str,
+    creator_external_id: str = "handle",
+    *,
+    view_count: int | None = None,
+    like_count: int | None = None,
+    comment_count: int | None = None,
+    quote_count: int | None = None,
+    is_quote: bool = False,
+    upload_date: str = "20260110",
+) -> RankableItem:
+    """Construct an X RankableItem fixture (card_url set so ``is_x_item`` recognizes it)."""
+    return RankableItem(
+        item_external_id=item_external_id,
+        title=f"tweet {item_external_id}",
+        channel_name=creator_external_id,
+        creator_external_id=creator_external_id,
+        view_count=view_count,
+        like_count=like_count,
+        comment_count=comment_count,
+        upload_date=upload_date,
+        card_url=f"https://x.com/{creator_external_id}/status/{item_external_id}",
+        quote_count=quote_count,
+        is_quote=is_quote,
+    )
+
+
+def test_from_tweet_carries_quote_count_and_is_quote() -> None:
+    """RankableItem.from_tweet maps ``quote_count`` and ``is_quote`` off the Tweet.
+
+    WHY: the quote signal is dropped on the floor before this sub-phase (from_tweet never
+    read quote_count, and is_quote did not exist). Ranking's discourse term and quote
+    down-weight depend on both surviving the tweet->item adapter. A regression that dropped
+    either would silently neuter the quote handling. We pass a quoting tweet and assert both.
+    """
+    tweet = SimpleNamespace(
+        tweet_id="123",
+        text="quoting a take",
+        handle="alice",
+        created_at="2026-06-18T00:00:00Z",
+        like_count=10,
+        retweet_count=5,
+        reply_count=2,
+        quote_count=7,
+        is_quote=True,
+    )
+
+    item = RankableItem.from_tweet(tweet)
+
+    assert item.quote_count == 7, "from_tweet must carry the quote_count into the blend"
+    assert item.is_quote is True, "from_tweet must carry the is_quote flag for the multiplier"
+
+
+def test_engagement_blend_rewards_quotes() -> None:
+    """An item WITH quotes blends higher than an otherwise-identical item WITHOUT.
+
+    WHY: quotes signal active discourse around a take, so they earn a positive engagement
+    term (ENGAGEMENT_QUOTE_WEIGHT). Two items identical except quote_count must NOT tie —
+    the quoted one scores higher. A regression that ignored quote_count would tie them.
+    """
+    with_quotes = _x_item("wq", view_count=100, like_count=50, comment_count=5, quote_count=40)
+    without_quotes = _x_item("nq", view_count=100, like_count=50, comment_count=5, quote_count=None)
+
+    assert rerank.engagement_blend(with_quotes) > rerank.engagement_blend(without_quotes), (
+        "quotes must add a positive term to the engagement blend"
+    )
+
+
+def test_quote_multiplier_ranks_quote_below_identical_original() -> None:
+    """A quote tweet ranks BELOW an otherwise-identical original (QUOTE_TWEET_MULTIPLIER).
+
+    WHY: a quote of someone else's take is derivative — Phase 8's ruling down-weights it so
+    the creator's OWN take floats above their quote of another. We build two X items
+    identical in every scored dimension (same creator, engagement, date) EXCEPT is_quote,
+    so the multiplier is the only differentiator. The original must sort first and score
+    strictly higher. A regression that dropped the multiplier would tie (and flip on the
+    id tiebreak).
+    """
+    config = _config()
+    original = _x_item("aaa_original", "handle", like_count=100, is_quote=False)
+    quote = _x_item("bbb_quote", "handle", like_count=100, is_quote=True)
+
+    ranked = rerank.derank_items([quote, original], config, reference_date=REFERENCE_DATE)
+    order = [scored.item.item_external_id for scored in ranked]
+    scores = {scored.item.item_external_id: scored.score for scored in ranked}
+
+    assert order[0] == "aaa_original", "the original take must rank above its quote"
+    assert scores["aaa_original"] > scores["bbb_quote"], "a quote must score strictly below the identical original"
+    # And the ratio is exactly the multiplier (both are otherwise identical).
+    assert abs(scores["bbb_quote"] - scores["aaa_original"] * rerank.QUOTE_TWEET_MULTIPLIER) < 1e-9
+
+
+def test_batch_percentile_top_is_one_monotone_and_single_item() -> None:
+    """The batch-engagement percentile tops out at 1.0, is monotone, and handles one item.
+
+    WHY: the absolute term lets a banger from a quiet account outrank a median post from a
+    loud one — it needs a well-formed percentile: the top engager is 1.0, higher engagement
+    never yields a LOWER percentile, and a lone item does not divide-by-zero. A regression in
+    any of these would mis-weight the absolute term or crash the single-tweet run.
+    """
+    low = _x_item("low", like_count=1)
+    mid = _x_item("mid", like_count=100)
+    high = _x_item("high", like_count=10_000)
+
+    percentiles = rerank.compute_batch_engagement_percentile([low, mid, high])
+
+    assert percentiles["high"] == 1.0, "the top engager tops the batch percentile"
+    assert percentiles["low"] <= percentiles["mid"] <= percentiles["high"], "percentile is monotone in engagement"
+
+    # A single-item batch is well-defined (1.0), not a ZeroDivisionError.
+    solo = rerank.compute_batch_engagement_percentile([_x_item("solo", like_count=5)])
+    assert solo == {"solo": 1.0}
+    # An empty batch is an empty map (no items, no percentiles).
+    assert rerank.compute_batch_engagement_percentile([]) == {}
+
+
+def test_x_cap_keeps_top_eight_and_drops_the_rest() -> None:
+    """Nine scored tweets collapse to exactly X_DIGEST_TWEET_CAP survivors; the rest are counted.
+
+    WHY: top-N virality selection supersedes density-not-inclusion for the X half — a noisy
+    follow list must not flood the digest. With 9 tweets and a cap of 8, exactly 8 survive
+    (the highest-scoring) and the drop count is 1. The survivors must be the TOP scorers, so
+    a regression that kept the wrong 8 (or dropped from the top) fails.
+    """
+    # Pre-sorted DESCENDING by score, as derank_items returns — scores 9.0 .. 1.0.
+    scored = [ScoredItem(item=_x_item(f"t{index}"), score=float(9 - index)) for index in range(9)]
+
+    kept, dropped = rerank.cap_x_items(scored)
+
+    assert dropped == 1, "9 tweets over a cap of 8 drops exactly 1"
+    assert len(kept) == rerank.X_DIGEST_TWEET_CAP == 8, "exactly the cap survives"
+    kept_ids = [scored_item.item.item_external_id for scored_item in kept]
+    assert kept_ids == [f"t{index}" for index in range(8)], "the TOP 8 scorers survive, the lowest is cut"
+
+
+def test_x_cap_untouched_when_at_or_below_cap() -> None:
+    """A batch of <= cap tweets is passed through whole (nothing dropped)."""
+    scored = [ScoredItem(item=_x_item(f"t{index}"), score=float(8 - index)) for index in range(8)]
+
+    kept, dropped = rerank.cap_x_items(scored)
+
+    assert dropped == 0, "a batch at the cap loses nothing"
+    assert len(kept) == 8
+
+
+def test_x_cap_never_drops_youtube_items() -> None:
+    """The X cap never touches YouTube items — only tweets are capped (YouTube count unaffected).
+
+    WHY: the density-not-inclusion contract still holds for YouTube (Key Decision 6 is
+    superseded for the X half ONLY, Rule 7). We mix 9 tweets with 2 YouTube items; the cap
+    trims tweets to 8 but must keep BOTH YouTube items, so the survivors are 10 with 1 drop.
+    """
+    yt = [
+        ScoredItem(item=_item(f"yt{index}", f"UC{index}", view_count=100), score=float(100 - index))
+        for index in range(2)
+    ]
+    tweets = [ScoredItem(item=_x_item(f"tw{index}"), score=float(9 - index)) for index in range(9)]
+
+    kept, dropped = rerank.cap_x_items(yt + tweets)
+
+    assert dropped == 1, "only the one over-cap tweet is dropped"
+    kept_yt = [scored_item.item.item_external_id for scored_item in kept if not rerank.is_x_item(scored_item.item)]
+    assert kept_yt == ["yt0", "yt1"], "both YouTube items survive — the cap is X-only"
+    kept_x_count = sum(1 for scored_item in kept if rerank.is_x_item(scored_item.item))
+    assert kept_x_count == 8, "tweets are capped to 8"
+
+
 def _run_all_standalone() -> int:
     """Run every ``test_*`` function in this module without pytest. Returns exit code."""
     test_functions = [

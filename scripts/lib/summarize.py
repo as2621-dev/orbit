@@ -53,6 +53,13 @@ _SUMMARIZE_PROMPT_PATH: Path = (_LIB_DIR.parent.parent / "references" / "summari
 # never trust it — any longer blurb is truncated defensively in code (Rule 12).
 MAX_BLURB_CHARS: int = 140
 
+# The chapter outline threaded into the blurb prompt as grounding (transcripts are NOT
+# retained past chapterize, so chapter titles are the grounding source). Capped so a
+# long outline never blows the single-call token budget (Rule 6): the first few titles
+# carry the item's shape; the char cap is the hard backstop.
+MAX_OUTLINE_CHAPTERS: int = 6
+MAX_OUTLINE_CHARS: int = 160
+
 # The injectable live-model boundary: a rendered prompt in, the model's raw text out —
 # identical to ``lib.classify.LlmClassifier`` / ``lib.chapterize.ChapterSegmenter``.
 LlmCaller = Callable[[str], str]
@@ -126,6 +133,42 @@ def _resolve_caller(llm_call: Optional[LlmCaller]) -> LlmCaller:
     return llm_call if llm_call is not None else call_claude_cli
 
 
+def _chapter_outline(item: Any) -> str:
+    """Build the item's chapter-title outline for the blurb prompt (grounding source).
+
+    Joins the first :data:`MAX_OUTLINE_CHAPTERS` chapter titles with ``" · "`` and hard-
+    caps the result at :data:`MAX_OUTLINE_CHARS` chars. Returns ``""`` for a chapterless
+    item (X tweets, short YouTube) so its prompt line simply carries an empty column. The
+    outline is the model's grounding material — transcripts are dropped after chapterize,
+    so these titles are what a blurb must be grounded in (never invented).
+
+    Args:
+        item: A :class:`lib.rerank.RankableItem`, or a dict exposing ``chapters`` (each
+            chapter is a :class:`lib.chapterize.Chapter` or a dict with ``title``).
+
+    Returns:
+        The joined, truncated chapter-title outline, or ``""`` if there are no chapters.
+
+    Example:
+        >>> class _C:
+        ...     def __init__(self, title): self.title = title
+        >>> class _I:
+        ...     chapters = [_C("Intro"), _C("The reveal")]
+        >>> _chapter_outline(_I())
+        'Intro · The reveal'
+    """
+    chapters = item.get("chapters") if isinstance(item, dict) else getattr(item, "chapters", None)
+    if not chapters:
+        return ""
+    titles: list[str] = []
+    for chapter in chapters[:MAX_OUTLINE_CHAPTERS]:
+        raw_title = chapter.get("title") if isinstance(chapter, dict) else getattr(chapter, "title", "")
+        title = (raw_title or "").strip()
+        if title:
+            titles.append(title)
+    return " · ".join(titles)[:MAX_OUTLINE_CHARS]
+
+
 def _truncate_blurb(blurb: str) -> str:
     """Clamp one blurb to :data:`MAX_BLURB_CHARS`, never trusting the model's length.
 
@@ -191,8 +234,10 @@ def summarize_items(items: list[Any], *, llm_call: Optional[LlmCaller] = None) -
         indexed_items[item_external_id] = item
         channel_name = _read_field(item, "channel_name")
         title = _read_field(item, "title")
-        # Tab-separated so the model parses id/channel/title cleanly even with commas.
-        block_lines.append(f"{item_external_id}\t{channel_name}\t{title}")
+        chapter_outline = _chapter_outline(item)
+        # Tab-separated so the model parses the columns cleanly even with commas. The 4th
+        # column is the chapter outline — the blurb's grounding source (empty when none).
+        block_lines.append(f"{item_external_id}\t{channel_name}\t{title}\t{chapter_outline}")
 
     if not indexed_items:
         return {}

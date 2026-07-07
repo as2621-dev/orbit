@@ -256,3 +256,25 @@ def test_parse_tweets_drops_retweet_prefixed_text() -> None:
     tweets = bird_x._parse_tweets(parsed, handle="alice")
 
     assert [tweet.tweet_id for tweet in tweets] == ["orig1"], "RT-prefixed dropped, original kept"
+
+
+def test_parse_tweets_flags_quote_tweets_from_quoted_tweet_marker() -> None:
+    """WHY: the vendored bird CLI attaches a ``quotedTweet`` object (its ``mapTweetResult`` at
+    ``quoteDepth`` 1) ONLY when a tweet quotes another tweet; ``JSON.stringify`` omits the key
+    otherwise. Ranking down-weights a quote of someone else's take, so ``is_quote`` must be True
+    for the quoting tweet and False for a plain one — a wrong flag would mis-rank discourse.
+    We put both shapes in ONE payload so the detector cannot pass by accidentally flagging all."""
+    parsed = [
+        {
+            "id": "q1",
+            "text": "quoting a hot take",
+            "author": {"username": "alice"},
+            "quotedTweet": {"id": "other99", "text": "the quoted original", "author": {"username": "bob"}},
+        },
+        {"id": "plain1", "text": "an original thought", "author": {"username": "alice"}},
+    ]
+
+    tweets = {tweet.tweet_id: tweet for tweet in bird_x._parse_tweets(parsed, handle="alice")}
+
+    assert tweets["q1"].is_quote is True, "a tweet carrying a quotedTweet object is a quote"
+    assert tweets["plain1"].is_quote is False, "a tweet with no quote marker is not a quote"

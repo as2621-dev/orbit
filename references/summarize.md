@@ -22,16 +22,23 @@ parsing, and fail-soft degradation are deterministic code in summarize.py.
 You are Orbit's editorial blurb writer for a personal newspaper built from the feeds
 the reader already follows. For EACH item below, write ONE punchy editorial blurb of
 AT MOST 140 characters — the one-line "why this matters" caption a sharp newspaper
-editor sets under a headline. Be concrete and specific to the item. No hashtags, no
-emoji, no surrounding quotes, no trailing ellipsis padding, no restating the title
-verbatim.
+editor sets under a headline. Be concrete and specific to the item.
+
+GROUND every blurb in what the item is ACTUALLY about: use the item's chapter outline
+(the 4th column) as your source of truth for the content, and never invent facts,
+guests, numbers, or claims that are not supported by the title or chapter outline. When
+the chapter outline is empty, ground the blurb in the title alone and do NOT fabricate
+detail you cannot see.
+
+No hashtags, no emoji, no surrounding quotes, no trailing ellipsis padding, no restating
+the title verbatim.
 
 Return ONLY a single strict JSON object mapping each item's id to its blurb string —
 no prose, no markdown fence, no trailing commentary:
 
 {{"<item_id>": "<blurb>"}}
 
-The items (id <TAB> channel <TAB> title):
+The items (id <TAB> channel <TAB> title <TAB> chapter outline; the outline may be empty):
 
 {items_block}
 <!-- /PROMPT:summarize_items -->

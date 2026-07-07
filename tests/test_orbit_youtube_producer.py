@@ -96,7 +96,9 @@ def test_youtube_producer_classifies_chapterizes_and_marks_seen(tmp_path: Path) 
         source_id = _fresh_store_with_channel(Path(tmp))
 
         long_upload = _upload("vidLONG", duration=1800)  # > 1200s, no creator chapters
-        short_upload = _upload("vidSHORT", duration=300)  # short -> no chapters
+        # Clears the 600s inclusion floor but sits below the 1200s chapterize threshold, so
+        # it is included yet still carries no chapters — the "short -> no chapters" case.
+        short_upload = _upload("vidSHORT", duration=800)
 
         def _mock_delta(source, depth):  # noqa: ANN001 — test stub
             return [long_upload, short_upload]
@@ -217,8 +219,10 @@ def test_youtube_producer_skips_item_when_classify_times_out(capsys) -> None:  #
     with tempfile.TemporaryDirectory() as tmp:
         _fresh_store_with_channel(Path(tmp))
 
-        good_upload = _upload("vidGOOD", duration=300, title="A good talk")
-        doomed_upload = _upload("vidDOOMED", duration=300, title="TIMEOUT this one")
+        # Durations clear the 600s floor (incidental to this test) so both reach classify;
+        # the timeout skip — not the floor — is what is under test here.
+        good_upload = _upload("vidGOOD", duration=800, title="A good talk")
+        doomed_upload = _upload("vidDOOMED", duration=800, title="TIMEOUT this one")
 
         def _mock_delta(source, depth):  # noqa: ANN001 — test stub
             return [good_upload, doomed_upload]
@@ -310,6 +314,134 @@ def test_youtube_producer_degrades_chapters_when_chapterize_times_out(capsys) ->
 
     # The degrade was surfaced (Rule 12), not swallowed.
     assert "youtube_stage1_item_chapterize_degraded" in capsys.readouterr().out
+
+
+def test_youtube_producer_short_form_upload_never_reaches_classifier(capsys) -> None:  # noqa: ANN001
+    """A sub-600s upload is dropped BEFORE the classify call — the LLM never sees it.
+
+    WHY (Rule 9): the 2026-07-06 long-form floor is a budget guarantee, not just an output
+    filter. A 400s clip must be dropped BEFORE ``classify_item`` so no ``claude -p`` call is
+    spent on it. We feed one 400s clip and one 1800s talk through a spy classifier that
+    records every title it is asked to judge, then assert: the short clip's title NEVER
+    reached the classifier; only the long talk is returned; and the short-form drop is
+    counted in the completion log. A regression that filtered after classify (or not at all)
+    would surface the short title in ``classified_titles`` and fail here.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store_with_channel(Path(tmp))
+
+        long_upload = _upload("vidLONG", duration=1800, title="A long-form talk")
+        short_upload = _upload("vidSHORT", duration=400, title="A 400s short clip")
+
+        def _mock_delta(source, depth):  # noqa: ANN001 — test stub
+            return [long_upload, short_upload]
+
+        classified_titles: list[str] = []
+
+        def _spy_classifier(prompt: str) -> str:
+            # The upload title reaches the prompt body; record which items were judged.
+            if "A long-form talk" in prompt:
+                classified_titles.append("A long-form talk")
+            if "A 400s short clip" in prompt:
+                classified_titles.append("A 400s short clip")
+            return '{"axis_a_signal": 1, "axis_b_on_topic": 1, "category": "ai"}'
+
+        config = OrbitConfig(creator_weights={"UC_chan": 1.0}, interests=["ai"])
+
+        items = orbit.run_stage1_build_youtube_items(
+            config,
+            depth="default",
+            upload_delta=_mock_delta,
+            transcript_fetcher=lambda video_id, depth: None,  # noqa: ANN001,ARG005
+            llm_classifier=_spy_classifier,
+            segmenter=lambda prompt: "[]",
+        )
+
+    # The short clip never reached the classifier (LLM budget saved), only the long one did.
+    assert classified_titles == ["A long-form talk"], "a sub-600s upload must not reach the classifier"
+    assert [item.item_external_id for item in items] == ["vidLONG"], "only the long-form upload survives"
+    # The drop was counted, not swallowed (Rule 12).
+    assert '"short_form_dropped_count": 1' in capsys.readouterr().out
+
+
+def test_youtube_producer_missing_duration_upload_survives_to_classify() -> None:
+    """A ``duration is None`` upload is KEPT (fail-open) and reaches the classifier.
+
+    WHY (Rule 12): commit 654f0fb taught us that missing metadata must never nuke items.
+    yt-dlp sometimes omits duration; treating an absent duration as "short" would silently
+    drop real long-form uploads. The floor drops only KNOWN-short clips — a ``duration=None``
+    upload must survive to classify and reach the digest. We feed one dateless-duration
+    upload and assert it is classified and returned. A regression that dropped None-duration
+    uploads returns an empty list and fails here.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store_with_channel(Path(tmp))
+
+        unknown_duration_upload = _upload("vidNODUR", duration=None, title="Unknown-duration talk")
+
+        def _mock_delta(source, depth):  # noqa: ANN001 — test stub
+            return [unknown_duration_upload]
+
+        classified = []
+
+        def _spy_classifier(prompt: str) -> str:
+            classified.append("Unknown-duration talk" in prompt)
+            return '{"axis_a_signal": 1, "axis_b_on_topic": 1, "category": "ai"}'
+
+        config = OrbitConfig(creator_weights={"UC_chan": 1.0}, interests=["ai"])
+
+        items = orbit.run_stage1_build_youtube_items(
+            config,
+            depth="default",
+            upload_delta=_mock_delta,
+            transcript_fetcher=lambda video_id, depth: None,  # noqa: ANN001,ARG005
+            llm_classifier=_spy_classifier,
+            segmenter=lambda prompt: "[]",
+        )
+
+    assert classified == [True], "a duration=None upload must reach the classifier (fail-open)"
+    assert [item.item_external_id for item in items] == ["vidNODUR"], "a duration=None upload must survive"
+
+
+def test_youtube_producer_drops_category_other_upload(capsys) -> None:  # noqa: ANN001
+    """A long-form upload the classifier tags ``category == "other"`` is dropped and counted.
+
+    WHY (Rule 9): the taxonomy gate applies to YouTube as well as X. A substantive
+    (Axis-A signal) long-form upload that the classifier places outside the fixed taxonomy
+    (``other``) must be dropped outright, while an ``ai`` upload in the same batch survives.
+    Both clear the 600s floor, so this isolates the category gate from the floor. We assert
+    only the ``ai`` upload is returned and the category-drop count is surfaced. Reverting the
+    gate re-admits the ``other`` upload and fails the first assertion.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store_with_channel(Path(tmp))
+
+        ai_upload = _upload("vidAI", duration=1800, title="An AI research talk")
+        other_upload = _upload("vidOTHER", duration=1800, title="A cooking vlog")
+
+        def _mock_delta(source, depth):  # noqa: ANN001 — test stub
+            return [ai_upload, other_upload]
+
+        def _category_classifier(prompt: str) -> str:
+            if "A cooking vlog" in prompt:
+                return '{"axis_a_signal": 1, "axis_b_on_topic": 1, "category": "other"}'
+            return '{"axis_a_signal": 1, "axis_b_on_topic": 1, "category": "ai"}'
+
+        config = OrbitConfig(creator_weights={"UC_chan": 1.0}, interests=["ai"])
+
+        items = orbit.run_stage1_build_youtube_items(
+            config,
+            depth="default",
+            upload_delta=_mock_delta,
+            transcript_fetcher=lambda video_id, depth: None,  # noqa: ANN001,ARG005
+            llm_classifier=_category_classifier,
+            segmenter=lambda prompt: "[]",
+        )
+
+    assert [item.item_external_id for item in items] == ["vidAI"], "the 'other'-category upload must be dropped"
+    assert "vidOTHER" not in [item.item_external_id for item in items]
+    # The category-drop count was surfaced (Rule 12), not swallowed.
+    assert '"category_dropped_count": 1' in capsys.readouterr().out
 
 
 def _dated_upload(video_id: str, upload_date: str) -> Upload:

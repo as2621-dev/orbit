@@ -74,10 +74,36 @@ ENGAGEMENT_VIEW_WEIGHT: float = 0.50
 ENGAGEMENT_LIKE_WEIGHT: float = 0.35
 ENGAGEMENT_COMMENT_WEIGHT: float = 0.15
 
+# Weight for the X-only quote count in the engagement blend. Quotes signal active
+# discourse around a take, so they earn a positive term — but a quote is a weaker
+# endorsement than a like, so the weight sits BELOW ENGAGEMENT_LIKE_WEIGHT. YouTube
+# items carry ``quote_count is None`` -> ``log1p_safe`` returns 0.0, so this term is
+# score-neutral for them (Phase 8 Sub-phase 3).
+ENGAGEMENT_QUOTE_WEIGHT: float = 0.20
+
 # How strongly relative-engagement (item's log-engagement minus its creator's
 # baseline) moves the score. The relative term is signed: positive when an item
 # beats its creator's norm, negative when it lags — so over-performers float.
 RELATIVE_ENGAGEMENT_WEIGHT: float = 1.0
+
+# How strongly the ABSOLUTE batch-engagement percentile (0.0–1.0 within the X batch)
+# moves the score, ADDED alongside the creator-relative term. The relative term alone
+# would let a median post from a loud account tie a genuine banger from a quiet one;
+# this absolute term breaks that tie in favor of the batch's true top engagers. Only
+# X items get a percentile (YouTube items are absent from the map -> 0.0 term, so this
+# is score-neutral for YouTube). First-cut weight; tuned against real runs.
+ABSOLUTE_ENGAGEMENT_WEIGHT: float = 0.5
+
+# Final-score multiplier applied when an X item is itself a QUOTE of someone else's
+# tweet. A quote of another creator's take is derivative, so it ranks below the
+# creator's own original take of otherwise-identical strength. 1.0 would be a no-op;
+# 0.5 halves a quote's score. Non-quote items (all YouTube, plain tweets) keep 1.0.
+QUOTE_TWEET_MULTIPLIER: float = 0.5
+
+# Hard cap on how many X tweets survive into the digest after scoring (Phase 8 Sub-phase
+# 3 — top-N virality selection supersedes density-not-inclusion for the X half only).
+# Applied at the rank seam AFTER scoring; YouTube items are never capped.
+X_DIGEST_TWEET_CAP: int = 8
 
 # Recency: exponential decay over days since upload. RECENCY_HALF_LIFE_DAYS is the
 # age at which the recency term halves; RECENCY_WEIGHT scales its contribution.
@@ -143,6 +169,12 @@ class RankableItem:
         summary: OPTIONAL ≤140-char LLM editorial blurb for the tile (Phase 7, populated
             by Sub-phase 2's ``lib.summarize``, NOT here). Empty by default — an absent
             blurb renders no element (graceful degradation, never fabricated).
+        quote_count: OPTIONAL X quote count (Phase 8 Sub-phase 3). None for YouTube items
+            and tweets with no quote data — ``log1p_safe`` maps None to 0.0 so the blend's
+            quote term is score-neutral when absent.
+        is_quote: True when this X item is itself a QUOTE of another tweet (Phase 8
+            Sub-phase 3). Drives :data:`QUOTE_TWEET_MULTIPLIER` so a quote of someone
+            else's take ranks below an original take. Always False for YouTube items.
     """
 
     item_external_id: str
@@ -158,6 +190,8 @@ class RankableItem:
     card_url: str = ""
     image_url: str = ""
     summary: str = ""
+    quote_count: Optional[int] = None
+    is_quote: bool = False
 
     @classmethod
     def from_parts(
@@ -275,6 +309,11 @@ class RankableItem:
             classification=classification,
             chapters=[],
             card_url=f"https://x.com/{handle}/status/{tweet_id}",
+            # Reason: quote_count feeds the engagement blend's discourse term and is_quote
+            # drives QUOTE_TWEET_MULTIPLIER (a quote of another take ranks below an
+            # original). Tolerant getattr defaults keep pre-Phase-8 Tweet stand-ins valid.
+            quote_count=getattr(tweet, "quote_count", None),
+            is_quote=bool(getattr(tweet, "is_quote", False)),
             # Reason: tweet tiles carry the author's unavatar.io profile pic (a deliberate
             # design extension — the base design has none); inlined at render time.
             image_url=derive_avatar_url(handle) if handle else "",
@@ -335,6 +374,10 @@ def engagement_blend(item: RankableItem) -> float:
     the score uses it RELATIVE to the creator's own baseline, not on its own (so a
     big channel's normal video does not auto-outrank a small channel's breakout).
 
+    X items add a fourth term for ``quote_count`` (:data:`ENGAGEMENT_QUOTE_WEIGHT`);
+    YouTube items carry ``quote_count is None`` so that term is 0.0 — the blend is
+    byte-for-byte unchanged for YouTube (Phase 8 Sub-phase 3).
+
     Args:
         item: The item whose engagement to blend.
 
@@ -355,6 +398,7 @@ def engagement_blend(item: RankableItem) -> float:
         ENGAGEMENT_VIEW_WEIGHT * log1p_safe(item.view_count)
         + ENGAGEMENT_LIKE_WEIGHT * log1p_safe(item.like_count)
         + ENGAGEMENT_COMMENT_WEIGHT * log1p_safe(item.comment_count)
+        + ENGAGEMENT_QUOTE_WEIGHT * log1p_safe(item.quote_count)
     )
 
 
@@ -388,6 +432,65 @@ def compute_creator_engagement_baselines(items: list[RankableItem]) -> dict[str,
     for item in items:
         blends_by_creator.setdefault(item.creator_external_id, []).append(engagement_blend(item))
     return {creator: statistics.median(blends) for creator, blends in blends_by_creator.items()}
+
+
+def is_x_item(item: RankableItem) -> bool:
+    """Return True when a :class:`RankableItem` originated from X (a tweet).
+
+    The discriminator is the ``card_url``: :meth:`RankableItem.from_tweet` sets it to the
+    ``https://x.com/{handle}/status/{id}`` permalink, while YouTube's
+    :meth:`RankableItem.from_parts` leaves it empty (the renderer falls back to the
+    ``watch?v=`` form). This is the one field that reliably distinguishes the two sources
+    without threading a platform tag through every producer. Used by the absolute-engagement
+    percentile (X batch only) and the X digest cap (Phase 8 Sub-phase 3).
+
+    Args:
+        item: The rankable item to classify by source.
+
+    Returns:
+        True if the item is an X tweet, False otherwise (YouTube and any future source
+        that does not set an x.com card url).
+    """
+    return item.card_url.startswith("https://x.com/")
+
+
+def compute_batch_engagement_percentile(items: list[RankableItem]) -> dict[str, float]:
+    """Rank each item's :func:`engagement_blend` into a 0.0–1.0 percentile within the batch.
+
+    The ABSOLUTE-engagement signal (Phase 8 Sub-phase 3): where
+    :func:`compute_creator_engagement_baselines` measures an item against its OWN creator's
+    norm, this measures it against the WHOLE batch, so a genuine banger from a quiet account
+    can outrank a merely-median post from a loud one. Intended for the X batch (the caller
+    passes only X items) so the term stays score-neutral for YouTube.
+
+    The percentile is the fraction of batch items whose blend is ``<=`` this item's blend
+    (a cumulative rank): the top item scores ``1.0``, a lone item scores ``1.0`` (nothing
+    ranks above it), tied blends share a percentile, and the mapping is monotonic in blend.
+
+    Args:
+        items: The batch to rank (typically the run's X items). Keyed by ``item_external_id``.
+
+    Returns:
+        A map of ``item_external_id`` -> percentile in ``(0.0, 1.0]`` (empty for an empty
+        batch). An item absent from the map (e.g. a YouTube item never passed in) contributes
+        no absolute term at scoring time.
+
+    Example:
+        >>> a = RankableItem("a", "t", "c", "h", 10, None, None, "20260101", card_url="https://x.com/h/status/a")
+        >>> b = RankableItem("b", "t", "c", "h", 10000, None, None, "20260101", card_url="https://x.com/h/status/b")
+        >>> pct = compute_batch_engagement_percentile([a, b])
+        >>> pct["b"]  # the higher-engagement tweet tops the batch
+        1.0
+    """
+    if not items:
+        return {}
+    blends = [(item.item_external_id, engagement_blend(item)) for item in items]
+    total = len(blends)
+    percentiles: dict[str, float] = {}
+    for external_id, blend in blends:
+        count_at_or_below = sum(1 for _, other_blend in blends if other_blend <= blend)
+        percentiles[external_id] = count_at_or_below / total
+    return percentiles
 
 
 def priority_weight_for(item: RankableItem, config: Any) -> float:
@@ -514,6 +617,7 @@ def score_item(
     creator_baselines: Optional[dict[str, float]] = None,
     reference_date: Optional[date] = None,
     trending_multipliers: Optional[dict[str, float]] = None,
+    engagement_percentiles: Optional[dict[str, float]] = None,
 ) -> float:
     """Score one item with Orbit's deterministic weighted derank formula (Rule 5).
 
@@ -524,7 +628,11 @@ def score_item(
               * TRENDING_MULTIPLIER_NEUTRAL   # M3 hook (trending/scoop)
               * ( UNIQUENESS_BASELINE_BOOST                       # priority-scaled floor
                 + RELATIVE_ENGAGEMENT_WEIGHT * relative_engagement  # vs creator's OWN baseline
-                + RECENCY_WEIGHT * recency_decay )
+                + RECENCY_WEIGHT * recency_decay
+                + ABSOLUTE_ENGAGEMENT_WEIGHT * batch_percentile )   # vs the WHOLE X batch
+
+    then, for an X item that is itself a quote, the whole score is multiplied by
+    :data:`QUOTE_TWEET_MULTIPLIER` (so a quote ranks below an identical original).
 
     where ``relative_engagement = engagement_blend(item) - creator_baseline`` (the
     creator's batch-median blend; see :func:`compute_creator_engagement_baselines`).
@@ -554,6 +662,11 @@ def score_item(
             scoring path is byte-for-byte unchanged. The map is built by
             :func:`lib.external_trending.build_trending_multiplier_map` (kept out of this module
             so rerank stays trending-agnostic — it consumes whatever map it is given).
+        engagement_percentiles: OPTIONAL map of ``item_external_id`` -> batch-engagement
+            percentile (0.0–1.0) from :func:`compute_batch_engagement_percentile` over the
+            X batch (Phase 8 Sub-phase 3). An item present in the map gains
+            ``ABSOLUTE_ENGAGEMENT_WEIGHT * percentile`` in the intrinsic bracket; an item
+            absent (every YouTube item) contributes 0.0, so YouTube scoring is unchanged.
 
     Returns:
         The item's derank score as a float.
@@ -590,8 +703,28 @@ def score_item(
     else:
         trending_multiplier = TRENDING_MULTIPLIER_NEUTRAL
 
-    intrinsic = UNIQUENESS_BASELINE_BOOST + RELATIVE_ENGAGEMENT_WEIGHT * relative_engagement + RECENCY_WEIGHT * recency
+    # Reason: the absolute batch-engagement term rewards a tweet that ranks high across the
+    # WHOLE X batch (not just vs its own creator). Items absent from the map (every YouTube
+    # item, which is never passed into the percentile) contribute 0.0 — score-neutral for
+    # YouTube (Phase 8 Sub-phase 3). Added alongside the creator-relative term in the bracket.
+    if engagement_percentiles:
+        engagement_percentile = float(engagement_percentiles.get(item.item_external_id, 0.0))
+    else:
+        engagement_percentile = 0.0
+
+    intrinsic = (
+        UNIQUENESS_BASELINE_BOOST
+        + RELATIVE_ENGAGEMENT_WEIGHT * relative_engagement
+        + RECENCY_WEIGHT * recency
+        + ABSOLUTE_ENGAGEMENT_WEIGHT * engagement_percentile
+    )
     score = priority_weight * CLUSTER_SIZE_NEUTRAL * trending_multiplier * intrinsic
+
+    # Reason: a quote of someone else's tweet is derivative, so it ranks below an otherwise
+    # identical original. Applied to the FINAL score (after the intrinsic bracket) so it
+    # scales the whole ranking value. is_quote is always False for YouTube -> no-op there.
+    if item.is_quote:
+        score *= QUOTE_TWEET_MULTIPLIER
 
     log.log_debug(
         "rerank_scored_item",
@@ -601,6 +734,8 @@ def score_item(
         relative_engagement=round(relative_engagement, 4),
         recency_decay=round(recency, 4),
         trending_multiplier=round(trending_multiplier, 4),
+        engagement_percentile=round(engagement_percentile, 4),
+        is_quote=item.is_quote,
         score=round(score, 4),
     )
     return score
@@ -648,6 +783,11 @@ def derank_items(
         return []
 
     creator_baselines = compute_creator_engagement_baselines(items)
+    # Reason: the absolute-engagement percentile is computed over the X items ONLY, so a
+    # tweet's percentile reflects its rank within the X batch (not diluted by YouTube
+    # uploads whose raw counts live on a different scale). YouTube items are absent from
+    # the map -> 0.0 absolute term -> YouTube scoring is byte-for-byte unchanged.
+    engagement_percentiles = compute_batch_engagement_percentile([item for item in items if is_x_item(item)])
     scored = [
         ScoredItem(
             item=item,
@@ -657,6 +797,7 @@ def derank_items(
                 creator_baselines=creator_baselines,
                 reference_date=reference_date,
                 trending_multipliers=trending_multipliers,
+                engagement_percentiles=engagement_percentiles,
             ),
         )
         for item in items
@@ -673,3 +814,57 @@ def derank_items(
         bottom_score=round(scored[-1].score, 4),
     )
     return scored
+
+
+def cap_x_items(
+    scored_items: list[ScoredItem],
+    *,
+    cap: int = X_DIGEST_TWEET_CAP,
+) -> tuple[list[ScoredItem], int]:
+    """Keep only the top-``cap`` X tweets; pass every YouTube item through untouched.
+
+    Top-N virality selection (Phase 8 Sub-phase 3) supersedes density-not-inclusion for
+    the X half only: after scoring, only the highest-scoring ``cap`` tweets survive into
+    the digest so a noisy follow list cannot flood it. YouTube items are NEVER capped —
+    they keep the density-not-inclusion contract.
+
+    ``scored_items`` is assumed already sorted DESCENDING by score (as :func:`derank_items`
+    returns it), so the first ``cap`` X items encountered are the top ones. Relative order
+    is preserved: kept items come back in the same order they arrived, so the caller can
+    hand the result straight to tiering without re-sorting.
+
+    Args:
+        scored_items: The full, score-sorted batch (X + YouTube) from :func:`derank_items`.
+        cap: Max number of X tweets to keep. Defaults to :data:`X_DIGEST_TWEET_CAP`.
+
+    Returns:
+        A ``(kept, dropped_count)`` tuple: ``kept`` is the surviving items (all YouTube +
+        the top-``cap`` X items, order preserved); ``dropped_count`` is how many X items
+        were cut (0 when the batch holds ``<= cap`` X items).
+
+    Example:
+        >>> yt = ScoredItem(RankableItem("y", "t", "c", "UC", 1, None, None, ""), 5.0)
+        >>> tw = ScoredItem(
+        ...     RankableItem("x", "t", "c", "h", 1, None, None, "", card_url="https://x.com/h/status/x"), 4.0
+        ... )
+        >>> kept, dropped = cap_x_items([yt, tw], cap=1)  # doctest: +SKIP
+        >>> len(kept), dropped  # doctest: +SKIP
+        (2, 0)
+    """
+    kept: list[ScoredItem] = []
+    x_kept_count = 0
+    dropped_count = 0
+    for scored_item in scored_items:
+        if is_x_item(scored_item.item):
+            if x_kept_count >= cap:
+                dropped_count += 1
+                continue
+            x_kept_count += 1
+        kept.append(scored_item)
+    log.log_info(
+        "x_digest_cap_applied",
+        cap=cap,
+        x_kept_count=x_kept_count,
+        x_cap_dropped_count=dropped_count,
+    )
+    return kept, dropped_count
