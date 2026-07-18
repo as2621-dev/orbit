@@ -8,8 +8,7 @@
   "depth": "default",
   "delivery": {
     "html_path": "~/orbit/out/today.html",
-    "imessage_to": "+15551234567",
-    "whatsapp_to": null
+    "email_to": "you@example.com"
   },
   "schedule": "0 7 * * *"
 }

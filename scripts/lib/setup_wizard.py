@@ -494,23 +494,23 @@ def _pick_priority_creators(
 
 
 def _gather_delivery(input_fn: Callable[[str], str]) -> dict[str, Any]:
-    """Collect the delivery block (``html_path`` + optional ``imessage_to``) — step 4.
+    """Collect the delivery block (``html_path`` + optional ``email_to``) — step 4.
 
-    ``html_path`` always has a sane default; ``imessage_to`` is opt-in (empty answer
-    leaves it null so Orbit never messages without a configured target — the Sub-phase 3
-    opt-in intent). Deterministic.
+    ``html_path`` always has a sane default; ``email_to`` is opt-in (an empty answer
+    leaves it unset so delivery stays opt-in — Orbit never emails a digest without a
+    configured recipient). Deterministic.
 
     Args:
         input_fn: The injectable input function (scripted in tests).
 
     Returns:
-        A delivery dict with ``html_path`` and, when given, ``imessage_to``.
+        A delivery dict with ``html_path`` and, when given, ``email_to``.
     """
     html_path = _prompt(input_fn, "Where should the digest HTML be written?", default=_DEFAULT_HTML_PATH)
-    imessage_to = _prompt(input_fn, "iMessage number for the TL;DR (optional, blank to skip)", default="")
+    email_to = _prompt(input_fn, "Email address to send your digest to (optional, blank to skip)", default="")
     delivery: dict[str, Any] = {"html_path": html_path}
-    if imessage_to:
-        delivery["imessage_to"] = imessage_to
+    if email_to:
+        delivery["email_to"] = email_to
     return delivery
 
 

@@ -902,7 +902,7 @@ def _build_delivery_summary(tiered_items: list[TieredItem], scoops: list[Trendin
     """Build the one-line delivery TL;DR from the tiered items + scoops (deterministic).
 
     A PURE, deterministic helper (Rule 5 — no LLM in the delivery path): it counts the
-    items and names the top scoop / top item so the iMessage/WhatsApp body is a useful
+    items and names the top scoop / top item so the delivery body is a useful
     one-liner without any model call. Leads with the loudest signal (a scoop) when one
     exists (brief §3 Stage 7: "TL;DR + scoops + a link"), else falls back to the
     top-ranked item's title, else a quiet "no new items" line.
@@ -939,22 +939,19 @@ def run_stage7_deliver(
     tiered_items: list[TieredItem],
     scoops: list[TrendingItem],
     config: OrbitConfig,
-    page_1_path: Path,
 ) -> None:
-    """Deliver the digest (iMessage core; WhatsApp/Briefcast gated stretch). Wiring only.
+    """Deliver the digest — Briefcast file emit only (no send step yet). Wiring only.
 
-    Runs AFTER :func:`run_stage7_render`. Builds a deterministic one-line TL;DR
-    (:func:`_build_delivery_summary` — no LLM, Rule 5) and routes it through the
-    delivery channels in :mod:`lib.deliver`:
+    Runs AFTER :func:`run_stage7_render`. iMessage and WhatsApp delivery were deleted
+    (PRD story #8); the email send step is wired by the email-delivery slice (PRD M5).
+    Until then the digest is rendered to disk and this stage performs NO send — the
+    interim state is expected.
 
-      * iMessage (core) — always attempted; :func:`lib.deliver.deliver_imessage` is a
-        logged no-op when ``delivery.imessage_to`` is unset (the bare CLI run path).
-      * WhatsApp (stretch) — gated behind ``delivery.whatsapp_to``; skipped by default.
-        Wired only when a target is set; the host injects the HTTP boundary at runtime
-        (not wired here, so a misconfigured target without that boundary fails loud
-        rather than sending). Left unwired in this build to keep the stretch path gated.
-      * Briefcast (stretch) — gated behind ``delivery.briefcast_path``; writes a payload
-        file when configured, skipped otherwise.
+    The only wired output is Briefcast (stretch, integrations §6): a payload FILE gated
+    behind ``delivery.briefcast_path`` and skipped by default. When it is configured, the
+    deterministic one-line TL;DR (:func:`_build_delivery_summary` — no LLM, Rule 5) is
+    built as the payload header. Briefcast has no auth surface, so it survives the
+    iMessage/WhatsApp removal.
 
     Business logic lives in :mod:`lib.deliver`; this stays sequencing only.
 
@@ -962,19 +959,13 @@ def run_stage7_deliver(
         tiered_items: The Stage-6 tiered items (for the TL;DR + Briefcast episode list).
         scoops: The Stage-5 scoops (the TL;DR leads with the loudest one).
         config: The loaded :class:`OrbitConfig` (supplies the ``delivery`` targets).
-        page_1_path: The page-1 HTML path the render stage wrote (the link target).
     """
-    summary = _build_delivery_summary(tiered_items, scoops)
-
-    imessage_to = config.delivery.get("imessage_to")
-    deliver.deliver_imessage(summary, page_1_path, imessage_to)
-
-    # Stretch channels — gated behind their config keys, skipped by default. Briefcast
-    # is wired (a file, no auth surface); WhatsApp stays gated on its config key but is
-    # not given an HTTP boundary here (the host wires it), so an accidental target fails
-    # loud in lib.deliver rather than this stage sending without a configured client.
+    # Briefcast (stretch) — a payload file, gated behind its config key, skipped by
+    # default. A file, not a send: no auth surface. The TL;DR is only needed for the
+    # payload header, so build it inside the gate (no send step exists yet).
     briefcast_path = config.delivery.get("briefcast_path")
     if briefcast_path:
+        summary = _build_delivery_summary(tiered_items, scoops)
         deliver.emit_briefcast_payload(summary, list(tiered_items), briefcast_path)
 
 
@@ -1061,10 +1052,10 @@ def run_pipeline(depth: str) -> int:
         summaries=summaries,
     )
 
-    # Stage 7 (deliver) — notify the user the digest is ready. iMessage is opt-in: on
-    # the bare CLI run delivery.imessage_to is unset, so this is a logged no-op and the
-    # run stays a clean exit-0. page 1 is written_paths[0] (page 1 first by contract).
-    run_stage7_deliver(tiered_items, scoops, config, written_paths[0])
+    # Stage 7 (deliver) — the digest is already rendered to disk (written_paths). iMessage
+    # and WhatsApp delivery were deleted (PRD story #8); the email send step is wired by a
+    # later slice, so this stage performs no send yet and the run stays a clean exit-0.
+    run_stage7_deliver(tiered_items, scoops, config)
 
     log.log_info(
         "pipeline_completed",

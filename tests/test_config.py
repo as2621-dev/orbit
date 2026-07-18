@@ -67,7 +67,7 @@ def test_valid_config_loads_into_typed_orbit_config(tmp_path: Path) -> None:
             "creator_weights": {"UC_chan": 1.5, "x_handle": "2"},
             "interests": ["ai agents", "f1"],
             "depth": "deep",
-            "delivery": {"html_path": "~/orbit/out/today.html", "imessage_to": "+15551234567", "whatsapp_to": None},
+            "delivery": {"html_path": "~/orbit/out/today.html", "email_to": "me@example.com"},
             "schedule": "0 7 * * *",
         },
     )
@@ -83,8 +83,7 @@ def test_valid_config_loads_into_typed_orbit_config(tmp_path: Path) -> None:
     assert config.creator_weights == {"UC_chan": 1.5, "x_handle": 2.0}
     assert all(isinstance(weight, float) for weight in config.creator_weights.values())
     assert config.delivery["html_path"] == "~/orbit/out/today.html"
-    assert config.delivery["imessage_to"] == "+15551234567"
-    assert config.delivery["whatsapp_to"] is None
+    assert config.delivery["email_to"] == "me@example.com"
 
 
 def test_missing_config_file_returns_defaults(tmp_path: Path) -> None:
@@ -188,17 +187,38 @@ def test_empty_delivery_html_path_raises_field_named_error(tmp_path: Path) -> No
         load_config(config_path)
 
 
-def test_non_string_imessage_target_raises_field_named_error(tmp_path: Path) -> None:
-    """A non-string delivery.imessage_to fails loud, naming the field (Rule 12, DoD #2).
+def test_non_string_email_target_raises_field_named_error(tmp_path: Path) -> None:
+    """A non-string delivery.email_to fails loud, naming the field (Rule 12, DoD #2).
 
-    WHY: the delivery target is passed to AppleScript as a string. A number/object there
-    would break the send; it must fail loud naming the field. (Format is NOT validated —
-    only the type — to avoid over-validating phone numbers.)
+    WHY: the delivery recipient is the email address the digest is sent to — a string. A
+    number/object there would break the send; it must fail loud naming the field. (Format
+    is NOT validated — only the type — to avoid over-validating email addresses.)
     """
-    config_path = _write_config(tmp_path, {"delivery": {"imessage_to": 15551234567}})
+    config_path = _write_config(tmp_path, {"delivery": {"email_to": 12345}})
 
-    with pytest.raises(ConfigError, match="delivery.imessage_to"):
+    with pytest.raises(ConfigError, match="delivery.email_to"):
         load_config(config_path)
+
+
+def test_legacy_imessage_whatsapp_keys_are_ignored_not_rejected(tmp_path: Path) -> None:
+    """A config still carrying leftover imessage_to/whatsapp_to keys loads without crashing.
+
+    WHY: real users upgrading from the iMessage era have an on-disk orbit.config.json whose
+    delivery block still contains imessage_to (and maybe whatsapp_to). The schema no longer
+    knows those keys — but loading must degrade gracefully (the key is ignored), never raise
+    a ConfigError. Pinning this makes the migration deliberate: a leftover key is tolerated,
+    not a hard failure that would break every returning user's next run.
+    """
+    config_path = _write_config(
+        tmp_path,
+        {"delivery": {"html_path": "~/orbit/out/today.html", "imessage_to": "+15551234567", "whatsapp_to": None}},
+    )
+
+    config = load_config(config_path)
+
+    # It loaded (no ConfigError) and html_path survived; the unknown keys are simply not
+    # consumed by any stage. The value passing through is harmless — nothing reads it.
+    assert config.delivery["html_path"] == "~/orbit/out/today.html"
 
 
 def test_non_numeric_creator_weight_raises_field_named_error(tmp_path: Path) -> None:

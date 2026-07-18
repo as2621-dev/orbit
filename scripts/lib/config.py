@@ -3,7 +3,7 @@
 Non-secret per-user config lives in ``orbit.config.json`` (brief §6,
 ``reference/api-contracts.md``): which browser cookies come from, creator priority
 weights, the interest profile, the depth throttle, delivery targets, and the cron
-schedule. Secrets (explicit cookies, Twilio creds) live in ``.env`` and are NEVER
+schedule. Secrets (explicit cookies) live in ``.env`` and are NEVER
 read here — when ``cookie_source == "env"`` this module only notes that the source
 loader will read ``AUTH_TOKEN``/``CT0`` from ``.env`` at runtime; it does not touch
 them.
@@ -108,7 +108,7 @@ class OrbitConfig:
             weight (float), the thumb on the ranking scale.
         interests: Topic keywords driving Axis-B classification.
         depth: The cost/time throttle — one of :data:`ALLOWED_DEPTHS`.
-        delivery: Output targets (``html_path`` / ``imessage_to`` / ``whatsapp_to``).
+        delivery: Output targets (``html_path`` / ``email_to``).
         schedule: Cron expression used by the README setup step / ``--setup`` wizard.
     """
 
@@ -236,9 +236,11 @@ def _validate_delivery(delivery: Any) -> None:
 
     Fail loud (Rule 12) on a structurally wrong delivery block: ``delivery`` must be a
     JSON object; ``html_path`` (if present) must be a non-empty string (it is the only
-    required output target); ``imessage_to`` / ``whatsapp_to`` (if present and non-null)
-    must be strings. Phone-number FORMAT is intentionally NOT validated here — that is
-    over-validation; the delivery module + the user own the exact target string.
+    required output target); ``email_to`` (if present and non-null) must be a string.
+    Email-address FORMAT is intentionally NOT validated here — that is over-validation;
+    the delivery module + the user own the exact recipient string. Unknown keys (e.g. a
+    leftover ``imessage_to`` from a pre-email config) are ignored, not rejected, so an
+    upgrading user's config loads without a crash.
 
     Args:
         delivery: The ``delivery`` value read from the config.
@@ -272,20 +274,18 @@ def _validate_delivery(delivery: Any) -> None:
                 f"got {html_path!r}."
             )
 
-    for target_field in ("imessage_to", "whatsapp_to"):
-        if target_field in delivery and delivery[target_field] is not None:
-            value = delivery[target_field]
-            if not isinstance(value, str):
-                log.log_error(
-                    "config_invalid_delivery_target",
-                    fix_suggestion=f"Set 'delivery.{target_field}' to a string target (or null to disable it).",
-                    config_field=f"delivery.{target_field}",
-                    invalid_value=repr(value),
-                )
-                raise ConfigError(
-                    f"Invalid 'delivery.{target_field}' in orbit.config.json: must be a string "
-                    f"(or null), got {type(value).__name__}."
-                )
+    email_to = delivery.get("email_to")
+    if email_to is not None and not isinstance(email_to, str):
+        log.log_error(
+            "config_invalid_delivery_email_to",
+            fix_suggestion="Set 'delivery.email_to' to the recipient email address string (or null to disable delivery).",
+            config_field="delivery.email_to",
+            invalid_value=repr(email_to),
+        )
+        raise ConfigError(
+            "Invalid 'delivery.email_to' in orbit.config.json: must be a string "
+            f"(or null), got {type(email_to).__name__}."
+        )
 
 
 def _coerce_creator_weights(raw_weights: Any) -> dict[str, float]:
@@ -376,7 +376,7 @@ def load_config(config_path: Optional[Path] = None) -> OrbitConfig:
         ConfigError: If the file exists but contains invalid JSON, is not a JSON
             object, carries an out-of-range ``cookie_source`` / ``depth``, a malformed
             ``schedule`` cron expression, a non-object ``delivery`` (or a bad
-            ``html_path`` / ``imessage_to`` / ``whatsapp_to`` type), or a non-numeric
+            ``html_path`` / ``email_to`` type), or a non-numeric
             ``creator_weights`` value.
 
     Example:

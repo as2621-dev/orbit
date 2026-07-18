@@ -35,9 +35,9 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import store  # noqa: E402
-from lib import density, paths  # noqa: E402
+from lib import paths  # noqa: E402
 from lib.classify import Classification  # noqa: E402
-from lib.density import TieredItem, assign_density_tiers, record_top_tier_carryforward  # noqa: E402
+from lib.density import assign_density_tiers, record_top_tier_carryforward  # noqa: E402
 from lib.rerank import RankableItem, ScoredItem  # noqa: E402
 
 

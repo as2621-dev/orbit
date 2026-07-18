@@ -142,7 +142,7 @@ def test_wizard_writes_loadable_config_with_choices(tmp_path: Path) -> None:
     # Scripted answers, in prompt order:
     #   cookie source, confirm cat #1, confirm cat #2,
     #   prioritize #1 (yes), prioritize #2 (no),
-    #   html_path, imessage (blank). The schedule is NO LONGER asked (fixed 7am).
+    #   html_path, email (blank). The schedule is NO LONGER asked (fixed 7am).
     answers = ["chrome", "y", "y", "y", "n", "~/orbit/out/today.html", ""]
 
     exit_code = run_setup_wizard(
@@ -167,7 +167,7 @@ def test_wizard_writes_loadable_config_with_choices(tmp_path: Path) -> None:
     # Interests seeded from subscription titles (lower-cased), order-preserved.
     assert loaded.interests == ["ai lab", "f1 news"]
     assert loaded.delivery["html_path"] == "~/orbit/out/today.html"
-    assert "imessage_to" not in loaded.delivery  # blank answer => opt-out, never messaged
+    assert "email_to" not in loaded.delivery  # blank answer => opt-out, no recipient stored
 
     # Sanity: the on-disk JSON is the api-contracts shape.
     raw = json.loads(config_path.read_text(encoding="utf-8"))
@@ -219,7 +219,7 @@ def test_wizard_auto_classifies_via_existing_classify_path(tmp_path: Path) -> No
     x_loader = MagicMock(return_value=[])
     llm = _signal_classifier()
 
-    # cookie, confirm cat, prioritize (no), html, imessage (blank). No schedule prompt.
+    # cookie, confirm cat, prioritize (no), html, email (blank). No schedule prompt.
     answers = ["chrome", "y", "n", "~/orbit/out/today.html", ""]
 
     run_setup_wizard(
@@ -271,12 +271,12 @@ def test_wizard_continues_youtube_only_when_x_auth_fails(tmp_path: Path) -> None
     assert loaded.creator_weights == {}
 
 
-def test_wizard_writes_imessage_target_when_provided(tmp_path: Path) -> None:
-    """A provided iMessage number must be persisted as delivery.imessage_to.
+def test_wizard_writes_email_target_when_provided(tmp_path: Path) -> None:
+    """A provided email address must be persisted as delivery.email_to.
 
     WHY: delivery is opt-in — earlier tests prove blank => no target. The mirror case must
-    also hold: when the user DOES give a number, it must reach the config so Sub-phase 3's
-    iMessage delivery has a target. Fails if the wizard ignores the provided number.
+    also hold: when the user DOES give an address, it must reach the config so the
+    email-delivery slice has a recipient. Fails if the wizard ignores the provided address.
     """
     config_path = tmp_path / "orbit.config.json"
     youtube_loader = MagicMock(
@@ -284,8 +284,8 @@ def test_wizard_writes_imessage_target_when_provided(tmp_path: Path) -> None:
     )
     x_loader = MagicMock(return_value=[])
 
-    # cookie, confirm cat, prioritize (no), html, imessage (+15551234567). No schedule prompt.
-    answers = ["chrome", "y", "n", "~/orbit/out/today.html", "+15551234567"]
+    # cookie, confirm cat, prioritize (no), html, email (me@example.com). No schedule prompt.
+    answers = ["chrome", "y", "n", "~/orbit/out/today.html", "me@example.com"]
 
     run_setup_wizard(
         config_path=config_path,
@@ -299,7 +299,7 @@ def test_wizard_writes_imessage_target_when_provided(tmp_path: Path) -> None:
     )
 
     loaded = load_config(config_path)
-    assert loaded.delivery["imessage_to"] == "+15551234567"
+    assert loaded.delivery["email_to"] == "me@example.com"
 
 
 def test_install_cron_entry_fresh_install_writes_marker_tagged_line() -> None:
@@ -398,7 +398,7 @@ def test_wizard_installs_single_marker_line_at_fixed_schedule(tmp_path: Path) ->
     config_path = tmp_path / "orbit.config.json"
     fake = _FakeCrontab(stored="")
 
-    # cookie, confirm cat, prioritize (no), html, imessage (blank) — no schedule prompt.
+    # cookie, confirm cat, prioritize (no), html, email (blank) — no schedule prompt.
     answers = ["chrome", "y", "n", "~/orbit/out/today.html", ""]
 
     exit_code = run_setup_wizard(
