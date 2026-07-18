@@ -109,6 +109,13 @@ Save to `.agents/debug/[YYYY-MM-DD]-[short-slug].md`:
 
 Tear down: `browser-use close` and `chrome-devtools stop`.
 
+## Step 7.5 — Compound the cause
+
+If the real cause is **reusable and non-obvious** — a browser/runtime gotcha, a timing trap, an
+API that bites — capture it with `/compound` (gated; pass the reproduction + the real cause). Skip
+if the bug was a one-off typo (Rule 2 / Rule 12). The `.agents/debug/*.md` report is the full
+record; `/compound` distills the durable lesson into `docs/solutions/` for the next slice.
+
 ## Step 8 — Hand off
 
 State plainly whether the bug is fixed-with-the-whole-suite-green or unresolved. Do not commit (consistent with `/rca`, `/codex`). Per Rule 13, end with the concrete next move:

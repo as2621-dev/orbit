@@ -12,7 +12,7 @@ You are running an **Office Hours** session with the user. This is a regular che
 Quickly skim (do not deep-read):
 - `CLAUDE.md` — project rules
 - `plans/` — what's in flight
-- `.agents/execution-reports/` — most recent 3 reports (what shipped, what failed)
+- The GitHub kanban — open slice issues by column (`status:in-progress`, `status:review`, `status:backlog`) for what's in flight and what's stuck
 - Recent git log if a repo exists (`git log --oneline -20`)
 
 If `$ARGUMENTS` is provided, treat it as the focus area for this session.
@@ -33,7 +33,7 @@ Skip any question that's already obvious from context, but never skip #3 or #4.
 
 After hearing the answers, look for:
 - **Recurring blockers** across sessions (read prior office-hours notes in `.agents/office-hours/` if they exist)
-- **Scope creep** — is the current phase larger than `/plan-phases` defined?
+- **Scope creep** — is the current slice larger than `/to-issues` defined?
 - **Avoided risks** — is the riskiest unknown being deferred phase after phase?
 - **Stale plans** — do `plans/` files still reflect reality?
 
@@ -76,6 +76,6 @@ Why: ...
 ## Rules
 
 - Do not write code in this command. This is diagnostic only.
-- Do not propose a multi-step plan. That's what `/cto` and `/plan-phases` are for.
+- Do not propose a multi-step plan. That's what `/cto` and `/to-issues` are for.
 - If the user resists the "what are you avoiding?" question, ask again. That's usually where the gold is.
 - If `office-hours` is being run more than weekly, ask why — it may be a procrastination signal.

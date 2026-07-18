@@ -64,24 +64,27 @@ Default to surfacing uncertainty, not hiding it.
 ## Rule 13 — Always anticipate the next step
 Every response ends with **what comes next**. Not a vague "let me know if you need anything" — a concrete, specific next action the user is most likely to want.
 
-- After `/cmo` → suggest `/cto`
-- After `/cto` → suggest `/plan-phases`
-- After `/plan-phases` → suggest `/run-phase plans/phase-1-*.md`
-- After `/run-phase` succeeds → suggest the next phase file, or `/office-hours` if all phases shipped
-- After `/run-phase` fails → suggest `/rca` with the failure mode, or retry the failed sub-phase
-- After `/rca` → suggest applying the fix (manual + `/commit`) or adding it as a sub-phase
+- After `/ideate` → suggest `/brainstorm` on the chosen direction
+- After `/brainstorm` → suggest `/cto`
+- After `/cto` → suggest `/to-issues`
+- After `/to-issues` → suggest `/grab-issue`
+- After `/grab-issue` succeeds → suggest the next `/grab-issue`, or `/office-hours` if the backlog is empty (or `/improve-architecture` if a few slices have landed since the last review)
+- After `/improve-architecture` → suggest `/grab-issue` on the highest-leverage refactor slice it filed
+- After `/grab-issue` fails → suggest `/rca` with the failure mode, or retry the slice
+- After `/rca` → suggest applying the fix (manual + `/commit`) or filing it as a new slice issue
 - After `/debug` → if fixed-and-verified, suggest `/commit`; if unresolved after the loop bound, suggest `/rca`
-- After `/commit` → suggest `git push`, the next phase, or `/office-hours`
-- After `/codex` findings → suggest fix-now / new-sub-phase / accept-with-note
+- After `/commit` → suggest `git push`, the next `/grab-issue`, or `/office-hours`
+- After `/codex` findings → suggest fix-now / new-slice-issue / accept-with-note
 - After `/office-hours` → suggest acting on the one next-call from the session
+- After `/handoff` → suggest opening a fresh session pointed at the handoff doc
 
 This applies **at every step inside a command too**, not just at hand-off. If you finish a planning section, name what part of the plan needs the user's input next. If you spot a blocker mid-execution, name the unblock action.
 
 Format: end-of-turn line should read something like:
-> **Next:** `/cto` (turn this brief into a master plan + reference docs)
+> **Next:** `/cto` (turn this brief into a PRD + reference docs)
 
 Or for non-command actions:
-> **Next:** Decide whether to push or queue the next phase. Push? Or `/run-phase plans/phase-3-*.md`?
+> **Next:** Decide whether to push or grab the next slice. Push? Or `/grab-issue`?
 
 Never end a response with "done" or just a status. The user should always know the single most likely next move.
 
@@ -97,21 +100,25 @@ This overrides verbosity elsewhere. It does NOT override Rule 12 or Rule 13.
 
 ## Commands
 
-This project ships with **9 slash commands**. Use them in this order for a new initiative:
+This project ships with **13 slash commands**. The core pipeline runs top-to-bottom; the rest are support commands.
 
 | Command | When to use |
 |---|---|
+| `/ideate` | **Optional, for a blank page.** When you have no specific idea yet: grounded research → ideas from many angles → adversarial cut → ranked shortlist. Hand the winner to `/brainstorm`. |
+| `/brainstorm` | After `/ideate` (or first, if you already have an idea). Relentless, NON-technical interview that pressure-tests the raw idea AND refines it into a product brief. Critical — pushes back, won't flatter. |
+| `/cto` | After `/brainstorm`. Produces **the PRD** (with a Technical Foundation: architecture, stack, key decisions, milestones) and reference docs. |
+| `/to-issues` | After `/cto`. Slices the PRD into vertical-slice (tracer-bullet) issues on the GitHub kanban backlog. |
+| `/grab-issue` | After `/to-issues`. **Dispatcher** — pulls the top unblocked slice and hands its whole build to a **fresh sub-agent** (clean context per slice, so `/loop /grab-issue` drains the backlog without context rot). The sub-agent builds it **test-first (red→green→refactor)**: test → code → refactor-for-depth → simplify → slop scan → CSO → acceptance check → browser-verify UI slices (puppeteer regression + browser-use walkthrough) → single commit → **Claude-native multi-agent review panel** (residual gate) → move to done. |
+| `/compound` | Capture a reusable, non-obvious learning into `docs/solutions/` — the compounding store `/grab-issue` B2.5 reads before building. The canonical write recipe (gated, dedups). Called as a tail step by `/grab-issue`, `/rca`, `/debug`, `/codex`, `/improve-architecture`; run standalone for any insight that surfaced outside a command. |
+| `/improve-architecture` | Every few days. Finds shallow/tangled modules, proposes deepenings in plain language, files refactor slices, and syncs `plans/prd.md` + `reference/`. Also runs proactively inside `/cto` on re-runs. |
 | `/office-hours` | Weekly diagnostic — what's stuck, what's risky, what's next. Run regularly. |
-| `/cmo` | At the start of a new idea. Refines scope, fills product holes, sharpens the pitch. |
-| `/cto` | After `/cmo`. Produces the master plan and reference docs (architecture, conventions, key APIs). |
-| `/plan-phases` | After `/cto`. Generates N phases, each with exactly 4 sub-phases. Includes a 3-lens self-critique pass. |
-| `/run-phase` | Executes a phase end-to-end: code → per-sub-phase review → fix → validate → phase-level DoD + slop scan + CSO → single commit. Opt-in worktree parallelism. |
 | `/rca` | When something breaks. Root-cause analysis, then proposes a fix. |
 | `/debug` | When a browser bug breaks. Reproduces with `browser-use`, diagnoses with Chrome DevTools, fixes, re-verifies in-browser, loops until gone. |
 | `/commit` | Stage and create a conventional commit. |
 | `/codex` | Adversarial second opinion when stuck or want pushback. 200-IQ pedant. User-triggered, not automatic. |
+| `/handoff` | Compact the conversation into a handoff doc (saved to temp, not committed) so a fresh agent can continue. |
 
-Phase artifacts live in `plans/`. Execution reports live in `.agents/execution-reports/`. Reference docs live in `reference/`. Codex transcripts in `.agents/codex/`. CSO follow-ups in `.agents/cso-findings/`. Debug reports in `.agents/debug/` (tooling playbook: `reference/browser-debug-playbook.md`).
+The PRD (with its Technical Foundation) lives in `plans/prd.md` — there is no separate master plan. Slice work lives on **GitHub Issues** — the kanban board is the `status:backlog` / `status:in-progress` / `status:review` / `status:done` labels, viewable as a drag-and-drop board in the repo's **GitHub Project**. Each slice is sized to one subagent within a 120k-token budget — `/grab-issue` spawns a **fresh sub-agent per slice**, so draining the backlog with `/loop /grab-issue` keeps the orchestrator's context flat. Reference docs live in `reference/`. Durable learnings (the compounding store, written by `/compound`) live in `docs/solutions/`. Codex transcripts in `.agents/codex/`. CSO follow-ups in `.agents/cso-findings/`. Debug reports in `.agents/debug/` (browser tooling playbook for both `/debug` and UI-slice verification: `reference/browser-debug-playbook.md`). Handoff docs go to the OS temp / scratchpad, never committed.
 
 **Design references (remote):** The full design library lives in a separate public repo to keep this template green:
 
@@ -119,6 +126,6 @@ Phase artifacts live in `plans/`. Execution reports live in `.agents/execution-r
 
 Contents: 86 skills + 511 design systems + 2,827 components + 20,660 shared_code templates, scraped from aura.build.
 
-`/cto` fetches `design-systems/INDEX.md` from there when picking a visual language for UI products. `/run-phase` fetches relevant `skills/` and `components/` when building UI sub-phases. Both commands `curl` indexes first, then fetch full content only for the items they decide to use.
+`/cto` fetches `design-systems/INDEX.md` from there when picking a visual language for UI products. `/grab-issue` fetches relevant `skills/` and `components/` when building UI slices. Both commands `curl` indexes first, then fetch full content only for the items they decide to use.
 
 Local pointer + fetch recipes: `design-references/RESOURCES.md`.

@@ -14,7 +14,7 @@ You are routing a request to **Codex** — a deliberately pedantic, literal, adv
 - You're making a design decision and want an adversarial stress-test.
 - You suspect Claude missed a subtle bug (race, off-by-one, lifetime, edge case).
 
-Do NOT invoke routinely. Codex is the "second opinion" tool, not the default reviewer. `/run-phase` already does self-review + slop scan + CSO. Codex is for **when those weren't enough**.
+Do NOT invoke routinely. Codex is the "second opinion" tool, not the default reviewer. `/grab-issue` already does self-review + slop scan + CSO + a Claude-native multi-agent review panel. Codex is an **external** escape hatch for when those weren't enough — and it's optional: this repo's automatic in-loop review is codex-free.
 
 ## Three modes
 
@@ -73,7 +73,7 @@ Tell the user `/codex` requires either the `codex` CLI or the `codex:rescue` age
 3. Run Codex in the requested mode against the target.
 4. Capture the output. Save it to `.agents/codex/[YYYY-MM-DD]-[mode]-[short-slug].md`.
 5. Surface the verdict to the user **verbatim** for review/challenge modes. Do NOT soften Codex's tone. Per Rule 12, the entire point of this command is to NOT smooth over findings.
-6. For consult: surface the answer. For review/challenge: ask the user how they want to act on the findings (fix now? add a sub-phase to a new plan? accept the risk and document why?).
+6. For consult: surface the answer. For review/challenge: ask the user how they want to act on the findings (fix now? file a new slice issue? accept the risk and document why?).
 
 ## Output format
 
@@ -98,8 +98,15 @@ After Codex returns, write to `.agents/codex/[date]-[mode]-[slug].md`:
 
 ## My decision
 
-[user's call on how to act — fix now / new sub-phase / accept with note]
+[user's call on how to act — fix now / new slice issue / accept with note]
 ```
+
+## Compound the lesson
+
+If a Codex finding taught something **reusable and non-obvious** — a correctness or security trap
+the codebase could re-hit, an anti-pattern to avoid — capture it with `/compound` once the user has
+made their call (gated; skip socially-smoothed nitpicks and one-off style notes, Rule 2 / Rule 12).
+Capture the lesson, not the whole transcript — the `.agents/codex/` record holds the full exchange.
 
 ## Rules
 
@@ -107,4 +114,4 @@ After Codex returns, write to `.agents/codex/[date]-[mode]-[slug].md`:
 - Per Rule 1, if Codex disagrees with Claude's prior advice on the same code, surface that explicitly — don't bury it.
 - Per Rule 5, do not use Codex for routing or deterministic tasks. It's a judgment-call tool for stuck-points and adversarial review.
 - Per Rule 7, if Codex and Claude's prior review contradict, pick one with explicit reasoning. Do not blend.
-- Do not invoke Codex from inside `/run-phase` automatically. `/codex` is user-triggered only. If `/run-phase` finished with concerns, the human decides whether to escalate.
+- Do not invoke Codex from inside `/grab-issue` automatically. `/codex` is user-triggered only. If `/grab-issue` finished with concerns, the human decides whether to escalate.

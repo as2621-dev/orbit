@@ -52,8 +52,8 @@ Run `git status` after the commit to verify success.
 
 Never push unless the user explicitly says so. Report the commit hash, then per Rule 13 surface the single most likely next move. Pick from this list based on context:
 
-- If this commit was a phase-end commit from `/run-phase` and **more phases remain in `plans/`** → suggest `/run-phase plans/phase-[N+1]-*.md`
-- If this commit was a phase-end commit and **no more phases remain** → suggest `/office-hours` or planning the next milestone with `/plan-phases`
+- If this commit closed a slice issue and **more slices remain on the backlog** → suggest the next `/grab-issue`
+- If this commit closed the last slice and **the backlog is empty** → suggest `/office-hours` or planning the next milestone with `/cto` → `/to-issues`
 - If this commit was a one-off fix → suggest `git push` (ask first) or "back to whatever you were doing"
 - If branch is ahead of remote and the commit looks shippable → suggest `git push`
 - If there are still **uncommitted changes** after this commit (you only staged a subset) → suggest a second `/commit` for the remaining hunk
@@ -61,7 +61,7 @@ Never push unless the user explicitly says so. Report the commit hash, then per 
 Format example:
 > Commit: `a1b2c3d` — `feat(auth): add session middleware`
 >
-> **Next:** Phase 2 still has uncommitted sub-phase reports — finish the phase or `/commit` them separately. Or run `/run-phase plans/phase-3-*.md`.
+> **Next:** Slice #42 is in review — once it's green, `/grab-issue` to pull the next unblocked slice. Or `git push` this commit first.
 
 Never end with just the commit hash.
 
