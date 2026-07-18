@@ -337,6 +337,32 @@ def _count_distinct_creators(tiered_items: list[TieredItem]) -> int:
     return len(creator_keys)
 
 
+def _masthead_counts(
+    tiered_items: list[TieredItem], scoops: list[Any], clusters: list[Any]
+) -> tuple[int, int, int, int, int]:
+    """Compute the masthead tallies (pure counting, Rule 5): sources / accounted / scoops / dormant / clusters.
+
+    Nothing is dropped, so every item is "accounted for"; "sources" is the distinct-creator
+    count. ``dormant`` falls back to the total scoop count when no scoop is explicitly flagged
+    ``is_scoop``. Shared with :mod:`lib.markdown_render` so the HTML and markdown mastheads
+    report identical tallies (no drift).
+
+    Args:
+        tiered_items: The tiered batch.
+        scoops: The Stage-5 scoops (may be empty).
+        clusters: The Stage-5 clusters (may be empty).
+
+    Returns:
+        ``(source_total, accounted, scoop_count, dormant_count, cluster_count)``.
+    """
+    source_total = _count_distinct_creators(tiered_items)
+    accounted = len(tiered_items)
+    scoop_count = len(scoops)
+    dormant_count = sum(1 for scoop in scoops if bool(getattr(scoop, "is_scoop", False))) or scoop_count
+    cluster_count = len(clusters)
+    return source_total, accounted, scoop_count, dormant_count, cluster_count
+
+
 def _trending_deep_link(trending_item: Any, items_by_id: dict[str, Any]) -> str:
     """Resolve a trending/scoop entry's deep-link (reuse the card link, source-aware).
 
@@ -446,6 +472,22 @@ def _build_compact_tile(item: Any) -> str:
     )
 
 
+def _tweet_source_label(item: Any) -> str:
+    """Build a tweet's ``@handle · X`` source label (shared with :mod:`lib.markdown_render`).
+
+    An already-``@``-prefixed handle is not double-prefixed. Kept as one helper so the HTML
+    tweet tile and the markdown tweet entry derive the label identically (no drift).
+
+    Args:
+        item: A :class:`lib.rerank.RankableItem` (an X tweet).
+
+    Returns:
+        The tweet source label (``"@handle · X"`` or ``"handle · X"``).
+    """
+    channel_name = (getattr(item, "channel_name", "") or "").strip()
+    return f"@{channel_name} · X" if channel_name and not channel_name.startswith("@") else f"{channel_name} · X"
+
+
 def _build_tweet_tile(item: Any, *, inline_image: InlineImage) -> str:
     """Build one tweet (X) tile — text-first, with the inlined unavatar profile pic.
 
@@ -456,10 +498,8 @@ def _build_tweet_tile(item: Any, *, inline_image: InlineImage) -> str:
     Returns:
         A tweet ``.tile`` block.
     """
-    channel_name = (getattr(item, "channel_name", "") or "").strip()
-    source_label = f"@{channel_name} · X" if channel_name and not channel_name.startswith("@") else f"{channel_name} · X"
     return tiles.render_tweet_tile(
-        source_label=source_label,
+        source_label=_tweet_source_label(item),
         text=getattr(item, "title", "") or "",
         link_url=_card_deep_link(item),
         avatar_url=_inline(getattr(item, "image_url", "") or "", inline_image),
@@ -763,11 +803,9 @@ def render_digest_pages(
 
     # Masthead counts (pure counting, Rule 5). Nothing is dropped, so every item is
     # "accounted for"; "sources" is the distinct-creator count (the feeds scanned).
-    source_total = _count_distinct_creators(tiered_items)
-    accounted = len(tiered_items)
-    scoop_count = len(scoops)
-    dormant_count = sum(1 for scoop in scoops if bool(getattr(scoop, "is_scoop", False))) or scoop_count
-    cluster_count = len(clusters)
+    source_total, accounted, scoop_count, dormant_count, cluster_count = _masthead_counts(
+        tiered_items, scoops, clusters
+    )
     accounted_str = f"{accounted} OF {source_total} SOURCES ACCOUNTED FOR"
 
     masthead_html = tiles.render_masthead(

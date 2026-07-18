@@ -27,7 +27,7 @@ from typing import Any, Callable, Optional
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
 
 import store  # noqa: E402  (import must follow the sys.path insert above)
-from lib import bird_x, classify, deliver, log, render, runlock  # noqa: E402
+from lib import bird_x, classify, deliver, log, markdown_render, render, runlock  # noqa: E402
 from lib.bird_x import Follow, Tweet, XAuthError  # noqa: E402
 from lib.classify import LlmClassifier, _default_llm_classifier  # noqa: E402
 from lib.cluster import Cluster, cluster_overlaps  # noqa: E402
@@ -823,6 +823,62 @@ def _resolve_html_path(config: OrbitConfig) -> Path:
     return Path(raw_path).expanduser()
 
 
+def _write_digest_markdown(
+    markdown_path: Path,
+    tiered_items: list[TieredItem],
+    config: OrbitConfig,
+    *,
+    writer: Callable[[Path, str], None],
+    clusters: Optional[list[Cluster]],
+    trending_items: Optional[list[TrendingItem]],
+    scoops: Optional[list[TrendingItem]],
+    verdict: str,
+    summaries: Optional[dict[str, str]],
+) -> None:
+    """Write the self-contained ``digest.md`` twin beside page 1 (issue #6), fail-soft.
+
+    The markdown twin (:func:`lib.markdown_render.render_digest_markdown`) is a SECONDARY
+    output that gates #7/#9; the primary product is the HTML digest + email. A render/write
+    failure here is logged loudly (Rule 12) but SWALLOWED so it can never abort the HTML
+    render contract or block delivery — matching Stage 7's loud-but-non-fatal delivery posture.
+    The path is passed in (beside page 1), and the twin is deliberately kept OUT of
+    ``written_paths`` so it never rides the email as a ``text/html`` attachment.
+
+    Args:
+        markdown_path: The ``digest.md`` path (beside page 1 — the contract path #7 reads).
+        tiered_items: The Stage-6 tiered items.
+        config: The loaded config (supplies ``digest_title``).
+        writer: The same ``(path, text) -> None`` writer the HTML pages use (tests inject a temp writer).
+        clusters: OPTIONAL clusters (feed cross-links + masthead count), forwarded verbatim.
+        trending_items: OPTIONAL trending list (the trio), forwarded verbatim.
+        scoops: OPTIONAL detected scoops (the trio + dormant count), forwarded verbatim.
+        verdict: The pre-computed LLM verdict sentence, forwarded verbatim.
+        summaries: The pre-computed blurb map, forwarded verbatim.
+    """
+    try:
+        markdown = markdown_render.render_digest_markdown(
+            tiered_items,
+            config,
+            clusters=clusters,
+            trending_items=trending_items,
+            scoops=scoops,
+            verdict=verdict,
+            summaries=summaries or {},
+        )
+        writer(markdown_path, markdown)
+        log.log_info("markdown_digest_written", markdown_path=str(markdown_path), char_count=len(markdown))
+    except Exception as exc:
+        log.log_error(
+            "markdown_digest_write_failed",
+            fix_suggestion=(
+                "The digest.md twin (#7's input) could not be written; the HTML digest and email "
+                "were unaffected. Check the output directory is writable."
+            ),
+            markdown_path=str(markdown_path),
+            error_message=str(exc),
+        )
+
+
 def run_stage7_render(
     tiered_items: list[TieredItem],
     config: OrbitConfig,
@@ -881,6 +937,22 @@ def run_stage7_render(
     if len(pages) > 1:
         writer(page_2_path, pages[1])
         written_paths.append(page_2_path)
+
+    # Write the self-contained digest.md twin beside page 1 (issue #6 — the input #7 hands
+    # to a fresh Claude session). It is a SIDE output: deliberately NOT appended to
+    # written_paths, because run_stage7_deliver attaches every written path to the email as
+    # a text/html attachment. Loud-but-non-fatal — a markdown failure never aborts delivery.
+    _write_digest_markdown(
+        markdown_render.resolve_digest_md_path(page_1_path),
+        tiered_items,
+        config,
+        writer=writer,
+        clusters=clusters,
+        trending_items=trending_items,
+        scoops=scoops,
+        verdict=verdict,
+        summaries=summaries,
+    )
 
     log.log_info(
         "render_completed",
