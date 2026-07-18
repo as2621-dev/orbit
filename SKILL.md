@@ -12,8 +12,8 @@ Orbit reads the feeds you already follow (YouTube subscriptions, X follows), tra
 what you have already seen, and surfaces a ranked digest of the new, on-topic, high-signal
 items — so you open one digest instead of ten feeds.
 
-`scripts/orbit.py` is the entrypoint. Run it daily (via cron) to produce the digest, or
-run it once with `--setup` to configure Orbit for the first time.
+`scripts/orbit.py` is the entrypoint. Run it daily (via the launchd agent `--setup` installs)
+to produce the digest, or run it once with `--setup` to configure Orbit for the first time.
 
 ## Entrypoint
 
@@ -53,9 +53,13 @@ The first-run wizard. It:
    run uses, then lets you confirm or flip each category and pick priority creators
    (which become `creator_weights`).
 4. Seeds your `interests` from subscription titles, then asks for the delivery target
-   (HTML path + optional iMessage number) and the cron schedule.
-5. Writes a validated `orbit.config.json` and prints the exact OS cron entry
-   (`<cron_expr> cd <repo> && claude -p "/orbit"`) for you to paste into `crontab -e`.
+   (HTML path + optional email address). The schedule is not asked — it is fixed at 7am daily.
+5. Writes a validated `orbit.config.json`, then **installs a launchd LaunchAgent**
+   (`com.orbit.daily`, 7am) that runs `claude -p --dangerously-skip-permissions "/orbit"` and
+   retires any legacy `# orbit-daily-digest` crontab line. If `launchctl` is unavailable it
+   prints manual plist instructions instead.
 
-Scheduling is OS cron on your own machine (no cloud scheduler), because the cookie-based
-feed reads must run where your browser sessions live.
+Scheduling is a local launchd agent (no cloud scheduler), because the cookie-based feed reads
+must run where your browser sessions live. launchd fires a run missed at 7am on the next wake;
+the scheduled command carries `--dangerously-skip-permissions` because it runs headless. Email
+delivery reads `ORBIT_EMAIL_FROM` + `GMAIL_APP_PASSWORD` from `.env` (see `SETUP.md`).

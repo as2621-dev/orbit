@@ -3,10 +3,12 @@ plugin marketplace manifest (Phase 6 sub-phase 4).
 
 WHY these tests exist: the §8 README and the public marketplace manifest are the
 outward-facing, distribution artifacts. Their *structure* is a product contract from the
-brief (§8.1-§8.6: the five permissions, the un-softened risk disclosure, the cost guidance)
-and the manifest must stay valid JSON that declares the orbit plugin/skill or installs
-break. These tests fail loudly if a required section, permission row, risk clause, or
-manifest field is dropped — not merely if formatting changes. The honest end-to-end *reading*
+brief (§8.1-§8.6: the disclosed permissions, the un-softened risk disclosure, the cost
+guidance) and the manifest must stay valid JSON that declares the orbit plugin/skill or
+installs break. These tests fail loudly if a required section, permission row, risk clause,
+or manifest field is dropped — not merely if formatting changes. They also fail if a
+retired capability (iMessage/WhatsApp delivery) is still described, because a stale
+instruction is as much an onboarding bug as a missing one. The honest end-to-end *reading*
 of the README is a human-review item and is intentionally NOT asserted here.
 """
 
@@ -20,7 +22,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # (the plugin root IS the skill; there is no skills/orbit/ subdirectory anymore).
 SKILL_README = REPO_ROOT / "SETUP.md"
 ROOT_README = REPO_ROOT / "README.md"
+PLUGIN_SKILL = REPO_ROOT / "SKILL.md"
 MARKETPLACE = REPO_ROOT / ".claude-plugin" / "marketplace.json"
+
+# The retired delivery integrations. After the email + launchd pivot, NONE of these may
+# appear in any outward-facing doc or the manifest: the code that backed them is deleted,
+# so a lingering mention would send an installer down a dead path (issue #8 / PRD story #20).
+RETIRED_DELIVERY_TERMS = ["imessage", "whatsapp", "applescript", "twilio"]
 
 
 @pytest.fixture(scope="module")
@@ -59,16 +67,21 @@ def test_skill_readme_section_titles_present(skill_readme_text: str) -> None:
     assert not missing, f"README missing section intent phrases: {missing}"
 
 
-def test_permissions_table_covers_all_five_permissions(skill_readme_text: str) -> None:
-    """WHY: §8.4 must disclose EACH of the five things Orbit asks for. A dropped permission
-    row means an undisclosed capability — a transparency failure, the exact thing this doc
-    is supposed to prevent."""
+def test_permissions_table_covers_all_disclosed_permissions(skill_readme_text: str) -> None:
+    """WHY: §8.4 must disclose EACH capability Orbit actually asks for now. A dropped
+    permission row means an undisclosed capability — a transparency failure, the exact thing
+    this doc exists to prevent. Two rows changed with the email + launchd pivot: the old
+    AppleScript/iMessage row is GONE (that delivery path is deleted — see the sweep test),
+    replaced by an email-delivery row (the digest is now sent over Gmail SMTP) and a
+    scheduled-headless-run row (the launchd agent runs `claude -p` with
+    --dangerously-skip-permissions, which the installer must be told about)."""
     required_permissions = [
-        "cookies",  # read browser cookies
-        "filesystem",  # filesystem write
-        "network",  # network access
-        "applescript",  # run AppleScript (iMessage)
+        "cookies",  # read browser cookies (YouTube, X)
+        "filesystem",  # filesystem write (digest, SQLite state, launchd plist)
+        "network",  # network access (youtube.com, x.com, LLM endpoint)
+        "email",  # send the digest over Gmail SMTP — replaces the old iMessage/AppleScript row
         "llm",  # LLM usage on the user's plan
+        "launchd",  # the scheduled headless daily run (--dangerously-skip-permissions)
     ]
     missing = [p for p in required_permissions if p not in skill_readme_text]
     assert not missing, f"permissions table missing rows for: {missing}"
@@ -133,6 +146,78 @@ def test_cost_estimate_and_default_depth_recommendation_present(skill_readme_tex
     assert "start with" in skill_readme_text and "default" in skill_readme_text, (
         "README must recommend starting with depth=default"
     )
+
+
+def test_email_setup_flow_is_documented(skill_readme_text: str) -> None:
+    """WHY: email is the ONLY delivery path now (issue #8 / PRD M5). An installer who cannot
+    find how to get a Gmail app password, that it needs 2FA, which two `.env` vars to set, and
+    the wizard's email prompt cannot reach a working delivery — the whole slice fails its
+    headline criterion. These are the exact identifiers the code reads (lib/deliver.py reads
+    ORBIT_EMAIL_FROM + GMAIL_APP_PASSWORD from the env), so a drift here is a broken setup."""
+    for required in ["app password", "2fa", "gmail_app_password", "orbit_email_from"]:
+        assert required in skill_readme_text, f"§8 setup must document email delivery detail: {required!r}"
+
+
+def test_scheduling_docs_describe_launchd_with_wake_catchup(skill_readme_text: str) -> None:
+    """WHY: the scheduler is launchd, not cron (issue #3 / PRD M6). The user-visible REASON
+    for the switch is wake-catch-up — a 7am run missed while the Mac slept fires on next wake
+    (cron silently skips). Docs that still teach `crontab -e` as the install path send the
+    installer to a scheduler Orbit no longer uses. Assert the launchd surface + the catch-up
+    rationale are both present."""
+    assert "launchd" in skill_readme_text, "§8 scheduling must describe the launchd agent, not cron"
+    assert "wake" in skill_readme_text, (
+        "§8 scheduling must state the wake-catch-up behavior — the user-visible reason for launchd"
+    )
+
+
+def test_scheduled_run_discloses_skip_permissions(skill_readme_text: str) -> None:
+    """WHY: the launchd job runs `claude -p --dangerously-skip-permissions` (scheduler.py). That
+    is a real capability grant — the daily job auto-approves tool permissions — so leaving it
+    undisclosed is a transparency failure (issue #8 criterion). Assert the flag AND its reason
+    (the run is headless, so an interactive permission prompt would hang it) are both stated."""
+    assert "--dangerously-skip-permissions" in skill_readme_text, (
+        "§8 must disclose that the scheduled run uses --dangerously-skip-permissions"
+    )
+    assert "headless" in skill_readme_text, (
+        "the --dangerously-skip-permissions disclosure must explain WHY (the run is headless)"
+    )
+
+
+def test_troubleshooting_covers_email_and_scheduler_failure_modes(skill_readme_text: str) -> None:
+    """WHY: §8.6 must cover the failure modes an installer will ACTUALLY hit after the pivot
+    (issue #8): a rejected app password / missing 2FA, an email that never arrives, a launchd
+    agent that does not fire, and how to confirm the agent is loaded. Each maps to a user who
+    would otherwise be stuck. `launchctl print` is the code-consistent way to confirm the
+    agent (its service target `gui/<uid>/com.orbit.daily` matches scheduler.py's bootout)."""
+    required = [
+        "app password",  # rejected app password / 2FA not enabled
+        "email not arriving",  # the digest never lands in the inbox
+        "launchd agent not firing",  # the 7am run did not happen
+        "launchctl print",  # how to confirm the agent is loaded
+    ]
+    missing = [r for r in required if r not in skill_readme_text]
+    assert not missing, f"§8.6 troubleshooting missing email/scheduler failure modes: {missing}"
+
+
+def test_no_retired_delivery_references_remain() -> None:
+    """WHY: iMessage/WhatsApp/AppleScript/Twilio delivery is DELETED from the code and config
+    schema (PRD M5, integrations §4 'do not resurrect'). Any lingering mention in an
+    outward-facing doc or the manifest would tell an installer to configure a path that no
+    longer exists — a stale instruction is as much an onboarding bug as a missing one. This is
+    the coupling that keeps the docs honest to the shipped delivery surface."""
+    surfaces = {
+        "README.md": ROOT_README,
+        "SETUP.md": SKILL_README,
+        "SKILL.md": PLUGIN_SKILL,
+        ".claude-plugin/marketplace.json": MARKETPLACE,
+    }
+    offenders: dict[str, list[str]] = {}
+    for label, path in surfaces.items():
+        text = path.read_text(encoding="utf-8").lower()
+        hits = [term for term in RETIRED_DELIVERY_TERMS if term in text]
+        if hits:
+            offenders[label] = hits
+    assert not offenders, f"retired delivery references still present: {offenders}"
 
 
 def test_marketplace_json_parses() -> None:

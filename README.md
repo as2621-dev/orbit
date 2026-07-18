@@ -4,7 +4,7 @@ Orbit is a personal daily intelligence digest of your own YouTube subscriptions 
 following. It pulls what's new, ranks it by signal, and renders a single HTML one-pager —
 so you open one digest instead of ten feeds.
 
-**Full onboarding, the five permissions and why we ask for them, the honest risk disclosure,
+**Full onboarding, the permissions and why we ask for them, the honest risk disclosure,
 troubleshooting, and a cost estimate live in [`SETUP.md`](SETUP.md).**
 Read that before running Orbit.
 
@@ -18,9 +18,9 @@ Read that before running Orbit.
   by virality** cut (quote-tweets down-weighted) into the digest.
 - **Overlap, trending & scoop passes** — merge short-form reactions, cross-link long-form on a
   shared topic, detect internal/external trending, and flag dormant-account scoops.
-- **Delivery & onboarding** — iMessage delivery (AppleScript, opt-in), optional WhatsApp
-  (Twilio) and Briefcast payload, the `/orbit --setup` wizard, and OS-cron scheduling the
-  wizard installs for you.
+- **Delivery & onboarding** — the digest emailed to you (Gmail SMTP: a summary body + the
+  self-contained HTML page(s) attached), the `/orbit --setup` wizard, and a wake-proof
+  **launchd** agent the wizard installs for you (a run missed at 7am fires on next wake).
 
 ## Quick start
 
@@ -35,36 +35,38 @@ Read that before running Orbit.
 2. Confirm you're logged into YouTube and X in a supported browser
    (Chrome/Firefox/Safari/Edge/Brave).
 3. Run `/orbit --setup` — it reads your subs/follows, auto-classifies channels, has you
-   confirm categories and pick priority creators, seeds interests, and sets your delivery
-   target. It writes a validated `orbit.config.json` and **installs the daily cron entry for
-   you** at a fixed **7am** (`0 7 * * *`), tagged so re-running setup replaces it rather than
-   duplicating:
+   confirm categories and pick priority creators, seeds interests, and sets your email
+   delivery target. It writes a validated `orbit.config.json` and **installs a wake-proof
+   launchd agent for you** (`com.orbit.daily`) at a fixed **7am**, idempotent by label so
+   re-running setup replaces it rather than duplicating. Unlike cron, launchd runs a **missed
+   7am run on the next wake**. If `launchctl` is unavailable (e.g. a sandboxed shell), setup
+   still completes and prints the plist + `launchctl bootstrap` command to install by hand.
 
-   ```
-   0 7 * * * cd /path/to/orbit && claude -p "/orbit" # orbit-daily-digest
-   ```
-
-   The schedule is fixed (not a prompt). If the crontab write fails (e.g. a sandboxed
-   environment with no `crontab` binary), setup still completes and prints the line for you to
-   add manually via `crontab -e`.
+   The schedule is fixed (not a prompt). The scheduled job runs
+   `claude -p --dangerously-skip-permissions "/orbit"` — the flag is required because the run
+   is headless (see [`SETUP.md`](SETUP.md) §8.3 step 5 and §8.4).
 
 The full 5-step setup is in [`SETUP.md`](SETUP.md) §8.3.
 
 ## Delivery
 
-iMessage (AppleScript, opt-in) is the delivery channel for the TL;DR, alongside the HTML
-one-pager written locally. **Email delivery is explicitly out of scope** (decision 2026-07-06):
-Orbit is a local, on-device tool and does not send mail. Optional WhatsApp (Twilio) and a
-Briefcast payload remain available; see [`SETUP.md`](SETUP.md).
+**Email is the delivery channel.** Each morning Orbit emails you the digest over Gmail SMTP: a
+one-line summary as the body, the full self-contained Tiles HTML page(s) attached so they open
+in a real browser on any device. Delivery is opt-in — set `delivery.email_to` in the config and
+`ORBIT_EMAIL_FROM` + `GMAIL_APP_PASSWORD` (a Gmail app password; 2FA required) in `.env`. Leave
+them unset and Orbit just writes the HTML locally. The earlier local-only delivery channels
+were removed (2026-07-18) in favor of one email path. See [`SETUP.md`](SETUP.md) §8.3-§8.4.
 
 ## Configuration & environment
 
 - **Config:** copy `orbit.config.example.json` to `orbit.config.json` (the `--setup` wizard
   writes this for you). It documents every field: `cookie_source`, `creator_weights`,
-  `interests`, `depth` (`quick`/`default`/`deep`), `delivery`, and `schedule`.
+  `interests`, `depth` (`quick`/`default`/`deep`), `delivery` (`html_path` + `email_to`), and
+  `schedule`.
 - **Environment:** copy `.env.example` to `.env` (gitignored). It carries placeholders for
-  env-based X cookies (`AUTH_TOKEN`/`CT0`, only used with `cookie_source: "env"`) and the
-  optional WhatsApp/Twilio credentials. **Never commit real secrets.**
+  env-based X cookies (`AUTH_TOKEN`/`CT0`, only used with `cookie_source: "env"`) and the Gmail
+  email-delivery credentials (`ORBIT_EMAIL_FROM`/`GMAIL_APP_PASSWORD`). **Never commit real
+  secrets.**
 
 ## Security note
 
