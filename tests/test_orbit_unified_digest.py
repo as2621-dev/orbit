@@ -185,3 +185,70 @@ def test_stage0_x_auth_failure_does_not_abort_youtube_only_run(tmp_path: Path) -
 
     assert [row["external_id"] for row in youtube_sources] == ["UC_yt"], "YouTube source must persist despite X failure"
     assert x_sources == [], "no X source persisted when the X loader failed (swallowed, not fatal)"
+
+
+def test_x_classify_cap_bounds_the_number_of_llm_calls(tmp_path: Path) -> None:
+    """The X half classifies at most _STAGE1_MAX_CLASSIFIED_TWEETS tweets, not every tweet.
+
+    WHY: each tweet is a separate ``claude -p`` call, and a rotated handle set can return
+    hundreds of new tweets on a cold/stale DB (a real run pulled 765). Without a per-run
+    cap the digest would fire one LLM call per tweet — hundreds of calls, hours of wall
+    clock, unbounded cost. The cap exists to bound that cost, mirroring the YouTube half.
+    This test feeds MORE tweets than the cap and asserts the classifier was invoked EXACTLY
+    ``cap`` times — it FAILS the moment the cap is removed (then it would be called once per
+    tweet). It does not merely check the run completes; it pins the cost bound itself.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _fresh_store(Path(tmp))
+
+        # One persisted X source so run_stage1_build_x_items does not short-circuit on
+        # "no X sources" (the tweet handles themselves need not match this source row).
+        def _mock_yt_loader(cookie_source: str) -> list[Subscription]:
+            return []
+
+        def _mock_x_loader(cookie_source: str) -> list[Follow]:
+            return [Follow(creator_handle="alice", display_name="Alice", rest_id="1001")]
+
+        config = OrbitConfig(interests=["ai"])
+        orbit.run_stage0_load_sources(config, loader=_mock_yt_loader, x_loader=_mock_x_loader)
+
+        cap = orbit._STAGE1_MAX_CLASSIFIED_TWEETS
+        over_cap_count = cap + 5
+        tweets = [
+            Tweet(
+                text=f"Signal tweet number {index}",
+                tweet_id=str(1900000000000000000 + index),
+                handle="alice",
+                created_at="2026-06-18T00:00:00Z",
+                like_count=100,
+                retweet_count=10,
+                reply_count=2,
+                quote_count=1,
+            )
+            for index in range(over_cap_count)
+        ]
+
+        def _mock_x_delta(sources, depth, run_day_ordinal):  # noqa: ANN001 — test stub
+            return tweets
+
+        classify_calls = {"count": 0}
+
+        def _counting_classifier(prompt: str) -> str:
+            classify_calls["count"] += 1
+            return '{"axis_a_signal": 1, "axis_b_on_topic": 1}'
+
+        x_items = orbit.run_stage1_build_x_items(
+            config,
+            depth="default",
+            run_day_ordinal=0,
+            x_delta=_mock_x_delta,
+            llm_classifier=_counting_classifier,
+        )
+
+    # The cost bound: exactly `cap` LLM calls despite `cap + 5` tweets available.
+    assert classify_calls["count"] == cap, (
+        f"X classify must stop at the cap ({cap}); got {classify_calls['count']} calls for "
+        f"{over_cap_count} tweets — the per-run cap is not bounding cost"
+    )
+    # And no more than `cap` items can survive to the unified stream from this run.
+    assert len(x_items) <= cap, "at most `cap` classified tweets can become rankable items"

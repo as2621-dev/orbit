@@ -84,6 +84,12 @@ _STAGE0_SKIP_NETWORK_ENV_VAR: str = "ORBIT_STAGE0_SKIP_NETWORK"
 _STAGE1_RECENCY_WINDOW_DAYS: int = 2
 _STAGE1_MAX_UPLOADS_PER_CHANNEL: int = 5
 _STAGE1_MAX_CLASSIFIED_UPLOADS: int = 60
+# The X half has the same unbounded-cost exposure: a rotated set of handles can return
+# hundreds of new tweets on a cold/stale DB (one run pulled 765), and each tweet is a
+# separate ``claude -p`` classify call. Cap the per-run X classify budget the same way as
+# YouTube so a single digest run stays bounded; deferred tweets are reconsidered next run
+# (X items are not delta-marked, so nothing is lost — see run_stage1_build_x_items).
+_STAGE1_MAX_CLASSIFIED_TWEETS: int = 60
 
 # The pipeline stages, in execution order. All stages are now wired: Stage 0
 # (sources), Stages 1-2 (delta fetch + classify/chapterize, for BOTH YouTube and X),
@@ -384,9 +390,25 @@ def run_stage1_build_x_items(
     category_by_handle = {str(row["external_id"]): str(row.get("category") or "signal") for row in x_sources}
 
     rankable_items: list[RankableItem] = []
+    classified_count = 0
     dropped_noise_count = 0
     category_dropped_count = 0
     for tweet in new_tweets:
+        if classified_count >= _STAGE1_MAX_CLASSIFIED_TWEETS:
+            # Per-run classify budget reached; remaining tweets are left unclassified and
+            # reconsidered next run. Logged so the cap is never a silent truncation (mirrors
+            # the YouTube half's youtube_stage1_classify_cap_reached).
+            log.log_warning(
+                "x_stage1_classify_cap_reached",
+                platform="x",
+                fix_suggestion=(
+                    "Per-run X classify cap hit; remaining tweets deferred to the next run. "
+                    "Raise _STAGE1_MAX_CLASSIFIED_TWEETS if you want a larger single digest."
+                ),
+                classify_cap=_STAGE1_MAX_CLASSIFIED_TWEETS,
+            )
+            break
+
         channel_category = category_by_handle.get(tweet.handle, "signal")
         try:
             classification = classify.classify_item(
@@ -410,6 +432,9 @@ def run_stage1_build_x_items(
                 error_message=str(exc),
             )
             continue
+        # A real classify call completed — count it against the per-run budget. Tweets
+        # dropped by the gates below still count (the ``claude -p`` cost was already paid).
+        classified_count += 1
         # Alpha gate (X-only): drop generic/low-signal tweets outright rather than merely
         # ranking them down. Axis-A == 0 means the classifier judged the post noise (gm,
         # platitudes, engagement-bait). YouTube inclusion is deliberately left unchanged.
@@ -433,6 +458,7 @@ def run_stage1_build_x_items(
         platform="x",
         source_count=len(x_sources),
         tweet_count=len(new_tweets),
+        classified_count=classified_count,
         rankable_count=len(rankable_items),
         dropped_noise_count=dropped_noise_count,
         category_dropped_count=category_dropped_count,
