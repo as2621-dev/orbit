@@ -1,6 +1,6 @@
 # Integrations — Orbit
 
-**Why this doc exists:** every external surface Orbit touches, with its auth pattern, rate-limit posture, and failure mode. `/run-phase` reads it before writing any code that calls out of process. All integrations are cookies-only or local — no API keys, no OAuth, no Orbit server.
+**Why this doc exists:** every external surface Orbit touches, with its auth pattern, rate-limit posture, and failure mode. `/grab-issue` reads it before writing any code that calls out of process. All integrations are cookies-only or local — no OAuth, no Orbit server; the only stored credential is the Gmail app password in `.env`.
 
 **When to update:** when an integration's auth recipe, endpoint, or rate-limit behavior changes, or when a new external surface is added.
 
@@ -27,15 +27,17 @@
 - **Cost control:** `depth` (`quick|default|deep`) gates how many items get transcribed/deep-pulled and thus how much LLM work happens. Default to `default`; document a rough daily-cost estimate in the README.
 - Prompt templates live in `skills/orbit/references/` as files, not inline (classify, label, chapterize, summarize).
 
-## 4. iMessage delivery — AppleScript (macOS, optional)
-- **Trigger:** only if the user sets `delivery.imessage_to`. Skipped otherwise.
-- **Mechanism:** AppleScript (`osascript`) sends a short message — TL;DR + scoops + a link to the local HTML page — via the Messages app. Requires macOS Automation permission for the controlling process.
-- **No network credential** leaves the machine; iMessage uses the user's own logged-in Messages session.
+## 4. Email delivery — Gmail SMTP with app password (M5, replaces iMessage)
+- **Auth:** Gmail **app password** (requires 2FA enabled on the Google account) + sender address, both in `.env` (`GMAIL_APP_PASSWORD`, `ORBIT_EMAIL_FROM`); recipient in `delivery.email_to`. Never logged, never echoed.
+- **Mechanism:** stdlib `smtplib` over SSL (`smtp.gmail.com:465`) + `email.mime`. Body = the delivery TL;DR as plain text/minimal HTML; the self-contained Tiles HTML page(s) ride as **attachments** — never inline (Gmail clips bodies at ~102KB, strips grid/flex/`@font-face`, and blocks base64 `data:` images; `file://` links are dead).
+- **Failure posture:** unset recipient/password ⇒ skip with a clear log; auth rejection ⇒ surface "app password invalid / 2FA required" with `fix_suggestion`, no retry storm; transient SMTP error ⇒ one retry then surface. Delivery failure is loud but never crashes the pipeline or un-marks seen items.
+- **Removed integrations (2026-07-18):** iMessage/AppleScript and WhatsApp/Twilio delivery are deleted from the pipeline and config schema — do not resurrect.
 
-## 5. WhatsApp delivery — Twilio / WhatsApp Business API (optional, M4 stretch)
-- **Trigger:** only if `delivery.whatsapp_to` is set. Requires a Twilio/Business API credential in `.env` (the one place an external API key may appear). Out of scope unless explicitly built.
+## 5. Claude artifact publish — chat/voice bridge (M7, spike-gated)
+- **Mechanism:** the headless `claude -p "/orbit"` session publishes `digest.md` as a **private** claude.ai artifact; the HTML + email embed a `claude.ai/new?q=` prefilled-prompt link pointing at the artifact URL (fetch-on-open — links cannot upload files into a session).
+- **Failure posture:** hard fail-soft — if publish fails or is unsupported headless, ship the digest/email without the link. Spike must prove headless publish before any dependent work.
 
-## 6. Briefcast payload (optional, M4 stretch)
+## 6. Briefcast payload (optional)
 - Emit the TL;DR + episode list as a Briefcast script payload (a file/format), not a live integration — no auth surface.
 
 ## Cross-cutting security posture (brief §4, §8)

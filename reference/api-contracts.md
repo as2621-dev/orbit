@@ -5,7 +5,7 @@
 **When to update:** when a config field or DB table/column is added, renamed, or removed. A schema change here implies a `store.py` migration (keep the WAL + lightweight-migration pattern lifted from last30days).
 
 ## Config schema — `orbit.config.json`
-Per-user from day one (brief §1). Non-secret config lives here; secrets (explicit cookies, WhatsApp/Twilio creds) live in `.env`.
+Per-user from day one (brief §1). Non-secret config lives here; secrets (explicit cookies, `GMAIL_APP_PASSWORD`, `ORBIT_EMAIL_FROM`) live in `.env`.
 
 ```jsonc
 {
@@ -24,14 +24,15 @@ Per-user from day one (brief §1). Non-secret config lives here; secrets (explic
   // the main cost/time lever (brief §7): how many items get transcribed / deep-pulled
   "depth": "default",                   // quick | default | deep
 
-  // where output goes
+  // where output goes — TARGET SHAPE as of 2026-07-18 (M5): email replaces
+  // imessage_to/whatsapp_to, which are REMOVED (config migration + code change together)
   "delivery": {
     "html_path": "~/orbit/out/today.html",
-    "imessage_to": "+15551234567",      // optional; AppleScript delivery (macOS)
-    "whatsapp_to": null                 // optional; Twilio/Business API (M4 stretch)
+    "email_to": "you@example.com"       // optional; summary email + Tiles HTML attachment via Gmail SMTP
   },
 
-  // cron expression — used by the README setup step / --setup wizard
+  // daily run time — consumed by the --setup wizard's launchd StartCalendarInterval
+  // agent (M6; was a cron expression when the scheduler was crontab)
   "schedule": "0 7 * * *"
 }
 ```

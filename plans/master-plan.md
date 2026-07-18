@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-18
 **Source brief:** documents/product-brief.md
-**Status:** Active
+**Status:** SUPERSEDED by `plans/prd.md` (2026-07-18) — kept for history; do not plan from this doc
 
 ## Vision (one paragraph)
 

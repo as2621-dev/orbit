@@ -1,6 +1,6 @@
 # Stack Notes — Orbit
 
-**Why this doc exists:** the "things future-you will forget" file — version pins, gotchas, and what is lifted from where. `/run-phase` reads it to avoid relearning the reference implementation's quirks. It is the bridge between this fresh repo and `mvanhorn/last30days-skill`.
+**Why this doc exists:** the "things future-you will forget" file — version pins, gotchas, and what is lifted from where. `/grab-issue` reads it to avoid relearning the reference implementation's quirks. It is the bridge between this fresh repo and `mvanhorn/last30days-skill`.
 
 **When to update:** when a version is pinned, a non-obvious gotcha is discovered, or a module is lifted/adapted (note what changed from the original).
 
@@ -34,3 +34,10 @@ Reference clone location: `/Users/asheshsrivastava/last30days-skill`. Pipeline m
 - **Rate limits on X.** Cookie-based reads are ToS-gray; pace conservatively, honor `depth`, rotate deep-pulled handles for large follow counts. Aggressive volume risks flagging the account.
 - **LLM spend is the user's.** All classify/chapterize/cluster-label/summarize tokens hit the user's own Claude Code/Codex plan. `depth` (`quick|default|deep`) is the only throttle; default to `default`. Put a rough daily-cost estimate in the README.
 - **`reference/save-html-brief.md`** in the clone is the closest analog to Orbit's Design Brief — read it when building Stage 7 render.
+
+## Gotchas — email + launchd pivot (2026-07-18, M5-M7)
+- **Gmail will not render Tiles inline.** ~102KB body clip, grid/flex/`@font-face` stripped, base64 `data:` images blocked, `file://` links dead. The design is summary body + HTML **attachment**; never attempt inline rendering.
+- **App passwords need 2FA.** A Google account without 2FA cannot mint app passwords — setup must detect auth rejection and say so (`fix_suggestion`), not loop.
+- **launchd, not cron, and migrate the old entry.** `StartCalendarInterval` fires a missed 07:00 run on next wake (cron silently skips — the whole point of the switch). Install is idempotent by label (`com.orbit.daily`): `launchctl bootout` before re-`bootstrap`, plist in `~/Library/LaunchAgents`. Setup must also remove the legacy `# orbit-daily-digest`-tagged crontab line or two schedulers race (see the Phase-5 double-orchestrator incident).
+- **Headless artifact publish is unproven.** M7's chat link depends on the `claude -p` session being able to publish an artifact; spike it first, and everything downstream of the link is fail-soft.
+- **SMTP is an injected boundary.** Like the cron runner and LLM classifier, tests fake the transport (`smtplib.SMTP_SSL`), never the message-building logic; assert no credential appears in headers or logs.

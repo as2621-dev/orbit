@@ -217,3 +217,16 @@ A daily HTML page summarizing your YouTube subs and X follows, organized by crea
 | State store | `scripts/store.py` |
 | HTML render | `lib/render.py`, `lib/html_render.py` |
 | Plugin/skill packaging | `.claude-plugin/`, `skills/last30days/SKILL.md` |
+
+---
+
+## 11. Delta addendum — 2026-07-17/18 rulings (SUPERSEDE conflicting sections above)
+
+Locked in conversation after Phases 1–8 shipped; these override §3 Stage 7, §6, and §9 item 4 where they conflict:
+
+1. **Delivery is email-only. iMessage is REMOVED** (not optional — deleted from the pipeline). The dead WhatsApp path is deleted too. Briefcast payload stays as-is (file emit, no auth).
+2. **Email design: short summary body + the self-contained Tiles HTML attached.** No email-native re-render of Tiles (Gmail's ~102KB clip, grid/flex/`@font-face` hostility, and blocked base64 `data:` images make inline rendering a dead end; a `file://` link is dead in Gmail). Send via **SMTP + Gmail app password** from `.env`.
+3. **Scheduling stays local; cron → launchd.** A `StartCalendarInterval` LaunchAgent at 07:00 replaces the crontab entry, so a run missed while asleep fires on next wake (email is async — arriving-at-wake is acceptable). Server-side cron re-examined and rejected again: browser-cookie auth and subscription LLM can't leave the machine.
+4. **Chat/voice bridge (follow-up, not v1):** the pipeline additionally writes a **`digest.md`** markdown twin, publishes it as a **Claude artifact** from the headless run, and embeds a "Chat about this digest" link (`claude.ai/new?q=` prefilled prompt pointing at the artifact URL) in the HTML + email. A link cannot upload files into a new session — fetch-on-open is the mechanism. Gated on a spike proving artifact publish works headless.
+5. **No adjacent-creator suggestions.** Discovery/recommendation of new creators is out of scope; curation remains confirm/prioritize over existing follows.
+6. **Known defect to fix:** the setup wizard's confirmed per-channel categories are computed but never persisted — user flips must be written to `sources` and must survive the weekly source refresh.
