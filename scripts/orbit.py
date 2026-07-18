@@ -27,7 +27,7 @@ from typing import Any, Callable, Optional
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
 
 import store  # noqa: E402  (import must follow the sys.path insert above)
-from lib import bird_x, classify, deliver, log, render  # noqa: E402
+from lib import bird_x, classify, deliver, log, render, runlock  # noqa: E402
 from lib.bird_x import Follow, Tweet, XAuthError  # noqa: E402
 from lib.classify import LlmClassifier, _default_llm_classifier  # noqa: E402
 from lib.cluster import Cluster, cluster_overlaps  # noqa: E402
@@ -987,7 +987,41 @@ def run_stage7_deliver(
 
 
 def run_pipeline(depth: str) -> int:
-    """Run the Orbit pipeline. Stage 0 is real; later stages are still stubs.
+    """Run the Orbit pipeline under the single-run lock, skipping if another run holds it.
+
+    Both the launchd 7am agent (which fires a missed run on wake) and a manual ``/orbit``
+    reach here. The run-lock (:func:`lib.runlock.acquire_run_lock`) makes overlapping runs
+    exclusive: if a previous run is still in flight, this one exits early (0) with a clear
+    ``pipeline_skipped_already_running`` log rather than racing on the shared SQLite state.
+    A crashed run releases the lock automatically (kernel-managed ``flock``), so the next
+    scheduled run is never blocked by a dead one.
+
+    Args:
+        depth: One of ``quick``, ``default``, ``deep`` — selects how much work each stage
+            performs.
+
+    Returns:
+        Process exit code (0 on success or an intentional already-running skip, non-zero on
+        a Stage-0 auth failure).
+    """
+    try:
+        with runlock.acquire_run_lock():
+            return _run_pipeline_stages(depth)
+    except runlock.RunLockHeld as exc:
+        log.log_warning(
+            "pipeline_skipped_already_running",
+            fix_suggestion=(
+                "Another Orbit run is still in flight; this run exited without touching the "
+                "shared SQLite state. It will run again at the next scheduled time."
+            ),
+            depth=depth,
+            error_message=str(exc),
+        )
+        return 0
+
+
+def _run_pipeline_stages(depth: str) -> int:
+    """Run the Orbit pipeline stages (Stage 0 real; the run-lock is held by the caller).
 
     Args:
         depth: One of ``quick``, ``default``, ``deep`` — selects how much work

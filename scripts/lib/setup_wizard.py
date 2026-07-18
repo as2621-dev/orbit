@@ -1,4 +1,4 @@
-"""The `/orbit --setup` first-run wizard + OS-cron-entry generation (Phase 6 / Sub-phase 2).
+"""The `/orbit --setup` first-run wizard (Phase 6 / Sub-phase 2).
 
 Implements the 5-step setup from brief §8.3: read the user's YouTube subscriptions and
 X follows (M1/M2 loaders), auto-classify each creator's recent titles into signal/noise
@@ -6,17 +6,22 @@ via the EXISTING two-axis classify path (:func:`lib.classify.classify_item` — 
 classifier), present categories for confirmation, let the user pick priority creators
 (``creator_weights``), seed ``interests`` from subscription titles, set the delivery
 target, write ``orbit.config.json`` matching ``reference/api-contracts.md``, and INSTALL
-the OS cron entry (``<cron_expr> cd <repo> && claude -p "/orbit"``) at the fixed 7am
-default — falling back to printing it for manual pasting if the crontab write fails.
+the wake-proof daily-run scheduler — a launchd LaunchAgent installed via
+:func:`lib.scheduler.install_daily_scheduler` at the fixed 7am default (which also retires
+the legacy orbit crontab line) — falling back to printing manual plist instructions if
+``launchctl`` is unavailable.
 
 Rule 5 discipline: the ONLY model use is the auto-classify judgment call (routed through
-the injectable :data:`lib.classify.LlmClassifier`). EVERYTHING else — cron-string
-building, prompt routing, weight assembly, IO — is deterministic code.
+the injectable :data:`lib.classify.LlmClassifier`). EVERYTHING else — schedule handling,
+prompt routing, weight assembly, IO — is deterministic code. All scheduler install (plist
+generation, launchctl, cron migration) lives in :mod:`lib.scheduler`; the wizard only calls
+into it (the 500-line-file convention drove the extraction — conventions.md §File size).
 
 Dependency-injection discipline (so tests never touch live services): the subscription
 loader, the X-following loader, the LLM classifier, the interactive ``input`` function,
-and the config-output path are ALL injectable. The defaults wire the real loaders /
-``input`` / config path; tests inject mocks + a tmp path.
+the config-output path, and the launchctl/crontab boundaries are ALL injectable. The
+defaults wire the real loaders / ``input`` / config path / launchctl; tests inject mocks +
+a tmp path.
 
 Stdlib-only (pydantic is NOT an Orbit dependency).
 """
@@ -24,14 +29,13 @@ Stdlib-only (pydantic is NOT an Orbit dependency).
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 # Make ``lib`` importable whether this module is imported as the package member
-# ``lib.setup_wizard`` (via orbit.py's sys.path insert of the scripts dir) or run from
-# the scripts dir directly. Mirrors config.py / youtube_yt.py's sys.path pattern.
+# ``lib.setup_wizard`` (via orbit.py's sys.path insert of the scripts dir) or run from the
+# scripts dir directly. Mirrors config.py / youtube_yt.py's sys.path pattern.
 _LIB_DIR = Path(__file__).parent.resolve()
 _SCRIPTS_DIR = _LIB_DIR.parent.resolve()
 for _candidate_dir in (_SCRIPTS_DIR, _LIB_DIR):
@@ -39,16 +43,11 @@ for _candidate_dir in (_SCRIPTS_DIR, _LIB_DIR):
         sys.path.insert(0, str(_candidate_dir))
 
 import store  # noqa: E402
-from lib import classify, log, subproc  # noqa: E402
+from lib import classify, log, scheduler  # noqa: E402
 from lib.bird_x import Follow, XAuthError, load_x_following  # noqa: E402
 from lib.classify import LlmClassifier, _default_llm_classifier  # noqa: E402
-from lib.config import DEFAULT_CONFIG_FILENAME, DEFAULT_SCHEDULE, is_valid_cron_expression  # noqa: E402
+from lib.config import DEFAULT_CONFIG_FILENAME, DEFAULT_SCHEDULE  # noqa: E402
 from lib.youtube_yt import Subscription, load_youtube_subscriptions  # noqa: E402
-
-# The default scheduler command, per brief §8.3 step 5 / §2 (OS cron -> claude -p "/orbit").
-# ``{repo}`` is the directory the user runs Orbit from; the cron line cds there first so
-# the relative ``orbit.config.json`` resolves the same way a manual run would.
-_DEFAULT_CRON_COMMAND_TEMPLATE: str = 'cd {repo} && claude -p --dangerously-skip-permissions "/orbit"'
 
 # A weight applied to every creator the user marks as priority. The brief leaves the
 # exact value to the maintainer; 2.0 is a clear "thumb on the scale" (api-contracts.md
@@ -61,224 +60,6 @@ _DEFAULT_HTML_PATH: str = "~/orbit/out/today.html"
 # The classify Axis-A prior every channel starts from before the model judges it: a
 # subscription is a signal source by default (mirrors persist_subscriptions' "signal").
 _DEFAULT_CHANNEL_CATEGORY: str = "signal"
-
-# Trailing comment tag on Orbit's installed crontab line. ``install_cron_entry`` matches
-# any existing line CONTAINING this marker for replacement, so re-running the wizard
-# updates the single Orbit line in place instead of appending duplicates.
-_ORBIT_CRON_MARKER: str = "# orbit-daily-digest"
-
-# Timeout (seconds) for a single ``crontab`` subprocess. Reading/writing a crontab is a
-# fast local op; a small ceiling keeps a hung ``crontab`` binary from stalling setup.
-_CRONTAB_TIMEOUT_SECONDS: int = 15
-
-# The injectable subprocess boundary for crontab I/O: called as
-# ``crontab_runner(command, stdin_text)`` and returns a :class:`lib.subproc.SubprocResult`.
-# Production wires :func:`_default_crontab_runner`; tests inject a scripted fake so no test
-# ever touches the real user crontab (mirrors bird_x.py's ``subproc`` injection posture).
-CrontabRunner = Callable[[list[str], Optional[str]], subproc.SubprocResult]
-
-
-def generate_cron_entry(schedule: str, command: Optional[str] = None, *, repo_path: Optional[Path] = None) -> str:
-    """Build a syntactically valid crontab line ``"<cron_expr> <command>"`` (PURE, Rule 5).
-
-    Deterministic string assembly — no I/O, no model. Validates ``schedule`` via
-    :func:`lib.config.is_valid_cron_expression` and FAILS LOUD (Rule 12) with a clear
-    :class:`ValueError` if it is malformed, so a broken schedule never reaches the user's
-    crontab. The default ``command`` reflects brief §8.3 step 5 / §2 — it ``cd``s into the
-    repo and invokes ``claude -p "/orbit"`` — with the repo directory injectable
-    (``repo_path``) so the line is testable; an explicit ``command`` overrides it entirely.
-
-    Args:
-        schedule: A 5-field cron expression (e.g. ``"0 7 * * *"`` for 7am daily).
-        command: An explicit command to run; when None, the default
-            ``cd <repo> && claude -p "/orbit"`` is built from ``repo_path``.
-        repo_path: The directory the cron command ``cd``s into; defaults to the current
-            working directory. Ignored when an explicit ``command`` is given.
-
-    Returns:
-        A single crontab line: the validated cron expression, a space, then the command.
-
-    Raises:
-        ValueError: If ``schedule`` is not a syntactically valid 5-field cron expression.
-
-    Example:
-        >>> generate_cron_entry("0 7 * * *", repo_path=Path("/home/me/orbit"))
-        '0 7 * * * cd /home/me/orbit && claude -p "/orbit"'
-    """
-    if not is_valid_cron_expression(schedule):
-        log.log_error(
-            "setup_invalid_cron_entry_schedule",
-            fix_suggestion=(
-                "Pass a 5-field cron expression (minute hour day-of-month month day-of-week), "
-                "e.g. '0 7 * * *' for 7am daily."
-            ),
-            invalid_schedule=schedule,
-        )
-        raise ValueError(
-            f"Cannot build a cron entry from {schedule!r}: not a valid 5-field cron "
-            "expression. Expected e.g. '0 7 * * *'."
-        )
-
-    if command is None:
-        resolved_repo = repo_path if repo_path is not None else Path.cwd()
-        command = _DEFAULT_CRON_COMMAND_TEMPLATE.format(repo=resolved_repo)
-
-    return f"{schedule} {command}"
-
-
-def _default_crontab_runner(command: list[str], stdin_text: Optional[str]) -> subproc.SubprocResult:
-    """Run one ``crontab`` command via subprocess (the production :data:`CrontabRunner`).
-
-    Reads (``crontab -l``, ``stdin_text=None``) or writes (``crontab -`` with the new
-    crontab text piped on stdin). Returns a :class:`lib.subproc.SubprocResult` so
-    :func:`install_cron_entry` inspects ``returncode``/``stdout``/``stderr`` uniformly.
-    Argument-list form (never ``shell=True``) so nothing is shell-interpolated.
-
-    Args:
-        command: The crontab argv, e.g. ``["crontab", "-l"]`` or ``["crontab", "-"]``.
-        stdin_text: Text piped to the process stdin (the new crontab body) on a write,
-            or None on a read.
-
-    Returns:
-        A :class:`lib.subproc.SubprocResult` with the process return code and captured
-        stdout/stderr.
-
-    Raises:
-        OSError: If the ``crontab`` binary cannot be spawned (missing/not on PATH). The
-            caller (:func:`install_cron_entry`) catches this and fails soft.
-        subprocess.SubprocessError: On a subprocess-level failure (e.g. timeout).
-    """
-    completed = subprocess.run(
-        command,
-        input=stdin_text,
-        capture_output=True,
-        text=True,
-        timeout=_CRONTAB_TIMEOUT_SECONDS,
-        check=False,
-    )
-    return subproc.SubprocResult(
-        returncode=completed.returncode,
-        stdout=completed.stdout or "",
-        stderr=completed.stderr or "",
-    )
-
-
-def _existing_crontab_lines(read_result: subproc.SubprocResult) -> Optional[list[str]]:
-    """Interpret a ``crontab -l`` result into the current crontab lines (or a read failure).
-
-    A zero return code yields the crontab's lines verbatim. A non-zero return code is
-    ambiguous: ``crontab -l`` exits non-zero both for the benign "no crontab for user"
-    first-run case AND for a genuine error. We treat an empty stderr or a "no crontab"
-    stderr as an EMPTY crontab (a safe fresh start), but signal a genuine read failure
-    (``None``) for anything else — so :func:`install_cron_entry` fails soft rather than
-    piping a fresh crontab that could clobber an existing one it merely failed to read.
-
-    Args:
-        read_result: The result of the ``crontab -l`` invocation.
-
-    Returns:
-        The existing crontab lines (possibly empty) on a readable crontab, or ``None``
-        when the read genuinely failed and the current crontab is unknown.
-    """
-    if read_result.returncode == 0:
-        return read_result.stdout.splitlines()
-    stderr_lower = read_result.stderr.lower()
-    if not read_result.stderr.strip() or "no crontab" in stderr_lower:
-        return []
-    return None
-
-
-def install_cron_entry(cron_entry: str, *, crontab_runner: CrontabRunner = _default_crontab_runner) -> bool:
-    """Install ``cron_entry`` into the user's crontab idempotently, failing SOFT on error.
-
-    Reads the current crontab via ``crontab_runner``, DROPS any existing line containing
-    :data:`_ORBIT_CRON_MARKER` (so a re-run replaces the single Orbit line rather than
-    appending a duplicate), appends ``cron_entry`` tagged with the trailing marker, and
-    pipes the result back via ``crontab -``. All crontab I/O goes through the injected
-    ``crontab_runner`` so tests never touch the real crontab.
-
-    Fail-soft posture (Rule 12 surfaced, not swallowed): a missing ``crontab`` binary, a
-    genuinely unreadable crontab, or a non-zero write all log
-    ``setup_cron_install_failed`` with a ``fix_suggestion`` and return ``False`` — the
-    caller then falls back to printing the entry for manual pasting, so a sandboxed / CI
-    run still completes setup.
-
-    Args:
-        cron_entry: The crontab line to install (untagged; the marker is appended here),
-            e.g. ``'0 7 * * * cd /repo && claude -p "/orbit"'``.
-        crontab_runner: The injectable crontab subprocess boundary; defaults to
-            :func:`_default_crontab_runner`. Tests inject a scripted fake.
-
-    Returns:
-        ``True`` when the crontab was updated, ``False`` on any failure (caller degrades
-        to the print-and-paste fallback).
-
-    Example:
-        >>> install_cron_entry('0 7 * * * echo hi', crontab_runner=my_fake)  # doctest: +SKIP
-        True
-    """
-    try:
-        read_result = crontab_runner(["crontab", "-l"], None)
-    except (OSError, subprocess.SubprocessError) as exc:
-        log.log_error(
-            "setup_cron_install_failed",
-            fix_suggestion=(
-                "Could not read the current crontab. Ensure the 'crontab' binary is installed "
-                "and on PATH, then add the printed cron line manually via `crontab -e`."
-            ),
-            phase="read",
-            error_message=str(exc),
-        )
-        return False
-
-    existing_lines = _existing_crontab_lines(read_result)
-    if existing_lines is None:
-        log.log_error(
-            "setup_cron_install_failed",
-            fix_suggestion=(
-                "Reading the current crontab failed unexpectedly; refusing to overwrite it. "
-                "Add the printed cron line manually via `crontab -e`."
-            ),
-            phase="read",
-            returncode=read_result.returncode,
-            stderr=read_result.stderr.strip(),
-        )
-        return False
-
-    tagged_entry = f"{cron_entry} {_ORBIT_CRON_MARKER}"
-    kept_lines = [line for line in existing_lines if _ORBIT_CRON_MARKER not in line]
-    kept_lines.append(tagged_entry)
-    new_crontab = "\n".join(kept_lines) + "\n"
-
-    try:
-        write_result = crontab_runner(["crontab", "-"], new_crontab)
-    except (OSError, subprocess.SubprocessError) as exc:
-        log.log_error(
-            "setup_cron_install_failed",
-            fix_suggestion=(
-                "Could not write the updated crontab. Ensure the 'crontab' binary is installed "
-                "and on PATH, then add the printed cron line manually via `crontab -e`."
-            ),
-            phase="write",
-            error_message=str(exc),
-        )
-        return False
-
-    if write_result.returncode != 0:
-        log.log_error(
-            "setup_cron_install_failed",
-            fix_suggestion=(
-                "The 'crontab -' write returned non-zero; the schedule was not installed. "
-                "Add the printed cron line manually via `crontab -e`."
-            ),
-            phase="write",
-            returncode=write_result.returncode,
-            stderr=write_result.stderr.strip(),
-        )
-        return False
-
-    log.log_info("setup_cron_installed", cron_marker=_ORBIT_CRON_MARKER)
-    return True
 
 
 def _prompt(input_fn: Callable[[str], str], message: str, default: str = "") -> str:
@@ -526,6 +307,47 @@ def _write_config(config: dict[str, Any], config_path: Path) -> None:
     log.log_info("setup_config_written", config_path=str(config_path))
 
 
+def _install_daily_schedule(
+    schedule: str,
+    *,
+    repo_path: Optional[Path],
+    launch_agents_dir: Optional[Path],
+    launchctl_runner: scheduler.LaunchctlRunner,
+    crontab_runner: scheduler.CrontabRunner,
+) -> None:
+    """Install the wake-proof daily launchd agent (step 5), printing a manual fallback on failure.
+
+    Delegates ALL scheduler logic to :func:`lib.scheduler.install_daily_scheduler` (Rule 5
+    — wiring only). On success prints where the agent landed; on a soft failure (sandboxed /
+    no ``launchctl``) prints the manual plist instructions so setup still completes.
+
+    Args:
+        schedule: The fixed 7am cron schedule (drives the plist calendar interval).
+        repo_path: The agent's working directory; defaults to cwd when None.
+        launch_agents_dir: The LaunchAgents directory (tmp path in tests).
+        launchctl_runner: The injectable launchctl boundary (faked in tests).
+        crontab_runner: The injectable crontab boundary for the cron migration (faked in tests).
+    """
+    installed = scheduler.install_daily_scheduler(
+        schedule,
+        repo_path=repo_path,
+        launch_agents_dir=launch_agents_dir,
+        launchctl_runner=launchctl_runner,
+        crontab_runner=crontab_runner,
+    )
+    if installed:
+        plist_path = scheduler.default_plist_path(launch_agents_dir)
+        print("\nInstalled your daily Orbit run as a launchd agent (com.orbit.daily, 7am, catches up on wake):\n")
+        print(f"  {plist_path}\n")
+    else:
+        print("\nCouldn't install the launchd agent automatically. Set it up yourself:\n")
+        print(
+            scheduler.manual_setup_instructions(
+                repo_path=repo_path, launch_agents_dir=launch_agents_dir, schedule=schedule
+            )
+        )
+
+
 def run_setup_wizard(
     *,
     cookie_source: str = "chrome",
@@ -536,7 +358,9 @@ def run_setup_wizard(
     llm_classifier: LlmClassifier = _default_llm_classifier,
     input_fn: Callable[[str], str] = input,
     store_module: Any = store,
-    crontab_runner: CrontabRunner = _default_crontab_runner,
+    launch_agents_dir: Optional[Path] = None,
+    launchctl_runner: scheduler.LaunchctlRunner = scheduler._default_launchctl_runner,
+    crontab_runner: scheduler.CrontabRunner = scheduler._default_crontab_runner,
 ) -> int:
     """Run the interactive first-run wizard (brief §8.3), writing ``orbit.config.json``.
 
@@ -553,26 +377,34 @@ def run_setup_wizard(
          schedule is NOT asked — it is fixed at :data:`lib.config.DEFAULT_SCHEDULE` (7am
          daily) per the 2026-07-06 local-auto-cron decision, still written to the config.
       5. Write ``orbit.config.json`` (api-contracts.md shape) to ``config_path``, then
-         INSTALL the OS cron entry via :func:`install_cron_entry` (fail-soft: on any
-         crontab error it falls back to printing the entry for manual pasting).
+         INSTALL the wake-proof launchd agent via
+         :func:`lib.scheduler.install_daily_scheduler` (which also retires the legacy orbit
+         crontab line). Fail-soft: on any launchctl error it prints manual plist
+         instructions instead.
 
     ALL external boundaries are injectable so tests run offline: loaders, the LLM
-    classifier, the ``input`` function, and the config output path. The defaults wire the
-    real loaders / ``input`` / ``./orbit.config.json``.
+    classifier, the ``input`` function, the config output path, and the launchctl/crontab
+    subprocess runners. The defaults wire the real loaders / ``input`` /
+    ``./orbit.config.json`` / real launchctl.
 
     Args:
         cookie_source: Default browser name (or ``"env"``) for cookie reading.
         config_path: Where to write the config; defaults to ``./orbit.config.json``.
-        repo_path: The repo directory the printed cron entry ``cd``s into; defaults to cwd.
+        repo_path: The repo directory the launchd agent runs in; defaults to cwd.
         youtube_loader: Subscription loader; defaults to ``load_youtube_subscriptions``.
         x_loader: X following loader; defaults to ``load_x_following``.
         llm_classifier: The injectable classify LLM boundary; tests inject a mock.
         input_fn: The injectable input function; defaults to builtin ``input``.
         store_module: The store module used by the classify path (injectable; defaults to
             :mod:`store`). Tests inject a mock so auto-classify never touches the real DB.
-        crontab_runner: The injectable crontab subprocess boundary; defaults to
-            :func:`_default_crontab_runner`. Tests inject a scripted fake so setup never
-            touches the real user crontab.
+        launch_agents_dir: The LaunchAgents directory the plist is written to; defaults to
+            ``~/Library/LaunchAgents``. Tests pass a tmp path.
+        launchctl_runner: The injectable launchctl boundary; defaults to
+            :func:`lib.scheduler._default_launchctl_runner`. Tests inject a scripted fake so
+            setup never runs a real ``launchctl``.
+        crontab_runner: The injectable crontab boundary for the cron migration; defaults to
+            :func:`lib.scheduler._default_crontab_runner`. Tests inject a scripted fake so
+            setup never touches the real user crontab.
 
     Returns:
         Process exit code: 0 on success.
@@ -600,7 +432,7 @@ def run_setup_wizard(
     )
     creator_weights = _pick_priority_creators(creators, input_fn=input_fn)
 
-    # Step 4: delivery. The schedule is no longer asked (decision 2026-07-06 — local auto-cron
+    # Step 4: delivery. The schedule is no longer asked (decision 2026-07-06 — local auto-run
     # at a fixed 7am): the wizard installs DEFAULT_SCHEDULE itself in step 5. The config still
     # carries ``schedule`` so its api-contracts shape is unchanged and user-editable.
     delivery = _gather_delivery(input_fn)
@@ -617,16 +449,16 @@ def run_setup_wizard(
 
     _write_config(config, resolved_config_path)
 
-    # Step 5: install the OS cron entry directly. On failure, fall back to printing it for
-    # manual pasting so a sandboxed/CI run still completes setup (install_cron_entry logs why).
-    cron_entry = generate_cron_entry(schedule, repo_path=repo_path)
-    log.log_info("setup_cron_entry_generated", cron_entry=cron_entry)
-    if install_cron_entry(cron_entry, crontab_runner=crontab_runner):
-        print("\nInstalled your daily Orbit schedule in crontab:\n")
-        print(f"  {cron_entry} {_ORBIT_CRON_MARKER}\n")
-    else:
-        print("\nCouldn't install the crontab entry automatically. Add this line yourself (run `crontab -e`):\n")
-        print(f"  {cron_entry}\n")
+    # Step 5: install the wake-proof launchd agent (and migrate out the legacy cron line).
+    # On failure, fall back to printing manual plist instructions so a sandboxed/CI run
+    # still completes setup (install_daily_scheduler logs why).
+    _install_daily_schedule(
+        schedule,
+        repo_path=repo_path,
+        launch_agents_dir=launch_agents_dir,
+        launchctl_runner=launchctl_runner,
+        crontab_runner=crontab_runner,
+    )
 
     log.log_info(
         "setup_wizard_completed",
