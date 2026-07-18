@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections.abc import Mapping
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -449,9 +450,7 @@ def run_stage1_build_x_items(
         if classification.category == "other":
             category_dropped_count += 1
             continue
-        rankable_items.append(
-            RankableItem.from_tweet(tweet, classification, creator_external_id=tweet.handle)
-        )
+        rankable_items.append(RankableItem.from_tweet(tweet, classification, creator_external_id=tweet.handle))
 
     log.log_info(
         "x_stage1_build_completed",
@@ -640,9 +639,7 @@ def run_stage1_build_youtube_items(
             # rest (short -> [], creator chapters -> deterministic, else snap to cues).
             transcript: Optional[Transcript] = None
             needs_transcript = (
-                upload.duration is not None
-                and upload.duration > LONG_FORM_THRESHOLD_SECONDS
-                and not upload.chapters
+                upload.duration is not None and upload.duration > LONG_FORM_THRESHOLD_SECONDS and not upload.chapters
             )
             if needs_transcript and transcripts_fetched < transcript_limit:
                 transcript = active_transcript_fetcher(upload.video_id, depth)
@@ -666,9 +663,7 @@ def run_stage1_build_youtube_items(
                 chapters = []
 
             rankable_items.append(
-                RankableItem.from_parts(
-                    upload, classification, chapters, creator_external_id=channel_id
-                )
+                RankableItem.from_parts(upload, classification, chapters, creator_external_id=channel_id)
             )
             # Mark seen AFTER a successful build so a mid-run crash never silently drops an
             # item by pre-marking it (delta-engine contract, youtube_yt.fetch_new_uploads).
@@ -938,35 +933,57 @@ def _build_delivery_summary(tiered_items: list[TieredItem], scoops: list[Trendin
 def run_stage7_deliver(
     tiered_items: list[TieredItem],
     scoops: list[TrendingItem],
+    written_paths: list[Path],
     config: OrbitConfig,
+    *,
+    transport: Optional[deliver.SmtpTransport] = None,
+    env: Optional[Mapping[str, str]] = None,
 ) -> None:
-    """Deliver the digest — Briefcast file emit only (no send step yet). Wiring only.
+    """Deliver the rendered digest — email send (PRD M5) plus the optional Briefcast file.
 
-    Runs AFTER :func:`run_stage7_render`. iMessage and WhatsApp delivery were deleted
-    (PRD story #8); the email send step is wired by the email-delivery slice (PRD M5).
-    Until then the digest is rendered to disk and this stage performs NO send — the
-    interim state is expected.
+    Runs AFTER :func:`run_stage7_render`, which returns ``written_paths`` (page 1 first,
+    page 2 when the digest spilled). iMessage and WhatsApp delivery were deleted (PRD story
+    #8); email is the single network delivery path.
 
-    The only wired output is Briefcast (stretch, integrations §6): a payload FILE gated
-    behind ``delivery.briefcast_path`` and skipped by default. When it is configured, the
-    deterministic one-line TL;DR (:func:`_build_delivery_summary` — no LLM, Rule 5) is
-    built as the payload header. Briefcast has no auth surface, so it survives the
-    iMessage/WhatsApp removal.
+    Two outputs, both no-ops until configured:
 
-    Business logic lives in :mod:`lib.deliver`; this stays sequencing only.
+      * Email (:func:`lib.deliver.deliver_email`) — sends the deterministic one-line TL;DR
+        (:func:`_build_delivery_summary` — no LLM, Rule 5) as the body with every
+        ``written_paths`` page attached. It SKIPS cleanly when ``delivery.email_to`` or the
+        ``.env`` credentials are unset, and a send failure is loud but non-fatal — so this
+        stage never crashes the pipeline or changes ``seen`` state.
+      * Briefcast (stretch, integrations §6) — a payload FILE gated behind
+        ``delivery.briefcast_path`` and skipped by default. No auth surface.
+
+    Business logic lives in :mod:`lib.deliver`; this stays sequencing only. The SMTP
+    ``transport`` and ``env`` are injectable so tests fake the boundary (default: real
+    ``smtplib.SMTP_SSL`` + ``os.environ``, resolved inside :func:`lib.deliver.deliver_email`).
 
     Args:
         tiered_items: The Stage-6 tiered items (for the TL;DR + Briefcast episode list).
         scoops: The Stage-5 scoops (the TL;DR leads with the loudest one).
+        written_paths: The rendered page paths from Stage 7 (page 1 first); attached to the email.
         config: The loaded :class:`OrbitConfig` (supplies the ``delivery`` targets).
+        transport: Optional injected SMTP factory; forwarded to ``deliver_email`` when set.
+        env: Optional injected environment mapping; forwarded to ``deliver_email`` when set.
     """
-    # Briefcast (stretch) — a payload file, gated behind its config key, skipped by
-    # default. A file, not a send: no auth surface. The TL;DR is only needed for the
-    # payload header, so build it inside the gate (no send step exists yet).
+    summary = _build_delivery_summary(tiered_items, scoops)
+
+    # Briefcast (stretch) — a payload file, gated behind its config key, skipped by default.
     briefcast_path = config.delivery.get("briefcast_path")
     if briefcast_path:
-        summary = _build_delivery_summary(tiered_items, scoops)
         deliver.emit_briefcast_payload(summary, list(tiered_items), briefcast_path)
+
+    # Email — the single delivery path (PRD M5). deliver_email owns the skip/retry/no-leak
+    # posture, so it is safe to call unconditionally: an unset recipient/credential skips.
+    # Only forward the injected boundaries when a caller supplied them (mirrors the
+    # inline_image seam in run_stage7_render) so the real defaults stay in one place.
+    email_kwargs: dict[str, Any] = {}
+    if transport is not None:
+        email_kwargs["transport"] = transport
+    if env is not None:
+        email_kwargs["env"] = env
+    deliver.deliver_email(summary, written_paths, config.delivery.get("email_to"), **email_kwargs)
 
 
 def run_pipeline(depth: str) -> int:
@@ -1022,12 +1039,8 @@ def run_pipeline(depth: str) -> int:
     # multiplier into rank and the three M3 sections into render. On the bare CLI run
     # rankable_items is empty, so this yields no clusters/trending/scoops and a neutral
     # multiplier map (the M1/M2 path is unchanged).
-    clusters, trending_items, scoops, trending_multipliers = run_stage5_overlap_trending_scoops(
-        rankable_items, config
-    )
-    tiered_items = run_stage6_rank_and_tier(
-        rankable_items, config, trending_multipliers=trending_multipliers
-    )
+    clusters, trending_items, scoops, trending_multipliers = run_stage5_overlap_trending_scoops(rankable_items, config)
+    tiered_items = run_stage6_rank_and_tier(rankable_items, config, trending_multipliers=trending_multipliers)
 
     # LLM editorial prose (Rule 5 — summarizing the day's feed is a valid model use).
     # Both go through the live claude-CLI boundary and are FAIL-SOFT (a flaky/absent LLM
@@ -1052,10 +1065,10 @@ def run_pipeline(depth: str) -> int:
         summaries=summaries,
     )
 
-    # Stage 7 (deliver) — the digest is already rendered to disk (written_paths). iMessage
-    # and WhatsApp delivery were deleted (PRD story #8); the email send step is wired by a
-    # later slice, so this stage performs no send yet and the run stays a clean exit-0.
-    run_stage7_deliver(tiered_items, scoops, config)
+    # Stage 7 (deliver) — email the rendered pages (PRD M5). deliver_email skips cleanly
+    # when the recipient/credentials are unconfigured and is loud-but-non-fatal on failure,
+    # so the run still exits 0 and seen state (written in Stage 1) is never disturbed.
+    run_stage7_deliver(tiered_items, scoops, written_paths, config)
 
     log.log_info(
         "pipeline_completed",
