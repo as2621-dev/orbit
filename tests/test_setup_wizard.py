@@ -36,11 +36,13 @@ import pytest
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from lib.bird_x import XAuthError  # noqa: E402
+import store  # noqa: E402
+from lib import paths  # noqa: E402
+from lib.bird_x import Follow, XAuthError, persist_following  # noqa: E402
 from lib.config import load_config  # noqa: E402
 from lib.setup_wizard import run_setup_wizard  # noqa: E402
 from lib.subproc import SubprocResult  # noqa: E402
-from lib.youtube_yt import Subscription  # noqa: E402
+from lib.youtube_yt import Subscription, persist_subscriptions  # noqa: E402
 
 
 def _scripted_input(answers: list[str]) -> MagicMock:
@@ -125,11 +127,31 @@ def _fake_store() -> MagicMock:
     """A store double for the classify path: no prior override, persist is a no-op.
 
     The classify path reads ``get_classification`` (None => no user override, so it asks
-    the LLM) and writes ``set_classification``. Mocking it keeps auto-classify entirely
-    offline — NO real per-user DB is touched (the directive's "IO mocked" rule).
+    the LLM) and writes ``set_classification``. ``get_source`` returns None so the wizard's
+    confirm step treats every creator as first-seen (auto-classify path, not the re-run
+    stored-default path). Mocking it keeps auto-classify entirely offline — NO real per-user
+    DB is touched (the directive's "IO mocked" rule).
     """
-    store = MagicMock()
-    store.get_classification.return_value = None
+    fake = MagicMock()
+    fake.get_classification.return_value = None
+    fake.get_source.return_value = None
+    return fake
+
+
+def _real_store(tmp_path: Path) -> object:
+    """Point the REAL store at a temp DB and initialize it; return the store module.
+
+    Unlike :func:`_fake_store` (a MagicMock that keeps auto-classify offline), this drives the
+    real SQLite store so a test can assert the PERSISTED category value — the acceptance bar is
+    "assert the persisted value, not that a function was called". The LLM boundary is still
+    mocked, so no live model call happens; only the DB is real (and thrown away with tmp_path).
+    """
+    import os
+
+    db_path = tmp_path / "orbit.db"
+    os.environ[paths.ORBIT_DB_PATH_ENV_VAR] = str(db_path)
+    store._db_override = db_path
+    store.init_db()
     return store
 
 
@@ -409,3 +431,219 @@ def test_wizard_prints_manual_plist_when_launchctl_unavailable(
     assert "setup_launchd_install_failed" in output  # the failure was surfaced, not hidden
     assert "launchctl bootstrap" in output  # the manual load command
     assert "com.orbit.daily" in output  # the agent to install
+
+
+def test_wizard_persists_user_flipped_noise_category(tmp_path: Path) -> None:
+    """A channel the user flips to noise during setup is PERSISTED as noise (user-set).
+
+    WHY (the discard bug): ``_confirm_categories`` returned a category map that nothing
+    assigned — the wizard never wrote ``sources`` rows, so a user's noise mark evaporated the
+    moment setup ended. We assert the PERSISTED value in the real store (not that a function was
+    called): the row must carry ``category='noise'`` AND ``category_is_user_override=1`` so the
+    mark both takes effect and survives later refreshes.
+    """
+    real_store = _real_store(tmp_path)
+    config_path = tmp_path / "orbit.config.json"
+
+    # cookie, confirm cat = 'n' (flip the auto 'signal' to noise), prioritize 'n', html, email.
+    answers = ["chrome", "n", "n", "~/orbit/out/today.html", ""]
+
+    exit_code = run_setup_wizard(
+        config_path=config_path,
+        repo_path=tmp_path,
+        youtube_loader=MagicMock(return_value=[Subscription(channel_id="UC_flip", display_name="Flip Me")]),
+        x_loader=MagicMock(return_value=[]),
+        llm_classifier=_signal_classifier(),
+        input_fn=_scripted_input(answers),
+        store_module=real_store,
+        launch_agents_dir=tmp_path / "LaunchAgents",
+        launchctl_runner=_FakeLaunchctl(),
+        crontab_runner=_FakeCrontab(),
+    )
+
+    assert exit_code == 0
+    row = real_store.get_source("youtube", "UC_flip")
+    assert row is not None, "the wizard did not persist the source row at all"
+    assert row["category"] == "noise", "the user's noise flip was not persisted"
+    assert row["category_is_user_override"] == 1, "the persisted category was not marked user-set"
+
+
+def test_user_category_survives_real_youtube_refresh(tmp_path: Path) -> None:
+    """A setup-time noise mark survives the REAL YouTube source refresh (driven end-to-end).
+
+    WHY (the clobber bug): the issue is explicit that this must exercise the real refresh path,
+    not ``upsert_source`` in isolation. The user flips a channel to noise in setup; then
+    ``persist_subscriptions`` — the weekly Stage-0 refresh, which re-upserts every channel with a
+    hardcoded ``category='signal'`` — runs. Before the fix that reset the mark weekly; the row
+    must still read noise.
+    """
+    real_store = _real_store(tmp_path)
+    config_path = tmp_path / "orbit.config.json"
+    answers = ["chrome", "n", "n", "~/orbit/out/today.html", ""]
+
+    run_setup_wizard(
+        config_path=config_path,
+        repo_path=tmp_path,
+        youtube_loader=MagicMock(return_value=[Subscription(channel_id="UC_weekly", display_name="Weekly")]),
+        x_loader=MagicMock(return_value=[]),
+        llm_classifier=_signal_classifier(),
+        input_fn=_scripted_input(answers),
+        store_module=real_store,
+        launch_agents_dir=tmp_path / "LaunchAgents",
+        launchctl_runner=_FakeLaunchctl(),
+        crontab_runner=_FakeCrontab(),
+    )
+    assert real_store.get_source("youtube", "UC_weekly")["category"] == "noise"
+
+    # The weekly Stage-0 refresh re-upserts the same channel with the hardcoded signal category.
+    persist_subscriptions([Subscription(channel_id="UC_weekly", display_name="Weekly")])
+
+    assert real_store.get_source("youtube", "UC_weekly")["category"] == "noise", (
+        "the weekly YouTube refresh clobbered the user's noise mark"
+    )
+
+
+def test_user_category_survives_real_x_refresh(tmp_path: Path) -> None:
+    """A setup-time noise mark survives the REAL X source refresh — the DAILY, unguarded one.
+
+    WHY: the X refresh (``persist_following``) has no weekly cache guard, so it re-upserts every
+    handle with ``category='signal'`` on EVERY run — it reset a user's noise mark daily, the more
+    urgent of the two paths per the issue. The user flips an X handle to noise in setup; after a
+    real ``persist_following`` the row must still read noise.
+    """
+    real_store = _real_store(tmp_path)
+    config_path = tmp_path / "orbit.config.json"
+    answers = ["chrome", "n", "n", "~/orbit/out/today.html", ""]
+
+    run_setup_wizard(
+        config_path=config_path,
+        repo_path=tmp_path,
+        youtube_loader=MagicMock(return_value=[]),
+        x_loader=MagicMock(return_value=[Follow(creator_handle="daily_x", display_name="Daily X", rest_id="42")]),
+        llm_classifier=_signal_classifier(),
+        input_fn=_scripted_input(answers),
+        store_module=real_store,
+        launch_agents_dir=tmp_path / "LaunchAgents",
+        launchctl_runner=_FakeLaunchctl(),
+        crontab_runner=_FakeCrontab(),
+    )
+    assert real_store.get_source("x", "daily_x")["category"] == "noise"
+
+    # The daily X refresh re-upserts the handle with the hardcoded signal category.
+    persist_following([Follow(creator_handle="daily_x", display_name="Daily X", rest_id="42")])
+
+    assert real_store.get_source("x", "daily_x")["category"] == "noise", (
+        "the daily X refresh clobbered the user's noise mark"
+    )
+
+
+def test_wizard_initializes_and_migrates_the_db_before_persisting(tmp_path: Path) -> None:
+    """Running --setup on a populated v1 DB migrates it and persists — it does NOT crash.
+
+    WHY (the production path the other tests masked): the --setup path never calls init_db on
+    its own (only the pipeline's Stage 0 does), so the wizard must initialize the store itself
+    before it reads/writes ``sources``. This drives the user's real situation — an existing v1
+    DB that predates the ``category_is_user_override`` column — WITHOUT pre-initializing it, and
+    proves the wizard applies migration 2, preserves the existing row, and persists the new mark
+    instead of raising ``no such column`` / ``KeyError``.
+    """
+    import os
+    import sqlite3
+
+    db_path = tmp_path / "orbit.db"
+    os.environ[paths.ORBIT_DB_PATH_ENV_VAR] = str(db_path)
+    store._db_override = db_path
+
+    # Build a genuine populated v1 DB (baseline schema only, no migrations, no new column).
+    seed_conn = sqlite3.connect(str(db_path))
+    seed_conn.executescript(store.SCHEMA_ORBIT_V1)
+    seed_conn.execute(
+        "INSERT INTO sources (platform, external_id, display_name, category) VALUES (?, ?, ?, ?)",
+        ("youtube", "UC_existing", "Existing", "signal"),
+    )
+    seed_conn.commit()
+    seed_conn.close()
+
+    config_path = tmp_path / "orbit.config.json"
+    # cookie, confirm cat = 'n' (flip auto signal -> noise), prioritize 'n', html, email.
+    answers = ["chrome", "n", "n", "~/orbit/out/today.html", ""]
+
+    # NOTE: no init_db() call here — the wizard must do it, or this run crashes.
+    exit_code = run_setup_wizard(
+        config_path=config_path,
+        repo_path=tmp_path,
+        youtube_loader=MagicMock(return_value=[Subscription(channel_id="UC_flip2", display_name="Flip Two")]),
+        x_loader=MagicMock(return_value=[]),
+        llm_classifier=_signal_classifier(),
+        input_fn=_scripted_input(answers),
+        store_module=store,  # the REAL store, deliberately un-initialized
+        launch_agents_dir=tmp_path / "LaunchAgents",
+        launchctl_runner=_FakeLaunchctl(),
+        crontab_runner=_FakeCrontab(),
+    )
+
+    assert exit_code == 0
+    # Migration 2 was applied by the wizard's init_db.
+    check = sqlite3.connect(str(db_path))
+    columns = {row[1] for row in check.execute("PRAGMA table_info(sources)")}
+    check.close()
+    assert "category_is_user_override" in columns, "the wizard did not migrate the v1 DB"
+    # The pre-existing row survived the migration.
+    assert store.get_source("youtube", "UC_existing")["category"] == "signal"
+    # The user's new noise mark was persisted as a user override.
+    flipped = store.get_source("youtube", "UC_flip2")
+    assert flipped["category"] == "noise"
+    assert flipped["category_is_user_override"] == 1
+
+
+def test_rerun_setup_uses_stored_category_as_default_and_skips_llm(tmp_path: Path) -> None:
+    """A second setup run reads the stored user category as the default and skips re-classifying.
+
+    WHY (story #15 + no wasted judgment): re-running setup should let the user ADJUST prior
+    choices, not redo them from scratch. A channel the user already set must present its stored
+    category as the default AND must skip the LLM classify call — mirroring the sacred
+    'a user override is never re-judged' rule the daily classify path already honors. We pin the
+    classifier call count at 0 on the second run and prove the stored 'noise' appears in the
+    confirm prompt.
+    """
+    real_store = _real_store(tmp_path)
+    config_path = tmp_path / "orbit.config.json"
+
+    # Run 1: user flips the channel to noise; the classifier is consulted exactly once.
+    llm_first = _signal_classifier()
+    run_setup_wizard(
+        config_path=config_path,
+        repo_path=tmp_path,
+        youtube_loader=MagicMock(return_value=[Subscription(channel_id="UC_again", display_name="Again")]),
+        x_loader=MagicMock(return_value=[]),
+        llm_classifier=llm_first,
+        input_fn=_scripted_input(["chrome", "n", "n", "~/orbit/out/today.html", ""]),
+        store_module=real_store,
+        launch_agents_dir=tmp_path / "LaunchAgents",
+        launchctl_runner=_FakeLaunchctl(),
+        crontab_runner=_FakeCrontab(),
+    )
+    assert llm_first.call_count == 1
+    assert real_store.get_source("youtube", "UC_again")["category"] == "noise"
+
+    # Run 2: same channel, now user-set. The wizard must NOT call the LLM for it.
+    llm_second = _signal_classifier()
+    rerun_input = _scripted_input(["chrome", "y", "n", "~/orbit/out/today.html", ""])
+    run_setup_wizard(
+        config_path=config_path,
+        repo_path=tmp_path,
+        youtube_loader=MagicMock(return_value=[Subscription(channel_id="UC_again", display_name="Again")]),
+        x_loader=MagicMock(return_value=[]),
+        llm_classifier=llm_second,
+        input_fn=rerun_input,
+        store_module=real_store,
+        launch_agents_dir=tmp_path / "LaunchAgents",
+        launchctl_runner=_FakeLaunchctl(),
+        crontab_runner=_FakeCrontab(),
+    )
+    assert llm_second.call_count == 0, "a user-set channel must not be re-classified on re-run"
+    # The confirm prompt presented the stored category as the default.
+    prompts = [call.args[0].lower() for call in rerun_input.call_args_list]
+    assert any("noise" in text for text in prompts), f"stored category not shown as default: {prompts}"
+    # And the mark is still noise after the user keeps it.
+    assert real_store.get_source("youtube", "UC_again")["category"] == "noise"

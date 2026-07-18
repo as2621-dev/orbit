@@ -88,6 +88,11 @@ def _is_yes(answer: str) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
+def _flip_category(category: str) -> str:
+    """Invert a signal/noise category — the user's single binary disagreement with the default."""
+    return "noise" if category == "signal" else "signal"
+
+
 def _classify_creator(
     display_name: str,
     *,
@@ -202,44 +207,66 @@ def _load_x_following_best_effort(
 
 
 def _confirm_categories(
-    creators: list[tuple[str, str]],
+    sources: list[tuple[str, str, str]],
     *,
     interests: list[str],
     llm_classifier: LlmClassifier,
     input_fn: Callable[[str], str],
     store_module: Any = store,
 ) -> dict[str, str]:
-    """Auto-classify each creator then let the user confirm/flip the category (brief §8.3 step 3).
+    """Confirm each creator's signal/noise category and PERSIST it as a user override (step 3).
 
-    For each ``(external_id, display_name)`` the wizard auto-classifies via the existing
-    classify path, shows the verdict, and asks the user to keep it (Enter) or flip it
-    (answer ``n``). Deterministic except the per-creator classify judgment call (Rule 5).
+    For each ``(platform, external_id, display_name)``:
+
+      * If the store already holds a USER-SET category for this source — a prior setup run left
+        ``category_is_user_override == 1`` — present the STORED value as the default and do NOT
+        re-classify. The user adjusts a prior choice instead of redoing it, mirroring the sacred
+        "a user override is never re-judged" rule the daily classify path already honors.
+      * Otherwise auto-classify via the existing classify path (:func:`_classify_creator` — the
+        only model use, Rule 5), show the verdict, and let the user keep (Enter) or flip it.
+
+    The confirmed category is written to ``sources`` with ``is_user_override=1`` via
+    :func:`store.upsert_source`, so it takes effect immediately AND is frozen against the weekly
+    YouTube / daily X source refresh (which re-upserts every source with a hardcoded ``signal``
+    prior). Persisting here is the fix for the discard bug — previously this map was returned and
+    dropped, so the user's marks never reached the DB. ``platform`` is carried so each write
+    lands under the correct ``UNIQUE(platform, external_id)`` key.
 
     Args:
-        creators: ``(external_id, display_name)`` pairs across YouTube + X.
+        sources: ``(platform, external_id, display_name)`` triples across YouTube + X.
         interests: The user's interest keywords (drives Axis B in the classify call).
         llm_classifier: The injectable LLM boundary (mocked in tests).
         input_fn: The injectable input function (scripted in tests).
+        store_module: The store module (injectable; defaults to :mod:`store`). Tests inject a
+            mock (offline) or the real store pointed at a temp DB (to assert the persisted value).
 
     Returns:
         A map of ``external_id`` -> confirmed category (``"signal"`` | ``"noise"``).
     """
     categories: dict[str, str] = {}
-    for external_id, display_name in creators:
-        auto_category = _classify_creator(
-            display_name, interests=interests, llm_classifier=llm_classifier, store_module=store_module
-        )
-        answer = _prompt(
-            input_fn,
-            f"'{display_name}' classified as {auto_category}. Keep this? (y/n)",
-            default="y",
-        )
-        if _is_yes(answer):
-            categories[external_id] = auto_category
+    for platform, external_id, display_name in sources:
+        existing = store_module.get_source(platform, external_id)
+        if existing and existing["category_is_user_override"] == 1:
+            # Re-run: the user already set this one. Offer the stored value; never re-classify.
+            default_category = existing["category"]
+            prompt_text = f"'{display_name}' is set to {default_category}. Keep this? (y/n)"
         else:
-            # Reason: a single binary flip — the user disagrees with the auto verdict, so
-            # invert it (signal <-> noise) rather than re-prompting for a free-text label.
-            categories[external_id] = "noise" if auto_category == "signal" else "signal"
+            default_category = _classify_creator(
+                display_name, interests=interests, llm_classifier=llm_classifier, store_module=store_module
+            )
+            prompt_text = f"'{display_name}' classified as {default_category}. Keep this? (y/n)"
+
+        answer = _prompt(input_fn, prompt_text, default="y")
+        confirmed_category = default_category if _is_yes(answer) else _flip_category(default_category)
+
+        store_module.upsert_source(
+            platform=platform,
+            external_id=external_id,
+            display_name=display_name,
+            category=confirmed_category,
+            is_user_override=1,
+        )
+        categories[external_id] = confirmed_category
     return categories
 
 
@@ -372,7 +399,9 @@ def run_setup_wizard(
          a YouTube-only user still gets a config).
       3. Auto-classify each creator into signal/noise via the EXISTING classify path
          (:func:`lib.classify.classify_item`, NO separate classifier), let the user confirm
-         categories, and pick priority creators (``creator_weights``).
+         categories — PERSISTED to ``sources`` as user overrides so they survive later refreshes
+         (a re-run offers the stored value and skips re-classifying already-set channels) — and
+         pick priority creators (``creator_weights``).
       4. Seed ``interests`` from subscription titles; gather the delivery target. The
          schedule is NOT asked — it is fixed at :data:`lib.config.DEFAULT_SCHEDULE` (7am
          daily) per the 2026-07-06 local-auto-cron decision, still written to the config.
@@ -411,6 +440,13 @@ def run_setup_wizard(
     """
     log.log_info("setup_wizard_started", cookie_source=cookie_source)
 
+    # Ensure the store exists and is at the latest schema BEFORE step 3 reads/writes ``sources``.
+    # The --setup path does not otherwise call init_db (only the pipeline's Stage 0 does), so on
+    # a fresh machine the base tables would be missing, and on the user's live v1 DB migration 2
+    # (the category_is_user_override column) would be unapplied — either would crash the confirm
+    # step. init_db is idempotent, so this is a no-op once the DB is current.
+    store_module.init_db()
+
     resolved_config_path = config_path if config_path is not None else Path.cwd() / DEFAULT_CONFIG_FILENAME
 
     chosen_cookie_source = _prompt(
@@ -420,16 +456,26 @@ def run_setup_wizard(
     subscriptions = _load_youtube_subscriptions_safe(chosen_cookie_source, youtube_loader)
     follows = _load_x_following_best_effort(chosen_cookie_source, x_loader)
 
-    # Build the unified creator list keyed by external_id (channel_id for YT, handle for X).
-    creators: list[tuple[str, str]] = [(sub.channel_id, sub.display_name) for sub in subscriptions]
-    creators += [(follow.creator_handle, follow.display_name) for follow in follows]
+    # Build the unified source list as (platform, external_id, display_name) triples: channel_id
+    # for YouTube, creator_handle for X. Platform is carried so each confirmed category persists
+    # under the right UNIQUE(platform, external_id) key.
+    sources_to_persist: list[tuple[str, str, str]] = [
+        ("youtube", sub.channel_id, sub.display_name) for sub in subscriptions
+    ]
+    sources_to_persist += [("x", follow.creator_handle, follow.display_name) for follow in follows]
 
     interests = _seed_interests_from_subscriptions(subscriptions)
 
-    # Step 3: confirm categories (auto-classify via the existing path) + pick priorities.
-    _confirm_categories(
-        creators, interests=interests, llm_classifier=llm_classifier, input_fn=input_fn, store_module=store_module
+    # Step 3: confirm categories (auto-classify via the existing path, then PERSIST each as a
+    # user override so a noise mark survives every later refresh) + pick priorities.
+    confirmed_categories = _confirm_categories(
+        sources_to_persist,
+        interests=interests,
+        llm_classifier=llm_classifier,
+        input_fn=input_fn,
+        store_module=store_module,
     )
+    creators = [(external_id, display_name) for _platform, external_id, display_name in sources_to_persist]
     creator_weights = _pick_priority_creators(creators, input_fn=input_fn)
 
     # Step 4: delivery. The schedule is no longer asked (decision 2026-07-06 — local auto-run
@@ -465,6 +511,7 @@ def run_setup_wizard(
         cookie_source=chosen_cookie_source,
         creator_count=len(creators),
         priority_creator_count=len(creator_weights),
+        noise_creator_count=sum(1 for category in confirmed_categories.values() if category == "noise"),
         interest_count=len(interests),
         schedule=schedule,
     )

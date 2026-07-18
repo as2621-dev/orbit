@@ -122,9 +122,19 @@ CREATE TABLE IF NOT EXISTS interests (
 INSERT OR IGNORE INTO schema_version (version) VALUES (1);
 """
 
-# Future migrations keyed by version number (>1). Empty at v1 — the baseline
-# schema is created by SCHEMA_ORBIT_V1; later phases add 2, 3, ... here.
-MIGRATIONS: Dict[int, str] = {}
+# Future migrations keyed by version number (>1). The baseline schema is created by
+# SCHEMA_ORBIT_V1 (which stays at v1); each numbered migration evolves it on top. A migration
+# runs on BOTH a fresh DB (right after the v1 baseline) and an existing populated DB, so there
+# is a single schema-evolution path — never a fresh-only branch that would skip live databases.
+#
+# 2: add ``sources.category_is_user_override`` — the explicit, per-source flag that separates a
+#    category the USER confirmed (frozen against the weekly/daily refresh) from a merely-seeded
+#    prior (still free to be re-judged). Named for the ``classifications.is_user_override``
+#    precedent, prefixed because ``sources`` has several user-settable columns. ``ADD COLUMN``
+#    with a constant ``DEFAULT 0`` is lossless: existing rows back-fill to not-user-set.
+MIGRATIONS: Dict[int, str] = {
+    2: "ALTER TABLE sources ADD COLUMN category_is_user_override INTEGER NOT NULL DEFAULT 0;",
+}
 
 
 def _connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
@@ -148,18 +158,63 @@ def _connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
     return conn
 
 
+def _split_sql_statements(script: str) -> List[str]:
+    """Split a migration body into individual executable statements.
+
+    Migration bodies are project-controlled (never user input) and use ``;`` only as a
+    statement terminator — no embedded semicolons — so a plain split is sufficient. Blank
+    fragments (e.g. trailing whitespace after the last ``;``) are dropped.
+
+    Args:
+        script: The migration SQL — one or more ``;``-terminated statements.
+
+    Returns:
+        The non-empty statements, in order.
+    """
+    return [fragment.strip() for fragment in script.split(";") if fragment.strip()]
+
+
 def _run_migrations(conn: sqlite3.Connection) -> None:
     """Apply any pending numbered migrations greater than the current max version.
 
+    Each migration's statements AND its ``schema_version`` bump run inside ONE explicit
+    transaction and commit together. This is the safety contract for migrating a LIVE
+    populated DB: a mid-migration failure rolls BOTH back, so the DB can never end up with a
+    changed schema but a stale version number — the state that would re-run the migration on
+    the next :func:`init_db` and crash with ``duplicate column name``. SQLite DDL is
+    transactional, so an ``ALTER TABLE`` inside the ``BEGIN`` is covered too.
+
+    ``executescript`` is deliberately NOT used here: it forces an intermediate COMMIT, which
+    would split the DDL and the version bump across two transactions and reopen that window.
+
+    Concurrency: the version is re-read INSIDE the write transaction (``BEGIN IMMEDIATE`` takes
+    the write lock up front), so two overlapping :func:`init_db` calls — which this project has
+    a history of — serialize. The loser sees the already-bumped version and skips rather than
+    re-applying the migration and raising ``duplicate column name``.
+
     Args:
-        conn: An open connection. Migrations are executed but NOT committed here —
-            the caller (:func:`init_db`) commits.
+        conn: An open connection. Each pending migration is committed atomically here.
     """
-    current_version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] or 0
+    pending_version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] or 0
     for version in sorted(MIGRATIONS.keys()):
-        if version > current_version:
-            conn.executescript(MIGRATIONS[version])
-            conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+        # Cheap fast-path: skip without taking the write lock when clearly already applied.
+        if version <= pending_version:
+            continue
+        # Guard against an already-open transaction so the explicit BEGIN can't raise
+        # "cannot start a transaction within a transaction".
+        if conn.in_transaction:
+            conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        # Re-read under the write lock: a concurrent init_db may have applied this version
+        # between the fast-path read and acquiring the lock. If so, skip it — never re-apply.
+        applied_version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] or 0
+        if version <= applied_version:
+            conn.commit()
+            continue
+        for statement in _split_sql_statements(MIGRATIONS[version]):
+            conn.execute(statement)
+        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+        conn.commit()
 
 
 def init_db(db_path: Optional[Path] = None) -> Path:
@@ -207,20 +262,38 @@ def upsert_source(
     category: str = "signal",
     priority_weight: float = 1.0,
     last_refreshed_at: Optional[str] = None,
+    is_user_override: int = 0,
 ) -> int:
     """Insert a source or update it in place on a repeat (platform, external_id).
 
-    Dedups on the ``UNIQUE(platform, external_id)`` constraint: a second call with
-    the same pair UPDATEs the existing row (display_name/category/priority_weight/
-    last_refreshed_at) rather than inserting a duplicate.
+    Dedups on the ``UNIQUE(platform, external_id)`` constraint: a second call with the same
+    pair UPDATEs the existing row rather than inserting a duplicate.
+
+    Category-preservation contract (the reason this is not a plain overwrite): ``display_name``,
+    ``priority_weight`` and ``last_refreshed_at`` always update from the incoming call, but
+    ``category`` is protected once the USER has set it. The weekly YouTube refresh and the DAILY
+    X refresh both re-upsert every source with a hardcoded ``category="signal"`` and
+    ``is_user_override=0``; without protection that clobbers a channel the user marked
+    ``noise``. So on conflict:
+
+      * an incoming **user override** (``is_user_override=1`` — the setup wizard) wins: it sets
+        ``category`` and stamps the row user-set;
+      * an incoming **refresh** (``is_user_override=0``) updates ``category`` ONLY when the
+        stored row is not already user-set, and NEVER clears an existing override.
+
+    A merely-seeded category (``is_user_override=0``) therefore stays free to be re-judged,
+    while a user-confirmed one is frozen against every subsequent refresh.
 
     Args:
         platform: ``youtube`` or ``x``.
         external_id: ``channel_id`` (YouTube) or ``creator_handle`` (X).
-        display_name: Human-readable creator name.
+        display_name: Human-readable creator name (always updated).
         category: Channel-level Axis-A prior — ``signal`` or ``noise``.
         priority_weight: Ranking weight (mirrors config ``creator_weights``).
         last_refreshed_at: ISO timestamp of the last Stage-0 refresh, or None.
+        is_user_override: ``1`` when ``category`` is a user-confirmed choice that must survive
+            future refreshes (mirrors the ``classifications.is_user_override`` precedent);
+            ``0`` (default) for the seeding/refresh path.
 
     Returns:
         The ``source_id`` of the inserted-or-updated row.
@@ -234,14 +307,23 @@ def upsert_source(
     try:
         conn.execute(
             """INSERT INTO sources
-                   (platform, external_id, display_name, category, priority_weight, last_refreshed_at)
-               VALUES (?, ?, ?, ?, ?, ?)
+                   (platform, external_id, display_name, category, priority_weight,
+                    last_refreshed_at, category_is_user_override)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(platform, external_id) DO UPDATE SET
                    display_name = excluded.display_name,
-                   category = excluded.category,
                    priority_weight = excluded.priority_weight,
-                   last_refreshed_at = excluded.last_refreshed_at""",
-            (platform, external_id, display_name, category, priority_weight, last_refreshed_at),
+                   last_refreshed_at = excluded.last_refreshed_at,
+                   category = CASE
+                       WHEN excluded.category_is_user_override = 1 THEN excluded.category
+                       WHEN sources.category_is_user_override = 1 THEN sources.category
+                       ELSE excluded.category
+                   END,
+                   category_is_user_override = CASE
+                       WHEN excluded.category_is_user_override = 1 THEN 1
+                       ELSE sources.category_is_user_override
+                   END""",
+            (platform, external_id, display_name, category, priority_weight, last_refreshed_at, is_user_override),
         )
         conn.commit()
         row = conn.execute(
@@ -272,6 +354,34 @@ def list_sources(platform: Optional[str] = None) -> List[Dict[str, Any]]:
         else:
             rows = conn.execute("SELECT * FROM sources ORDER BY source_id").fetchall()
         return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_source(platform: str, external_id: str) -> Optional[Dict[str, Any]]:
+    """Return a single source row by its (platform, external_id) key, or None if absent.
+
+    Keyed on BOTH columns because ``external_id`` alone is not unique across platforms (a
+    YouTube ``channel_id`` and an X ``creator_handle`` could collide as strings). The setup
+    wizard's re-run path uses this to read a stored category — presenting it as the default and
+    skipping re-classification of channels the user already confirmed (``category_is_user_override
+    = 1``).
+
+    Args:
+        platform: ``youtube`` or ``x``.
+        external_id: ``channel_id`` (YouTube) or ``creator_handle`` (X).
+
+    Returns:
+        The source row as a plain dict (including ``category`` and
+        ``category_is_user_override``), or None when no such source exists.
+    """
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM sources WHERE platform = ? AND external_id = ?",
+            (platform, external_id),
+        ).fetchone()
+        return dict(row) if row else None
     finally:
         conn.close()
 

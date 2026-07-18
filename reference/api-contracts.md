@@ -54,8 +54,11 @@ Lifted `store.py` shape: WAL mode, lightweight in-code migrations, DB at `~/.loc
 | `external_id` | TEXT | `channel_id` (YT) or `creator_handle` (X) |
 | `display_name` | TEXT | human-readable creator name |
 | `category` | TEXT | classification prior: `signal` \| `noise` (channel-level default for Axis A) |
+| `category_is_user_override` | INTEGER | 1 if the user set `category` during setup (frozen against refresh); 0 if merely seeded (still re-judgeable). Added by migration 2; existing rows back-fill to 0. Mirrors `classifications.is_user_override`. |
 | `priority_weight` | REAL | user-set ranking weight (mirrors `creator_weights`) |
 | `last_refreshed_at` | TEXT | when the source list entry was last refreshed (weekly Stage 0) |
+
+> **Refresh-preservation rule:** the weekly YouTube / daily X refresh re-upserts every source with a hardcoded `category="signal"`. `store.upsert_source` preserves `category` when `category_is_user_override = 1` (a user's noise mark survives) and updates it freely otherwise. Only the setup wizard writes `is_user_override=1`.
 
 ### `seen` — delta engine (per-source last-seen IDs)
 | column | type | meaning |
