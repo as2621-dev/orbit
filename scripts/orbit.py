@@ -41,7 +41,7 @@ from lib.external_trending import (  # noqa: E402
 )
 from lib.rerank import RankableItem, cap_x_items, derank_items  # noqa: E402
 from lib.setup_wizard import run_setup_wizard  # noqa: E402
-from lib.summarize import summarize_items, synthesize_verdict  # noqa: E402
+from lib.summarize import summarize_items  # noqa: E402
 from lib.trending import TrendingItem, compute_internal_trending  # noqa: E402
 from lib.youtube_yt import (  # noqa: E402
     Subscription,
@@ -830,9 +830,7 @@ def _write_digest_markdown(
     *,
     writer: Callable[[Path, str], None],
     clusters: Optional[list[Cluster]],
-    trending_items: Optional[list[TrendingItem]],
-    scoops: Optional[list[TrendingItem]],
-    verdict: str,
+    tracked_source_total: int,
     summaries: Optional[dict[str, str]],
 ) -> None:
     """Write the self-contained ``digest.md`` twin beside page 1 (issue #6), fail-soft.
@@ -849,10 +847,8 @@ def _write_digest_markdown(
         tiered_items: The Stage-6 tiered items.
         config: The loaded config (supplies ``digest_title``).
         writer: The same ``(path, text) -> None`` writer the HTML pages use (tests inject a temp writer).
-        clusters: OPTIONAL clusters (feed cross-links + masthead count), forwarded verbatim.
-        trending_items: OPTIONAL trending list (the trio), forwarded verbatim.
-        scoops: OPTIONAL detected scoops (the trio + dormant count), forwarded verbatim.
-        verdict: The pre-computed LLM verdict sentence, forwarded verbatim.
+        clusters: OPTIONAL clusters (feed cross-links), forwarded verbatim.
+        tracked_source_total: Total watched sources for the masthead count, forwarded verbatim.
         summaries: The pre-computed blurb map, forwarded verbatim.
     """
     try:
@@ -860,9 +856,7 @@ def _write_digest_markdown(
             tiered_items,
             config,
             clusters=clusters,
-            trending_items=trending_items,
-            scoops=scoops,
-            verdict=verdict,
+            tracked_source_total=tracked_source_total,
             summaries=summaries or {},
         )
         writer(markdown_path, markdown)
@@ -886,9 +880,7 @@ def run_stage7_render(
     html_path: Optional[Path] = None,
     writer: Callable[[Path, str], None] = _default_html_writer,
     clusters: Optional[list[Cluster]] = None,
-    trending_items: Optional[list[TrendingItem]] = None,
-    scoops: Optional[list[TrendingItem]] = None,
-    verdict: str = "",
+    tracked_source_total: int = 0,
     summaries: Optional[dict[str, str]] = None,
     inline_image: Optional[Callable[[str], Optional[str]]] = None,
 ) -> list[Path]:
@@ -907,6 +899,12 @@ def run_stage7_render(
         html_path: Explicit page-1 path (tests pass a temp path); defaults to the
             resolved ``config.delivery.html_path``.
         writer: ``(path, html) -> None`` writer; defaults to :func:`_default_html_writer`.
+        clusters: OPTIONAL Stage-5 clusters (the per-tile cross-links).
+        tracked_source_total: Total sources Orbit watches (all platforms), for the
+            masthead coverage count. Read from the sources table by the caller because a
+            channel that stayed quiet today has no item to count.
+        summaries: The pre-computed per-item blurb map.
+        inline_image: OPTIONAL image-inline stub (tests pass one to stay offline).
 
     Returns:
         The list of paths actually written (``[page1]`` or ``[page1, page2]``).
@@ -925,9 +923,7 @@ def run_stage7_render(
         config,
         page_2_href=render.DEFAULT_PAGE_2_FILENAME,
         clusters=clusters,
-        trending_items=trending_items,
-        scoops=scoops,
-        verdict=verdict,
+        tracked_source_total=tracked_source_total,
         summaries=summaries,
         **render_kwargs,
     )
@@ -948,9 +944,7 @@ def run_stage7_render(
         config,
         writer=writer,
         clusters=clusters,
-        trending_items=trending_items,
-        scoops=scoops,
-        verdict=verdict,
+        tracked_source_total=tracked_source_total,
         summaries=summaries,
     )
 
@@ -958,6 +952,7 @@ def run_stage7_render(
         "render_completed",
         stage="stage_7_render",
         item_count=len(tiered_items),
+        tracked_source_total=tracked_source_total,
         page_count=len(pages),
         spilled=len(pages) > 1,
         html_path=str(page_1_path),
@@ -1141,19 +1136,20 @@ def _run_pipeline_stages(depth: str) -> int:
     rankable_items = youtube_items + x_items
 
     # Stage 5 (M3) — cluster overlaps, compute baseline-relative trending, tag external
-    # corroboration vs scoop, detect dormant-account scoops. Feeds the trending/scoop
-    # multiplier into rank and the three M3 sections into render. On the bare CLI run
-    # rankable_items is empty, so this yields no clusters/trending/scoops and a neutral
-    # multiplier map (the M1/M2 path is unchanged).
-    clusters, trending_items, scoops, trending_multipliers = run_stage5_overlap_trending_scoops(rankable_items, config)
+    # corroboration vs scoop, detect dormant-account scoops. The trending list itself is no
+    # longer a page section; it survives as the RANK multiplier, the clusters supply the
+    # per-tile cross-links, and the scoops supply the email TL;DR. On the bare CLI run
+    # rankable_items is empty, so this yields a neutral multiplier map (M1/M2 unchanged).
+    clusters, _trending_items, scoops, trending_multipliers = run_stage5_overlap_trending_scoops(
+        rankable_items, config
+    )
     tiered_items = run_stage6_rank_and_tier(rankable_items, config, trending_multipliers=trending_multipliers)
 
-    # LLM editorial prose (Rule 5 — summarizing the day's feed is a valid model use).
-    # Both go through the live claude-CLI boundary and are FAIL-SOFT (a flaky/absent LLM
-    # returns ""/{} so the digest degrades to structural-only, never crashes the pipeline,
-    # Rule 12). Only Hero/Standard items get per-item blurbs (cost control); the verdict is
-    # grounded in the scoop + cluster + top-headline context.
-    verdict = synthesize_verdict(tiered_items, scoops, clusters)
+    # LLM editorial prose (Rule 5 — summarizing an episode is a valid model use). Goes
+    # through the live claude-CLI boundary and is FAIL-SOFT (a flaky/absent LLM returns {}
+    # so the digest degrades to structural-only, never crashes the pipeline, Rule 12). Only
+    # Hero/Standard items get a blurb (cost control). There is deliberately no day-level
+    # verdict sentence — the digest opens straight on the feed.
     hero_standard_items = [
         tiered_item.scored_item.item
         for tiered_item in tiered_items
@@ -1161,13 +1157,16 @@ def _run_pipeline_stages(depth: str) -> int:
     ]
     summaries = summarize_items(hero_standard_items)
 
+    # The masthead's "tracked" count comes from the sources table, NOT from the items: a
+    # channel that posted nothing today has no item, and the whole point of the count is to
+    # show that quiet channels are still being watched.
+    tracked_source_total = len(store.list_sources())
+
     written_paths = run_stage7_render(
         tiered_items,
         config,
         clusters=clusters,
-        trending_items=trending_items,
-        scoops=scoops,
-        verdict=verdict,
+        tracked_source_total=tracked_source_total,
         summaries=summaries,
     )
 

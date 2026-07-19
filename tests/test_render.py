@@ -37,10 +37,10 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from lib import html_render, render, trending  # noqa: E402
+from lib import html_render, render  # noqa: E402
 from lib.chapterize import Chapter  # noqa: E402
 from lib.classify import Classification  # noqa: E402
-from lib.density import TIER_HERO, TIER_INDEX, TIER_STANDARD, TieredItem  # noqa: E402
+from lib.density import TIER_COMPACT, TIER_HERO, TIER_INDEX, TIER_STANDARD, TieredItem  # noqa: E402
 from lib.rerank import RankableItem, ScoredItem  # noqa: E402
 
 
@@ -52,11 +52,14 @@ def _tiered(
     channel_name: str = "Some Channel",
     chapters: list[Chapter] | None = None,
     score: float = 5.0,
+    card_url: str = "",
 ) -> TieredItem:
     """Build a TieredItem fixture directly (no rerank / density run).
 
     A passing Classification is attached so the fixture mirrors a real top-line
-    item; the tier is set explicitly to control which section it renders in.
+    item; the tier is set explicitly to control which section it renders in. Passing an
+    ``x.com`` ``card_url`` makes it an X item (what ``render._is_tweet`` keys on), which
+    routes it to the "From X" section instead of the YouTube masonry.
     """
     classification = Classification(
         item_external_id=item_external_id,
@@ -75,6 +78,7 @@ def _tiered(
         upload_date="20260101",
         classification=classification,
         chapters=chapters or [],
+        card_url=card_url,
     )
     return TieredItem(scored_item=ScoredItem(item=item, score=score), density_tier=tier)
 
@@ -173,18 +177,55 @@ def test_malicious_title_and_url_are_neutralized() -> None:
     assert "&lt;script&gt;" in output_html
 
 
-def test_masthead_present_with_pure_counts() -> None:
-    """The masthead renders the wordmark + a correct pure-count line (DoD #4).
+def test_masthead_reports_tracked_channels_not_just_the_ones_that_posted() -> None:
+    """The masthead reports TRACKED / POSTED / ITEMS as three distinct counts.
 
-    WHY: the masthead is the glance that tells the user the day's shape. The counts are
-    deterministic (Rule 5, no LLM) — 2 items from 2 distinct creators must read
-    "2 sources · 2 accounted for". A regression in counting or a missing masthead fails.
+    WHY: the masthead answers "is Orbit watching everything I follow?". Reporting only
+    the creators that happen to appear today would make a run that silently lost 130
+    channels look identical to a genuinely quiet day. The tracked total therefore comes
+    from the sources table, NOT from the items — so 142 tracked channels with 2 of them
+    posting 2 videos must read 142 / 2 / 2, never 2 / 2 / 2. A regression that re-derived
+    "tracked" from the batch collapses all three numbers and fails here.
+    """
+    items = [_tiered("vidA", TIER_HERO), _tiered("vidB", TIER_STANDARD)]
+    output_html = render.render_digest_html(items, tracked_source_total=142, inline_image=lambda url: None)
+
+    assert ">Orbit</div>" in output_html  # the masthead wordmark
+    assert "142 TRACKED · 2 POSTED · 2 ITEMS" in output_html
+    assert "2 ITEMS FROM 2 OF 142 TRACKED CHANNELS" in output_html  # the footer agrees
+
+
+def test_masthead_tracked_total_degrades_to_posted_count_when_caller_is_uninformed() -> None:
+    """An unsupplied tracked total falls back to the posted count, never a bare 0.
+
+    WHY: ``tracked_source_total`` is not derivable from the items, so a caller that omits
+    it (an older call site, a test) must not make the page claim "0 TRACKED" beside real
+    items — an obviously false statement about coverage. Degrading to the posted count is
+    the honest floor: it under-reports rather than lying.
     """
     items = [_tiered("vidA", TIER_HERO), _tiered("vidB", TIER_STANDARD)]
     output_html = render.render_digest_html(items, inline_image=lambda url: None)
 
-    assert ">Orbit</div>" in output_html  # the masthead wordmark
-    assert "2 sources · 2 accounted for" in output_html
+    assert "2 TRACKED · 2 POSTED · 2 ITEMS" in output_html
+
+
+def test_page_opens_on_the_feed_with_no_editorial_layer_above_it() -> None:
+    """No verdict headline and no "Ahead of the curve" trio sit above the feed.
+
+    WHY (Rule 9): the digest deliberately makes NO day-level editorial claim — the user
+    asked for the videos first, not a synthesized headline over them. This test encodes
+    that product decision, so re-adding a verdict sentence or a scoop/trending/hidden-gem
+    strip above the masonry fails loudly rather than silently drifting back.
+    """
+    items = [_tiered("vidA", TIER_HERO), _tiered("vidB", TIER_STANDARD)]
+    output_html = render.render_digest_html(items, inline_image=lambda url: None)
+
+    assert "Ahead of the curve" not in output_html
+    assert "The scoop" not in output_html
+    assert "Trending now" not in output_html
+    assert "Hidden gem" not in output_html
+    # The feed heading follows the masthead directly.
+    assert output_html.index("From YouTube") > output_html.index(">Orbit</div>")
 
 
 def test_happy_path_is_valid_html_document() -> None:
@@ -224,7 +265,7 @@ def test_empty_tiered_items_still_valid_page() -> None:
     assert output_html.startswith("<!DOCTYPE html>")
     assert "</html>" in output_html
     assert ">Orbit</div>" in output_html  # a valid masthead still renders
-    assert "0 sources · 0 accounted for" in output_html
+    assert "0 TRACKED · 0 POSTED · 0 ITEMS" in output_html
 
 
 def test_hero_without_chapters_renders_card_without_chapter_list() -> None:
@@ -324,7 +365,6 @@ def test_card_link_falls_back_to_video_start_when_chapterless() -> None:
     assert 'href="https://www.youtube.com/watch?v=vidBare&amp;t=0s"' in output_html
 
 
-from lib.density import TIER_COMPACT  # noqa: E402
 
 
 def _many(tier: str, count: int, *, prefix: str, chapters_each: int = 0) -> list[TieredItem]:
@@ -466,18 +506,16 @@ def test_tiles_every_builder_escapes_script_title_to_inert_text() -> None:
     chapters = [tiles.ChapterRow(chip="04:20", text=_XSS_TITLE)]
     cross = [tiles.CrossLink(label=_XSS_TITLE, url="https://x.com")]
     builders_output = [
-        tiles.render_masthead(_XSS_TITLE, 1, 1, 1, 1, 1),
-        tiles.render_verdict(_XSS_TITLE),
-        tiles.render_scoop_tile(_XSS_TITLE, _XSS_TITLE, _XSS_TITLE, "https://x.com"),
-        tiles.render_trending_now([tiles.TrendingRow(title=_XSS_TITLE, category=tiles.CATEGORY_YOURS, your_count=3)]),
-        tiles.render_hidden_gem(_XSS_TITLE, 900, _XSS_TITLE, _XSS_TITLE, chip_time="02:50", chip_label=_XSS_TITLE),
+        tiles.render_masthead(_XSS_TITLE, 1, 1, 1),
+        tiles.render_feed_masonry([], heading=_XSS_TITLE, note=_XSS_TITLE),
         tiles.render_hero_tile(
             meta_label=_XSS_TITLE, title=_XSS_TITLE, summary=_XSS_TITLE, chapters=chapters, cross_links=cross
-        ),
-        tiles.render_standard_tile(meta_label=_XSS_TITLE, title=_XSS_TITLE, summary=_XSS_TITLE, chapters=chapters),
+        ).html,
+        tiles.render_standard_tile(meta_label=_XSS_TITLE, title=_XSS_TITLE, summary=_XSS_TITLE,
+                                   chapters=chapters).html,
         tiles.render_compact_tile(meta_label=_XSS_TITLE, title=_XSS_TITLE, summary=_XSS_TITLE, chip_time="1:00",
-                                  chip_label=_XSS_TITLE),
-        tiles.render_tweet_tile(source_label=_XSS_TITLE, text=_XSS_TITLE),
+                                  chip_label=_XSS_TITLE).html,
+        tiles.render_tweet_tile(source_label=_XSS_TITLE, text=_XSS_TITLE).html,
         tiles.render_footer(_XSS_TITLE, "page2.html"),
     ]
     for output_html in builders_output:
@@ -494,13 +532,13 @@ def test_tiles_feature_tile_uses_safe_img_src_for_thumbnail() -> None:
     fallback (no ``<img>`` at all).
     """
     safe_data_uri = "data:image/jpeg;base64,/9j/4AAQSkZJRg=="
-    good = tiles.render_hero_tile(meta_label="M", title="T", image_url=safe_data_uri)
+    good = tiles.render_hero_tile(meta_label="M", title="T", image_url=safe_data_uri).html
     assert f'<img src="{safe_data_uri}"' in good
 
     evil = tiles.render_hero_tile(
         meta_label="M", title="T", image_url="data:text/html,<script>alert(1)</script>",
         placeholder_label="thumb",
-    )
+    ).html
     assert "<img" not in evil  # payload rejected, no <img> emitted
     assert 'class="ph"' in evil  # fell back to the hatched placeholder
 
@@ -512,59 +550,23 @@ def test_tiles_empty_image_url_falls_back_to_ph_placeholder() -> None:
     must still render with the hatched placeholder + caption — emitting ``<img src="">``
     would show a broken-image icon in the user's inbox.
     """
-    output_html = tiles.render_standard_tile(meta_label="M", title="T", placeholder_label="thumb · lenny")
+    output_html = tiles.render_standard_tile(meta_label="M", title="T", placeholder_label="thumb · lenny").html
     assert "<img" not in output_html
     assert 'class="ph"' in output_html
     assert "thumb · lenny" in output_html
 
 
-def test_tiles_trending_now_renders_correct_marker_per_category() -> None:
-    """Each trending category renders its distinct marker + right-label (signal semantics).
-
-    WHY: the marker is the WHOLE point of the trending tile — ◆ a dormant creator
-    breaking silence, ↗ "N of yours" (consensus inside your network), ○ external
-    (trending outside it). Collapsing them would erase the "ahead of the curve"
-    meaning. We assert all three coexist with the right glyph and label.
-    """
-    output_html = tiles.render_trending_now(
-        [
-            tiles.TrendingRow(title="karpathy breaks silence", category=tiles.CATEGORY_DORMANT),
-            tiles.TrendingRow(title="Nano Banana 2 pricing", category=tiles.CATEGORY_YOURS, your_count=4),
-            tiles.TrendingRow(title="EU AI Act date", category=tiles.CATEGORY_EXTERNAL),
-        ]
-    )
-    assert "◆" in output_html and "dormant" in output_html
-    assert "↗" in output_html and "4 of yours" in output_html
-    assert "○" in output_html and "external" in output_html
-
-
-def test_tiles_empty_verdict_and_blurb_omit_their_element() -> None:
-    """An empty verdict / blurb omits its element entirely (no-fabrication degrade).
+def test_tiles_empty_blurb_omits_its_element() -> None:
+    """An empty blurb omits its element entirely (no-fabrication degrade).
 
     WHY: when the LLM is unavailable the prose must be ABSENT, not an empty styled
     container hinting content was lost. A regression that always emitted the wrapper
     would leave a dangling empty box on a quiet/LLM-down day.
     """
-    assert tiles.render_verdict("") == ""
-    assert tiles.render_verdict("   ") == ""
-
-    # A standard tile with no summary must not carry an empty blurb div.
-    no_blurb = tiles.render_standard_tile(meta_label="M", title="T", summary="")
+    no_blurb = tiles.render_standard_tile(meta_label="M", title="T", summary="").html
     assert "line-height:1.45" not in no_blurb  # the blurb div's signature style is absent
-    with_blurb = tiles.render_standard_tile(meta_label="M", title="T", summary="why it matters")
+    with_blurb = tiles.render_standard_tile(meta_label="M", title="T", summary="why it matters").html
     assert "why it matters" in with_blurb
-
-
-def test_tiles_verdict_italicizes_handles() -> None:
-    """The verdict italicizes ``@handle`` mentions (the design's masthead accent).
-
-    WHY: the masthead verdict styles mentions in italic; this is the deterministic,
-    code-driven (Rule 5) accent. The transform must run on the escaped string and not
-    introduce active markup.
-    """
-    output_html = tiles.render_verdict("a scoop from @swyx and @karpathy today")
-    assert output_html.count("font-style:italic") == 2
-    assert "<script>" not in output_html
 
 
 def test_tiles_assembled_page_is_self_contained_with_fonts_and_no_cdn() -> None:
@@ -577,10 +579,12 @@ def test_tiles_assembled_page_is_self_contained_with_fonts_and_no_cdn() -> None:
     or re-added a Google Fonts ``<link>`` breaks offline rendering.
     """
     body = (
-        tiles.render_masthead("MON · 1 JAN 2026 · 06:14", 26, 26, 1, 1, 2)
-        + tiles.render_verdict("the only real story is evals")
-        + tiles.render_feed_masonry(tiles.render_hero_tile(meta_label="DWARKESH · 1:52 · YouTube", title="Hi"))
-        + tiles.render_footer("26 OF 26 SOURCES ACCOUNTED FOR", "")
+        tiles.render_masthead("MON · 1 JAN 2026", 26, 4, 6)
+        + tiles.render_feed_masonry(
+            [tiles.render_hero_tile(meta_label="DWARKESH · 1:52 · YouTube", title="Hi")],
+            heading="From YouTube · ranked",
+        )
+        + tiles.render_footer("6 ITEMS FROM 4 OF 26 TRACKED CHANNELS", "")
     )
     page = html_render.wrap_page("Orbit · Today", body)
 
@@ -602,43 +606,55 @@ def test_tiles_footer_omits_page2_link_when_no_href() -> None:
     assert "page 2" in tiles.render_footer("ALL ACCOUNTED FOR", "page2.html")
 
 
-def _trending_item(item_external_id: str, title: str) -> "trending.TrendingItem":
-    """Build a minimal external-category TrendingItem for the trending-cap test."""
-    return trending.TrendingItem(
-        item_external_id=item_external_id,
-        cluster_id=f"c_{item_external_id}",
-        creator_external_id=f"UC_{item_external_id}",
-        title=title,
-        card_url="",
-        velocity_score=1.0,
-        convergence_count=0,
-        baseline_relative_ratio=1.0,
-    )
+def test_x_posts_render_in_their_own_section_below_the_videos() -> None:
+    """X posts render under a "From X" heading BELOW the YouTube section, not interleaved.
 
-
-def test_trending_now_renders_at_most_five_rows() -> None:
-    """The "Trending now" tile renders at most 5 rows even when more are ranked.
-
-    WHY (Rule 9): the velocity ranker can surface many trending clusters, but the digest
-    is a glance surface — an unbounded list buries the top signal and blows the page budget.
-    We pass 7 velocity-ordered items and assert exactly the top 5 titles render in the
-    trending tile (and the 6th/7th do NOT). Removing the cap re-renders all 7 and fails this.
+    WHY (Rule 9): the user reads the digest for videos and treats X as a footnote, so a
+    high-scoring tweet must not push videos down the page. Rank still orders WITHIN each
+    section, but platform decides which section — a regression back to one rank-ordered
+    masonry puts the tweet above the videos and fails this.
     """
-    trending_items = [_trending_item(f"tr{n}", f"Trending headline {n}") for n in range(7)]
+    items = [
+        # Ranked FIRST (Hero), but as an X post it must still render below the videos.
+        _tiered("tweet1", TIER_HERO, title="a hot take", card_url="https://x.com/levelsio/status/1"),
+        _tiered("vidA", TIER_STANDARD, title="a real episode"),
+    ]
+    output_html = render.render_digest_html(items, inline_image=lambda url: None)
 
-    trio_html = render._build_ahead_trio(
-        scoops=[],
-        trending_items=trending_items,
-        items_by_id={},
-        summaries={},
-    )
+    assert "From YouTube" in output_html
+    assert "From X" in output_html
+    assert output_html.index("From YouTube") < output_html.index("From X")
+    assert output_html.index("a real episode") < output_html.index("a hot take")
 
-    # Each trending row carries this distinctive style fragment (the gem tile uses a
-    # different ``gap:7px`` ordering), so counting it counts trending rows exactly.
-    row_count = trio_html.count("align-items:baseline;gap:10px")
-    assert row_count == 5, f"trending tile must cap at 5 rows, rendered {row_count}"
-    # The top-5 headlines are present; the tail (6th/7th) are dropped.
-    for n in range(5):
-        assert f"Trending headline {n}" in trio_html
-    assert "Trending headline 5" not in trio_html
-    assert "Trending headline 6" not in trio_html
+
+def test_youtube_only_day_omits_the_empty_x_section() -> None:
+    """With no X posts, the "From X" heading is absent entirely (no dangling section).
+
+    WHY: an empty headed section reads as "your X feed had nothing", which is a claim the
+    page has no business making when X simply isn't part of the run. Omitting beats an
+    empty container (Rule 12: degrade, don't fake).
+    """
+    output_html = render.render_digest_html([_tiered("vidA", TIER_HERO)], inline_image=lambda url: None)
+
+    assert "From YouTube" in output_html
+    assert "From X" not in output_html
+
+
+def test_split_youtube_and_x_partitions_every_item_exactly_once() -> None:
+    """The platform split loses nothing and duplicates nothing (the never-drop invariant).
+
+    WHY: rank controls density, never inclusion. Splitting the batch into two rendered
+    sections is the one place an item could silently vanish (fall into neither half) or
+    double-render (land in both). We assert the two halves partition the input exactly.
+    """
+    items = [
+        _tiered("vidA", TIER_HERO),
+        _tiered("tweet1", TIER_STANDARD, card_url="https://x.com/a/status/1"),
+        _tiered("vidB", TIER_COMPACT),
+        _tiered("tweet2", TIER_INDEX, card_url="https://x.com/b/status/2"),
+    ]
+    youtube_items, x_items = render.split_youtube_and_x(items)
+
+    assert [t.scored_item.item.item_external_id for t in youtube_items] == ["vidA", "vidB"]
+    assert [t.scored_item.item.item_external_id for t in x_items] == ["tweet1", "tweet2"]
+    assert len(youtube_items) + len(x_items) == len(items)

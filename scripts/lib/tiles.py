@@ -20,19 +20,18 @@ Security (design brief §5, non-negotiable):
     hatched ``.ph`` placeholder (feature tiles) or is simply omitted (tweet avatars)
     — never a broken or unsafe ``<img>``.
 
-Graceful degradation (Rule 12, no fabrication): empty verdict/blurb omit their
-element entirely; hidden-gem subscriber counts and per-item clock times are NOT
-captured upstream, so they are never rendered (no made-up "3.1k subs" / "14:20").
+Graceful degradation (Rule 12, no fabrication): an empty blurb / chapter list / image
+omits its element entirely rather than rendering a placeholder claim.
 
 Rule 5: no LLM here — pure deterministic string building.
 """
 
 from __future__ import annotations
 
-import re
+import math
 import sys
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Sequence
 
 # Make ``lib`` importable whether this module is loaded as ``lib.tiles`` (via the
 # scripts-dir sys.path insert) or run from the scripts dir directly. Mirrors
@@ -45,44 +44,99 @@ for _candidate_dir in (_SCRIPTS_DIR, _LIB_DIR):
 
 from lib.html_render import escape, is_safe_link_url, safe_href, safe_img_src  # noqa: E402
 
-# --- Trending-now marker categories (the "ahead of the curve" middle tile) ----
-# The trending list marks each row by WHERE the signal comes from: a creator who
-# broke a long silence (dormant), a topic N of YOUR follows landed on, or a topic
-# trending OUTSIDE your network (external). The marker glyph + colour encode it.
-CATEGORY_DORMANT: str = "dormant"
-CATEGORY_YOURS: str = "yours"
-CATEGORY_EXTERNAL: str = "external"
 
-# Per-category render spec: (marker glyph, marker colour, right-label colour). The
-# right-label TEXT for CATEGORY_YOURS is computed from the count ("N of yours").
-_TRENDING_MARKER_SPEC: dict[str, tuple[str, str, str]] = {
-    CATEGORY_DORMANT: ("◆", "#B7472A", "#8a7f6c"),
-    CATEGORY_YOURS: ("↗", "#B7472A", "#B7472A"),
-    CATEGORY_EXTERNAL: ("○", "#8a7f6c", "#8a7f6c"),
-}
+# --- Layout geometry ---------------------------------------------------------
+# The masonry is packed HERE, in Python, rather than left to CSS `column-count`:
+# CSS column balancing plus `break-inside:avoid` leaves ragged, half-empty column
+# bottoms. We greedily place each tile in the currently-shortest column (see
+# :func:`pack_tiles_into_columns`), then let every tile in a column share the leftover
+# slack (`.col > .tile{flex:1 1 auto}` in lib.html_render.CSS) so each column ends flush
+# on the same baseline — a newspaper page with no dead space. The slack is SPREAD rather
+# than dumped on the last tile, which would leave one conspicuously hollow card.
+MASONRY_COLUMN_COUNT: int = 3
+MASONRY_COLUMN_GAP_PX: int = 18
 
-# @handle token in a verdict sentence — italicised for the masthead accent. The
-# regex runs on the ALREADY-escaped string; ``@`` and ``[A-Za-z0-9_]`` are not
-# touched by html.escape, so matching post-escape is safe.
-_VERDICT_HANDLE_PATTERN: re.Pattern[str] = re.compile(r"(@[A-Za-z0-9_]+)")
+# Nominal rendered width of one masonry column inside the 1360px-max shell
+# (1360 - 2*40 page padding - 2*18 gaps) / 3. Only used for the height ESTIMATES that
+# drive column packing, never emitted as a fixed width — the columns are fluid.
+COLUMN_WIDTH_PX: int = 414
+
+# Thumbnail height at :data:`COLUMN_WIDTH_PX`. Tiles render thumbs as `aspect-ratio:16/9`
+# — YouTube's native thumbnail ratio — so a thumbnail is shown WHOLE rather than
+# center-cropped to an arbitrary fixed height. This constant only mirrors that ratio for
+# the packing estimate.
+THUMB_HEIGHT_PX: int = round(COLUMN_WIDTH_PX * 9 / 16)
+
+# Per-element px costs for the packing estimate. Deliberately coarse: packing only needs
+# tiles ranked by relative height, and the stretch rule absorbs the residual error.
+_PADDING_PX: int = 32
+_META_ROW_PX: int = 22
+_CHAPTER_ROW_PX: int = 26
+_MORE_CHAPTERS_PX: int = 24
+_CROSS_LINKS_PX: int = 58
+_CHIP_ROW_PX: int = 24
+_BLURB_LINE_PX: int = 20
+# How many characters fit on one line at COLUMN_WIDTH_PX, by role. Serif body text is
+# denser per px than the big Fraunces titles, hence the split.
+_BLURB_CHARS_PER_LINE: int = 52
+_TITLE_CHARS_PER_LINE_AT_19PX: int = 32
 
 
-class TrendingRow(NamedTuple):
-    """One row of the "Trending now" tile.
+class TileBlock(NamedTuple):
+    """One rendered tile plus the estimated height the packer places it by.
+
+    Every ``render_*_tile`` builder returns this instead of a bare string: the builder
+    is the only place that knows what it actually emitted (thumb? how many chapter rows?
+    how long is the title?), so it is the honest place to size the tile.
 
     Attributes:
-        title: The trending topic / headline text (escaped on render).
-        category: One of :data:`CATEGORY_DORMANT` / :data:`CATEGORY_YOURS` /
-            :data:`CATEGORY_EXTERNAL` — selects the marker glyph + colour.
-        your_count: For :data:`CATEGORY_YOURS`, how many of the user's follows
-            landed on this (renders ``"N of yours"``). Ignored otherwise.
-        link_url: Optional href for the row.
+        html: The tile's markup.
+        height_px: A coarse estimate of the tile's rendered height, used ONLY to balance
+            :func:`pack_tiles_into_columns`. Not a measured layout, and deliberately
+            unrelated to ``lib.render.estimate_page_height`` (which sizes whole PAGES
+            against a separately-tuned spill budget).
     """
 
-    title: str
-    category: str
-    your_count: int = 0
-    link_url: str = ""
+    html: str
+    height_px: int
+
+
+def _text_line_count(text: str, chars_per_line: int) -> int:
+    """Estimate how many wrapped lines ``text`` occupies at ``chars_per_line``.
+
+    Args:
+        text: The text to measure. Empty/whitespace yields 0 lines (the element is omitted).
+        chars_per_line: Characters that fit on one rendered line.
+
+    Returns:
+        The estimated line count (0 for empty text).
+
+    Example:
+        >>> _text_line_count("", 30), _text_line_count("a" * 61, 30)
+        (0, 3)
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return 0
+    return math.ceil(len(stripped) / chars_per_line)
+
+
+def _title_height_px(title: str, title_font_size: str) -> int:
+    """Estimate a tile title's rendered height at ``title_font_size``.
+
+    Bigger type both wraps sooner (fewer chars per line) and sets taller lines, so the
+    per-line char budget is scaled off the 19px reference.
+
+    Args:
+        title: The title text.
+        title_font_size: The title font-size in px, no unit (e.g. ``"23"``).
+
+    Returns:
+        The estimated title block height in px.
+    """
+    font_size = float(title_font_size)
+    chars_per_line = max(12, round(_TITLE_CHARS_PER_LINE_AT_19PX * 19 / font_size))
+    return round(_text_line_count(title, chars_per_line) * font_size * 1.16)
 
 
 class ChapterRow(NamedTuple):
@@ -116,26 +170,33 @@ class CrossLink(NamedTuple):
 # --- Small shared element helpers --------------------------------------------
 
 
-def _render_thumb(image_url: str, placeholder_label: str, thumb_height: int) -> str:
-    """Render a tile thumbnail: an inlined ``<img>`` if safe, else the ``.ph`` block.
+def _render_thumb(image_url: str, placeholder_label: str) -> str:
+    """Render a tile thumbnail at YouTube's native 16:9, or the ``.ph`` block.
+
+    The thumbnail is sized by ASPECT RATIO, not a fixed px height: every source
+    thumbnail Orbit inlines is a 16:9 YouTube still, so ``aspect-ratio:16/9`` shows it
+    whole at whatever width the column happens to be, instead of center-cropping it to
+    an arbitrary height. ``object-fit:cover`` stays as the guard for the odd
+    off-ratio source (an avatar-shaped fallback image), which is cropped rather than
+    allowed to distort the tile.
 
     Routes ``image_url`` through :func:`safe_img_src`; on an empty/unsafe src it
     NEVER emits a broken ``<img>`` — it falls back to the hatched ``.ph`` placeholder
-    carrying ``placeholder_label`` (escaped). This is the design's degradation path
-    when a thumbnail could not be inlined.
+    carrying ``placeholder_label`` (escaped), at the same 16:9 box so the layout does
+    not shift between a thumbnailed and a thumbnail-less tile.
 
     Args:
         image_url: A base64 ``data:image/...`` URI or http(s) URL (or empty).
         placeholder_label: The ``.ph`` caption shown when no image is available.
-        thumb_height: The thumbnail height in px.
 
     Returns:
         An ``<img>`` or ``<div class="ph">`` markup string.
     """
+    box = "width:100%;aspect-ratio:16/9;"
     safe_src = safe_img_src(image_url)
     if safe_src:
-        return f'<img src="{safe_src}" alt="" style="height:{thumb_height}px;width:100%;object-fit:cover;display:block;">'
-    return f'<div class="ph" style="height:{thumb_height}px;width:100%;"><span>{escape(placeholder_label)}</span></div>'
+        return f'<img src="{safe_src}" alt="" style="{box}object-fit:cover;display:block;">'
+    return f'<div class="ph" style="{box}"><span>{escape(placeholder_label)}</span></div>'
 
 
 def _render_blurb(summary: str, *, font_size: str, margin_bottom: str, color: str = "#3a342b") -> str:
@@ -270,33 +331,29 @@ def _render_meta_row(meta_label: str, flag: str) -> str:
     )
 
 
-# --- Masthead / verdict ------------------------------------------------------
+# --- Masthead ----------------------------------------------------------------
 
 
-def render_masthead(
-    date_str: str,
-    source_total: int,
-    accounted: int,
-    scoop_count: int,
-    dormant_count: int,
-    cluster_count: int,
-) -> str:
-    """Render the newspaper masthead (the "Orbit" wordmark + the day's counts).
+def render_masthead(date_str: str, tracked_total: int, posted_count: int, item_count: int) -> str:
+    """Render the newspaper masthead (the "Orbit" wordmark + the day's coverage counts).
+
+    The counts line answers ONE question — "is Orbit watching everything I follow?" —
+    so it reports coverage, not editorial signal: how many channels/accounts are
+    tracked in total, how many of those posted today, and how many items that produced.
 
     Args:
-        date_str: The pre-formatted dateline (e.g. ``"TUESDAY · 17 JUN 2026 · 06:14"``),
-            built by the orchestrator; escaped here.
-        source_total: Total sources scanned.
-        accounted: How many of those are accounted for in the digest.
-        scoop_count: Number of scoops surfaced.
-        dormant_count: Number of dormant-creator breaks.
-        cluster_count: Number of multi-source story clusters.
+        date_str: The pre-formatted dateline (e.g. ``"TUESDAY · 17 JUN 2026"``), built
+            by the orchestrator; escaped here.
+        tracked_total: Every source Orbit watches (all YouTube channels + X accounts),
+            whether or not they posted today.
+        posted_count: How many of those tracked sources appear in today's digest.
+        item_count: How many items the digest carries.
 
     Returns:
         The masthead ``<div>`` block.
 
     Example:
-        >>> "Orbit" in render_masthead("MON · 1 JAN 2026", 26, 26, 1, 1, 2)
+        >>> "142 TRACKED · 9 POSTED · 14 ITEMS" in render_masthead("MON · 1 JAN 2026", 142, 9, 14)
         True
     """
     return (
@@ -311,221 +368,10 @@ def render_masthead(
         '<div style="text-align:right;font-family:\'JetBrains Mono\',monospace;font-size:11px;'
         'letter-spacing:.07em;color:#5a5240;line-height:1.7;">'
         f"<div>{escape(date_str)}</div>"
-        f'<div><b style="color:#1F1B16;">{int(source_total)} sources · {int(accounted)} accounted for</b></div>'
-        f'<div style="color:#B7472A;">{int(scoop_count)} scoop · {int(dormant_count)} dormant · '
-        f"{int(cluster_count)} clusters</div>"
+        f'<div><b style="color:#1F1B16;">{int(tracked_total)} TRACKED · {int(posted_count)} POSTED · '
+        f"{int(item_count)} ITEMS</b></div>"
         "</div>"
         "</div>"
-    )
-
-
-def render_verdict(verdict_text: str) -> str:
-    """Render the LLM editorial verdict sentence, or ``""`` when empty (omit element).
-
-    The text is escaped first, then ``@handle`` tokens are wrapped in italic accent
-    spans (matching the design's italicised mentions). The italic transform runs on
-    the escaped string and only touches ``@[A-Za-z0-9_]+`` runs, so it can never
-    re-introduce active markup. An empty/whitespace verdict returns ``""`` so the
-    masthead is followed by no empty container (Rule 12: degrade, don't fake).
-
-    Args:
-        verdict_text: The plain-text verdict sentence from the LLM (or empty when
-            the LLM was unavailable).
-
-    Returns:
-        A verdict ``<div>`` block, or ``""`` if there is no verdict.
-
-    Example:
-        >>> render_verdict("")
-        ''
-        >>> "font-style:italic" in render_verdict("A scoop from @swyx today")
-        True
-    """
-    text = (verdict_text or "").strip()
-    if not text:
-        return ""
-    accented = _VERDICT_HANDLE_PATTERN.sub(r'<span style="font-style:italic;">\1</span>', escape(text))
-    return (
-        '<div style="padding:26px 0 24px;">'
-        '<div style="font-family:\'Fraunces\',serif;font-weight:500;font-size:30px;'
-        'line-height:1.3;letter-spacing:-.01em;max-width:1060px;">'
-        f"{accented}</div></div>"
-    )
-
-
-# --- Ahead-of-the-curve trio (scoop / trending / hidden gem) -----------------
-
-
-def render_scoop_tile(
-    attribution: str,
-    title: str,
-    blurb: str,
-    link_url: str,
-    *,
-    link_label: str = "→ read the thread",
-) -> str:
-    """Render the loud red "scoop" tile (left of the ahead-of-the-curve trio).
-
-    Args:
-        attribution: The source attribution after the "The scoop ·" prefix
-            (e.g. ``"@swyx · X"``), escaped.
-        title: The scoop headline, escaped.
-        blurb: The one-line why-it-matters blurb (escaped). Empty → omitted.
-        link_url: The href for the read link.
-        link_label: The read-link label.
-
-    Returns:
-        A red scoop ``.tile`` block.
-    """
-    has_blurb = bool((blurb or "").strip())
-    title_margin = "auto" if not has_blurb else "11px"
-    blurb_html = (
-        f'<div style="font-size:14.5px;line-height:1.45;opacity:.92;margin-bottom:auto;">{escape(blurb)}</div>'
-        if has_blurb
-        else ""
-    )
-    return (
-        '<div class="tile" style="background:#B7472A;border-color:#B7472A;padding:22px 24px;'
-        'color:#F7F3EA;display:flex;flex-direction:column;margin-bottom:0;">'
-        '<div style="font-family:\'JetBrains Mono\',monospace;font-size:10px;letter-spacing:.12em;'
-        f'text-transform:uppercase;opacity:.85;margin-bottom:12px;">◆ The scoop · {escape(attribution)}</div>'
-        '<div style="font-family:\'Fraunces\',serif;font-weight:600;font-size:24px;line-height:1.16;'
-        f'margin-bottom:{title_margin};">{escape(title)}</div>'
-        f"{blurb_html}"
-        f'<a href="{safe_href(link_url)}" style="font-family:\'JetBrains Mono\',monospace;font-size:11px;'
-        f'margin-top:16px;border-top:1px solid rgba(247,243,234,.35);padding-top:11px;">{escape(link_label)}</a>'
-        "</div>"
-    )
-
-
-def render_trending_now(rows: tuple[TrendingRow, ...] | list[TrendingRow]) -> str:
-    """Render the "Trending now" middle tile of the trio, or ``""`` if no rows.
-
-    Each row's marker encodes its category: ``◆`` dormant-creator break, ``↗``
-    "N of yours" (topic N of your follows landed on), ``○`` external (trending
-    outside your network).
-
-    Args:
-        rows: The :class:`TrendingRow` items in display order.
-
-    Returns:
-        A trending ``.tile`` block, or ``""`` if there are no rows.
-    """
-    if not rows:
-        return ""
-    row_html_parts: list[str] = []
-    last_index = len(rows) - 1
-    for index, row in enumerate(rows):
-        marker, marker_color, label_color = _TRENDING_MARKER_SPEC.get(
-            row.category, _TRENDING_MARKER_SPEC[CATEGORY_EXTERNAL]
-        )
-        if row.category == CATEGORY_YOURS:
-            right_label = f"{int(row.your_count)} of yours"
-        elif row.category == CATEGORY_DORMANT:
-            right_label = "dormant"
-        else:
-            right_label = "external"
-        border = "" if index == last_index else "border-bottom:1px solid rgba(31,27,22,.1);"
-        row_html_parts.append(
-            f'<a href="{safe_href(row.link_url)}" style="display:flex;align-items:baseline;gap:10px;'
-            f'padding:9px 0;{border}">'
-            f'<span style="color:{marker_color};font-family:\'JetBrains Mono\',monospace;font-size:12px;'
-            f'width:12px;flex:none;">{marker}</span>'
-            f'<span style="font-size:15px;line-height:1.25;flex:1;">{escape(row.title)}</span>'
-            f'<span style="font-family:\'JetBrains Mono\',monospace;font-size:9.5px;color:{label_color};'
-            f'white-space:nowrap;">{escape(right_label)}</span></a>'
-        )
-    return (
-        '<div class="tile" style="padding:22px 24px;display:flex;flex-direction:column;margin-bottom:0;">'
-        '<div style="font-family:\'JetBrains Mono\',monospace;font-size:10px;letter-spacing:.12em;'
-        'text-transform:uppercase;color:#5a5240;margin-bottom:14px;">↗ Trending now</div>'
-        '<div style="display:flex;flex-direction:column;gap:0;">' + "".join(row_html_parts) + "</div></div>"
-    )
-
-
-def render_hidden_gem(
-    channel_label: str,
-    velocity_pct: int,
-    title: str,
-    blurb: str,
-    *,
-    chip_time: str = "",
-    chip_label: str = "",
-    link_url: str = "",
-) -> str:
-    """Render the "Hidden gem" right tile of the trio (velocity %, NO subscriber count).
-
-    Per the locked decisions, subscriber counts and per-item clock times are NOT
-    captured upstream, so the meta line carries the channel ONLY — never a fabricated
-    "3.1k subs" / "14:20".
-
-    Args:
-        channel_label: The channel meta label (escaped; pass pre-cased if uppercase
-            is desired).
-        velocity_pct: The view-velocity percentage (renders ``"+N% today"``).
-        title: The episode title, escaped.
-        blurb: The one-line blurb (escaped). Empty → omitted.
-        chip_time: Optional key-moment timestamp chip (e.g. ``"02:50"``). Empty →
-            the key-moment link is omitted.
-        chip_label: The key-moment label paired with ``chip_time``.
-        link_url: The href for the key-moment link.
-
-    Returns:
-        A hidden-gem ``.tile`` block.
-    """
-    has_blurb = bool((blurb or "").strip())
-    blurb_html = (
-        f'<div style="font-size:14px;line-height:1.45;color:#3a342b;margin-bottom:auto;">{escape(blurb)}</div>'
-        if has_blurb
-        else ""
-    )
-    chip_html = ""
-    if (chip_time or "").strip():
-        chip_html = (
-            f'<a href="{safe_href(link_url)}" style="display:flex;gap:7px;align-items:baseline;margin-top:14px;'
-            'border-top:1px solid rgba(31,27,22,.12);padding-top:11px;">'
-            f'<span class="chip">{escape(chip_time)}</span>'
-            f'<span style="font-size:13px;color:#2a251e;">{escape(chip_label)}</span></a>'
-        )
-    return (
-        '<div class="tile" style="padding:0;display:flex;flex-direction:column;margin-bottom:0;overflow:hidden;">'
-        '<div style="background:#2a251e;color:#e8a594;font-family:\'JetBrains Mono\',monospace;font-size:10px;'
-        'letter-spacing:.12em;text-transform:uppercase;padding:9px 18px;display:flex;'
-        'justify-content:space-between;align-items:center;">'
-        f'<span>✦ Hidden gem</span><span style="color:#F7F3EA;">+{int(velocity_pct)}% today</span></div>'
-        '<div style="padding:18px 20px;display:flex;flex-direction:column;flex:1;">'
-        f'<div style="font-family:\'JetBrains Mono\',monospace;font-size:10px;color:#8a7f6c;'
-        f'margin-bottom:8px;">{escape(channel_label)}</div>'
-        '<div style="font-family:\'Fraunces\',serif;font-weight:600;font-size:20px;line-height:1.16;'
-        f'margin-bottom:9px;">{escape(title)}</div>'
-        f"{blurb_html}{chip_html}</div></div>"
-    )
-
-
-def render_ahead_trio(scoop_tile: str, trending_tile: str, gem_tile: str) -> str:
-    """Wrap the three pre-rendered trio tiles in the "Ahead of the curve" grid.
-
-    Returns ``""`` if all three tiles are empty (a quiet day with nothing ahead of
-    the curve gets no empty section).
-
-    Args:
-        scoop_tile: HTML from :func:`render_scoop_tile` (or ``""``).
-        trending_tile: HTML from :func:`render_trending_now` (or ``""``).
-        gem_tile: HTML from :func:`render_hidden_gem` (or ``""``).
-
-    Returns:
-        The "Ahead of the curve" section ``<div>``, or ``""`` if all tiles empty.
-    """
-    if not (scoop_tile or trending_tile or gem_tile):
-        return ""
-    return (
-        '<div style="margin-bottom:32px;">'
-        '<div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;">'
-        '<div style="font-family:\'JetBrains Mono\',monospace;font-size:11px;letter-spacing:.18em;'
-        'color:#B7472A;text-transform:uppercase;">Ahead of the curve</div>'
-        '<div style="flex:1;height:1px;background:rgba(183,71,42,.3);"></div></div>'
-        '<div style="display:grid;grid-template-columns:1.15fr 1fr 1fr;gap:16px;align-items:stretch;">'
-        f"{scoop_tile}{trending_tile}{gem_tile}</div></div>"
     )
 
 
@@ -544,11 +390,10 @@ def _render_feature_tile(
     more_chapters_count: int,
     cross_links: tuple[CrossLink, ...] | list[CrossLink],
     card_url: str,
-    thumb_height: int,
     body_padding: str,
     title_font_size: str,
     blurb_font_size: str,
-) -> str:
+) -> TileBlock:
     """Shared builder for the Hero/Standard feature tiles (thumb + chapters + links).
 
     Hero and Standard differ only by size knobs; both share this body. See
@@ -556,11 +401,21 @@ def _render_feature_tile(
     points and argument docs.
 
     Returns:
-        A feature ``.tile`` block.
+        A feature ``.tile`` :class:`TileBlock`.
     """
-    return (
+    height_px = (
+        THUMB_HEIGHT_PX
+        + _PADDING_PX
+        + _META_ROW_PX
+        + _title_height_px(title, title_font_size)
+        + _text_line_count(summary, _BLURB_CHARS_PER_LINE) * _BLURB_LINE_PX
+        + len(chapters) * _CHAPTER_ROW_PX
+        + (_MORE_CHAPTERS_PX if more_chapters_count > 0 else 0)
+        + (_CROSS_LINKS_PX if cross_links else 0)
+    )
+    html = (
         '<div class="tile">'
-        f"{_render_thumb(image_url, placeholder_label, thumb_height)}"
+        f"{_render_thumb(image_url, placeholder_label)}"
         f'<div style="padding:{body_padding};">'
         f"{_render_meta_row(meta_label, flag)}"
         '<div style="font-family:\'Fraunces\',serif;font-weight:600;'
@@ -572,6 +427,7 @@ def _render_feature_tile(
         f"{_render_cross_links(cross_links)}"
         "</div></div>"
     )
+    return TileBlock(html=html, height_px=height_px)
 
 
 def render_hero_tile(
@@ -586,9 +442,8 @@ def render_hero_tile(
     more_chapters_count: int = 0,
     cross_links: tuple[CrossLink, ...] | list[CrossLink] = (),
     card_url: str = "",
-    thumb_height: int = 188,
-) -> str:
-    """Render the Hero tile — the loudest masonry card (tall thumb, biggest title).
+) -> TileBlock:
+    """Render the Hero tile — the loudest masonry card (biggest title).
 
     Args:
         image_url: Inlined thumbnail src (base64/http(s)); empty → ``.ph`` fallback.
@@ -601,14 +456,13 @@ def render_hero_tile(
         more_chapters_count: Count for the "+ N more chapters" link (0 → omitted).
         cross_links: "Same story, also covered" cross-links.
         card_url: The whole-item deep-link (used by the more-chapters link).
-        thumb_height: Thumbnail height in px.
 
     Returns:
-        A Hero ``.tile`` block.
+        A Hero ``.tile`` :class:`TileBlock`.
 
     Example:
-        >>> html = render_hero_tile(meta_label="DWARKESH · 1:52:14 · YouTube", title="<x>")
-        >>> "class=\\"tile\\"" in html and "&lt;x&gt;" in html
+        >>> tile = render_hero_tile(meta_label="DWARKESH · 1:52:14 · YouTube", title="<x>")
+        >>> "class=\\"tile\\"" in tile.html and "&lt;x&gt;" in tile.html
         True
     """
     return _render_feature_tile(
@@ -622,7 +476,6 @@ def render_hero_tile(
         more_chapters_count=more_chapters_count,
         cross_links=cross_links,
         card_url=card_url,
-        thumb_height=thumb_height,
         body_padding="16px 18px",
         title_font_size="23",
         blurb_font_size="14",
@@ -641,9 +494,8 @@ def render_standard_tile(
     more_chapters_count: int = 0,
     cross_links: tuple[CrossLink, ...] | list[CrossLink] = (),
     card_url: str = "",
-    thumb_height: int = 120,
     title_font_size: str = "19",
-) -> str:
+) -> TileBlock:
     """Render a Standard tile — a mid-weight masonry card (smaller than Hero).
 
     Same shape as :func:`render_hero_tile` with smaller defaults. ``title_font_size``
@@ -661,11 +513,10 @@ def render_standard_tile(
         more_chapters_count: Count for the "+ N more chapters" link (0 → omitted).
         cross_links: "Same story, also covered" cross-links.
         card_url: The whole-item deep-link.
-        thumb_height: Thumbnail height in px.
         title_font_size: Title font-size in px (no unit).
 
     Returns:
-        A Standard ``.tile`` block.
+        A Standard ``.tile`` :class:`TileBlock`.
     """
     return _render_feature_tile(
         image_url=image_url,
@@ -678,7 +529,6 @@ def render_standard_tile(
         more_chapters_count=more_chapters_count,
         cross_links=cross_links,
         card_url=card_url,
-        thumb_height=thumb_height,
         body_padding="15px 17px",
         title_font_size=title_font_size,
         blurb_font_size="13.5",
@@ -694,7 +544,7 @@ def render_compact_tile(
     chip_label: str = "",
     link_url: str = "",
     title_font_size: str = "18",
-) -> str:
+) -> TileBlock:
     """Render a Compact tile — thumbnail-less, one optional key-moment chip-link.
 
     Covers the design's short/condensed YouTube tiles (Theo, Fireship): meta line,
@@ -712,7 +562,7 @@ def render_compact_tile(
         title_font_size: Title font-size in px (no unit).
 
     Returns:
-        A Compact ``.tile`` block.
+        A Compact ``.tile`` :class:`TileBlock`.
     """
     chip_html = ""
     if (chip_time or "").strip():
@@ -721,7 +571,14 @@ def render_compact_tile(
             f'<span class="chip">{escape(chip_time)}</span>'
             f'<span style="font-size:12.5px;color:#2a251e;">{escape(chip_label)}</span></a>'
         )
-    return (
+    height_px = (
+        _PADDING_PX
+        + _META_ROW_PX
+        + _title_height_px(title, title_font_size)
+        + _text_line_count(summary, _BLURB_CHARS_PER_LINE) * _BLURB_LINE_PX
+        + (_CHIP_ROW_PX if chip_html else 0)
+    )
+    html = (
         '<div class="tile"><div style="padding:14px 16px;">'
         f'<div style="font-family:\'JetBrains Mono\',monospace;font-size:10px;color:#8a7f6c;'
         f'margin-bottom:6px;">{escape(meta_label)}</div>'
@@ -731,6 +588,7 @@ def render_compact_tile(
         f"{_render_blurb(summary, font_size='13.5', margin_bottom='10px')}"
         f"{chip_html}</div></div>"
     )
+    return TileBlock(html=html, height_px=height_px)
 
 
 def render_tweet_tile(
@@ -740,7 +598,7 @@ def render_tweet_tile(
     link_url: str = "",
     link_label: str = "→ post",
     avatar_url: str = "",
-) -> str:
+) -> TileBlock:
     """Render a tweet (X) tile — text-first, with the deliberate unavatar extension.
 
     The design's tweet tiles are text-only; the user opted to ADD a profile avatar
@@ -757,7 +615,7 @@ def render_tweet_tile(
             no avatar rendered.
 
     Returns:
-        A tweet ``.tile`` block (cream ``#F2ECE0`` background).
+        A tweet ``.tile`` :class:`TileBlock` (cream ``#F2ECE0`` background).
     """
     safe_avatar = safe_img_src(avatar_url)
     avatar_html = (
@@ -766,7 +624,8 @@ def render_tweet_tile(
         if safe_avatar
         else ""
     )
-    return (
+    height_px = _PADDING_PX + _META_ROW_PX + _text_line_count(text, _BLURB_CHARS_PER_LINE) * 19 + _CHIP_ROW_PX
+    html = (
         '<div class="tile" style="background:#F2ECE0;"><div style="padding:13px 15px;">'
         '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
         f"{avatar_html}"
@@ -777,31 +636,89 @@ def render_tweet_tile(
         f'color:#B7472A;margin-top:9px;display:inline-block;">{escape(link_label)}</a>'
         "</div></div>"
     )
+    return TileBlock(html=html, height_px=height_px)
 
 
-def render_feed_masonry(tiles_html: str) -> str:
-    """Wrap the ranked tiles in the "From your feed · ranked" 3-column masonry.
+def pack_tiles_into_columns(tile_blocks: Sequence[TileBlock], column_count: int) -> list[list[str]]:
+    """Greedily distribute tiles across ``column_count`` columns, shortest column first.
+
+    This is what replaces CSS ``column-count`` balancing: each tile in rank order goes
+    to whichever column is currently shortest, so the columns end within roughly one
+    tile of each other instead of one dying half a page early. Ties break to the
+    left-most column, which keeps the highest-ranked tiles reading left-to-right.
+
+    Pure function over the estimated heights — no markup is parsed or measured (Rule 5).
 
     Args:
-        tiles_html: The concatenated per-tile HTML (Hero/Standard/Compact/Tweet),
-            already built + escaped, in DOM order ≈ rank.
+        tile_blocks: The tiles in rank order.
+        column_count: How many columns to fill (>= 1).
 
     Returns:
-        The masonry section ``<div>`` (heading + ``column-count:3`` container).
+        One list of tile HTML strings per column, in placement order.
 
     Example:
-        >>> "From your feed" in render_feed_masonry("<div class=\\"tile\\"></div>")
+        >>> blocks = [TileBlock("a", 100), TileBlock("b", 10), TileBlock("c", 10)]
+        >>> pack_tiles_into_columns(blocks, 2)
+        [['a'], ['b', 'c']]
+    """
+    columns: list[list[str]] = [[] for _ in range(column_count)]
+    column_heights: list[int] = [0] * column_count
+    for tile_block in tile_blocks:
+        shortest_index = column_heights.index(min(column_heights))
+        columns[shortest_index].append(tile_block.html)
+        column_heights[shortest_index] += tile_block.height_px
+    return columns
+
+
+def render_feed_masonry(tile_blocks: Sequence[TileBlock], *, heading: str, note: str = "") -> str:
+    """Wrap a run of tiles in a headed, gap-free masonry section.
+
+    The page uses this twice — once for the YouTube tiles, once for the X posts
+    below them — so the heading (and its optional right-hand note) is a parameter
+    rather than a hardcoded string.
+
+    Two things keep the grid newspaper-tight rather than ragged:
+      * the columns are packed HERE (:func:`pack_tiles_into_columns`) instead of by CSS
+        column balancing, so no column runs out of tiles early; and
+      * a short run uses FEWER columns (``min(3, len(tile_blocks))``) rather than leaving
+        an empty one — two X posts fill the row as two half-width tiles instead of
+        huddling on the left with a dead third column.
+    The tiles in each column then share whatever slack remains (the ``.col > .tile``
+    flex rule), so the section ends flush on one baseline.
+
+    Args:
+        tile_blocks: The per-tile :class:`TileBlock` items (Hero/Standard/Compact/Tweet),
+            already built + escaped, in rank order.
+        heading: The section heading (e.g. ``"From YouTube · ranked"``), escaped.
+        note: An optional right-aligned note (e.g. ``"bigger tile = higher signal"``);
+            empty → the note element is omitted.
+
+    Returns:
+        The masonry section ``<div>`` (heading + packed flex-column container).
+
+    Example:
+        >>> "From YouTube" in render_feed_masonry([TileBlock("<div></div>", 10)],
+        ...                                       heading="From YouTube · ranked")
         True
     """
+    note_html = (
+        f'<div style="font-family:\'JetBrains Mono\',monospace;font-size:10px;color:#8a7f6c;">{escape(note)}</div>'
+        if (note or "").strip()
+        else ""
+    )
+    blocks = list(tile_blocks)
+    column_count = max(1, min(MASONRY_COLUMN_COUNT, len(blocks)))
+    columns_html = "".join(
+        f'<div class="col">{"".join(column)}</div>' for column in pack_tiles_into_columns(blocks, column_count)
+    )
     return (
-        '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">'
+        '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;margin-top:28px;">'
         '<div style="font-family:\'JetBrains Mono\',monospace;font-size:11px;letter-spacing:.18em;'
-        'color:#5a5240;text-transform:uppercase;">From your feed · ranked</div>'
+        f'color:#5a5240;text-transform:uppercase;">{escape(heading)}</div>'
         '<div style="flex:1;height:1px;background:rgba(31,27,22,.18);"></div>'
-        '<div style="font-family:\'JetBrains Mono\',monospace;font-size:10px;color:#8a7f6c;">'
-        "bigger tile = higher signal</div></div>"
-        '<div style="column-count:3;column-gap:18px;">'
-        f"{tiles_html}</div>"
+        f"{note_html}</div>"
+        f'<div style="display:flex;align-items:stretch;gap:{MASONRY_COLUMN_GAP_PX}px;">'
+        f"{columns_html}</div>"
     )
 
 

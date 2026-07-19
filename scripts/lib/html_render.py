@@ -451,7 +451,10 @@ __BODY__
 # The newspaper "Tiles" design (scripts/assets/orbit-tiles.dc.html) is mostly
 # inline-styled per element; only a handful of shared classes live here. This block
 # is the CLASS layer (.ph hatched placeholder / .tile card / .chip timestamp / .kp
-# key-point row) ported verbatim from the design's <style>. The base64 @font-face
+# key-point row / .col packed masonry column) ported from the design's <style>. The
+# .col rules are Orbit's own: lib.tiles packs the columns in Python and the
+# last-child stretch makes every column end flush, so the grid has no dead space
+# (the design's CSS `column-count` left ragged bottoms). The base64 @font-face
 # rules are NOT here — wrap_page prepends them from the prebuilt
 # scripts/assets/fonts/fonts-inline.css so the page stays self-contained (no CDN).
 CSS: str = """  *{box-sizing:border-box}
@@ -461,6 +464,9 @@ CSS: str = """  *{box-sizing:border-box}
   a{color:inherit;text-decoration:none}
   .tile{break-inside:avoid;background:#F7F3EA;border:1px solid rgba(31,27,22,.14);margin-bottom:18px;transition:border-color .15s,box-shadow .15s}
   .tile:hover{border-color:rgba(183,71,42,.55);box-shadow:0 2px 10px rgba(31,27,22,.07)}
+  .col{flex:1 1 0;min-width:0;display:flex;flex-direction:column}
+  .col>.tile{flex:1 1 auto}
+  .col>.tile:last-child{margin-bottom:0}
   .chip{font-family:'JetBrains Mono',monospace;font-size:10.5px;font-weight:500;color:#B7472A;background:rgba(183,71,42,.1);padding:2px 6px;border-radius:2px;white-space:nowrap}
   .kp{display:flex;gap:9px;align-items:baseline;padding:5px 0;border-bottom:1px dotted rgba(31,27,22,.16)}
   .kp:last-child{border-bottom:none}
@@ -550,23 +556,14 @@ def wrap_page(title: str, body_html: str) -> str:
 _TILES_REEXPORTS: frozenset[str] = frozenset(
     {
         "render_masthead",
-        "render_verdict",
-        "render_ahead_trio",
-        "render_scoop_tile",
-        "render_trending_now",
-        "render_hidden_gem",
         "render_feed_masonry",
         "render_hero_tile",
         "render_standard_tile",
         "render_compact_tile",
         "render_tweet_tile",
         "render_footer",
-        "TrendingRow",
         "ChapterRow",
         "CrossLink",
-        "CATEGORY_DORMANT",
-        "CATEGORY_YOURS",
-        "CATEGORY_EXTERNAL",
     }
 )
 

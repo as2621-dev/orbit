@@ -1,9 +1,10 @@
 """Self-contained ``digest.md`` markdown twin of the Tiles HTML digest (issue #6).
 
 The render stage writes this ONE markdown file beside the rendered HTML. It carries the
-SAME content the Tiles pages carry — tier grouping, the LLM verdict, per-item blurbs, the
-"ahead of the curve" trio, and working deep-links — so a fresh Claude session that
-receives ONLY this file's text has the full digest (that is exactly what #7 does with it).
+SAME content the Tiles pages carry — the coverage counts, the YouTube feed grouped by
+tier, the X posts below it, per-item blurbs, and working deep-links — so a fresh Claude
+session that receives ONLY this file's text has the full digest (that is exactly what #7
+does with it).
 
 Two deliberate differences from :mod:`lib.render`, both because the consumer is a text
 file an LLM reads, not a browser page:
@@ -18,13 +19,13 @@ file an LLM reads, not a browser page:
 
 PARITY BY REUSE (not by reimplementation): to guarantee the twin never drifts from the
 HTML, this module reuses :mod:`lib.render`'s OWN content-selection helpers — tier
-grouping, the card/chapter/trending deep-link resolvers, the trio selection inputs, the
-masthead counts. Those are module-private (underscore) helpers; importing them is a
-deliberate coupling so a change to how the HTML selects content flows to the markdown for
-free. This module owns only the markdown PRESENTATION.
+grouping, the YouTube/X split, the card/chapter deep-link resolvers, the masthead counts.
+Those are module-private (underscore) helpers; importing them is a deliberate coupling so
+a change to how the HTML selects content flows to the markdown for free. This module owns
+only the markdown PRESENTATION.
 
-Rule 5: no LLM here — the verdict + summaries are computed upstream and passed in; this is
-pure deterministic string building.
+Rule 5: no LLM here — the summaries are computed upstream and passed in; this is pure
+deterministic string building.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ for _candidate_dir in (_SCRIPTS_DIR, _LIB_DIR):
     if str(_candidate_dir) not in sys.path:
         sys.path.insert(0, str(_candidate_dir))
 
-from lib import log, render, tiles  # noqa: E402  (import must follow the sys.path inserts above)
+from lib import log, render  # noqa: E402  (import must follow the sys.path inserts above)
 from lib.density import TIER_COMPACT, TIER_HERO, TIER_INDEX, TIER_STANDARD  # noqa: E402
 from lib.html_render import _format_timestamp  # noqa: E402
 
@@ -52,9 +53,9 @@ from lib.html_render import _format_timestamp  # noqa: E402
 # render.DEFAULT_PAGE_2_FILENAME).
 DIGEST_MD_FILENAME: str = "digest.md"
 
-# Tier order + human headings for the "From your feed · ranked" section. Mirrors the HTML
-# density ladder (Hero loudest -> Index quietest). Any item whose density_tier falls
-# OUTSIDE these four constants is still rendered (see _build_feed's leftover-group fold),
+# Tier order + human headings for the YouTube feed section. Mirrors the HTML density
+# ladder (Hero loudest -> Index quietest). Any item whose density_tier falls OUTSIDE
+# these four constants is still rendered (see _build_youtube_feed's leftover-group fold),
 # so the twin can never show fewer items than the HTML masonry.
 _TIER_HEADINGS: tuple[tuple[str, str], ...] = (
     (TIER_HERO, "Hero"),
@@ -124,15 +125,6 @@ def _md_link(text: str, url: str) -> str:
     return label
 
 
-def _trend_marker(category: str, your_count: int) -> str:
-    """Map a "Trending now" category to its markdown marker (mirrors the HTML glyphs)."""
-    if category == tiles.CATEGORY_YOURS:
-        return f"↗ {your_count} of yours"
-    if category == tiles.CATEGORY_DORMANT:
-        return "◆ dormant"
-    return "○ external"
-
-
 # --- Section builders --------------------------------------------------------
 
 
@@ -140,90 +132,17 @@ def _build_header(
     page_title: str,
     reference_date: Optional[date],
     tiered_items: list[Any],
-    scoops: list[Any],
-    clusters: list[Any],
+    tracked_source_total: int,
 ) -> str:
-    """Build the masthead: the title, the dateline, and the day's counts line.
+    """Build the masthead: the title, the dateline, and the day's coverage counts.
 
-    The counts mirror render.py's masthead fields exactly (distinct-creator sources,
-    accounted-for total, scoops, dormant, clusters) so the twin reports the same tallies.
+    The counts come from render._masthead_counts, so the twin reports the SAME tracked /
+    posted / item tallies the HTML masthead does.
     """
     dateline = render._format_dateline(reference_date)
-    source_total, accounted, scoop_count, dormant_count, cluster_count = render._masthead_counts(
-        tiered_items, scoops, clusters
-    )
-    counts_line = (
-        f"**{accounted} of {source_total} sources accounted for** · "
-        f"{scoop_count} scoops · {dormant_count} dormant · {cluster_count} clusters"
-    )
+    tracked_total, posted_count, item_count = render._masthead_counts(tiered_items, tracked_source_total)
+    counts_line = f"**{tracked_total} tracked · {posted_count} posted · {item_count} items**"
     return f"# {page_title}\n\n{dateline}\n\n{counts_line}"
-
-
-def _build_verdict(verdict: str) -> str:
-    """Build the verdict blockquote, or ``""`` when there is no verdict (no fabrication)."""
-    text = (verdict or "").strip()
-    return f"> {_oneline(text)}" if text else ""
-
-
-def _build_trio(
-    scoops: list[Any],
-    trending_items: list[Any],
-    items_by_id: dict[str, Any],
-    summaries: dict[str, str],
-) -> str:
-    """Build the "Ahead of the curve" section (top scoop / trending rows / hidden gem).
-
-    Reproduces render._build_ahead_trio's SELECTION (which scoop, the top-N trending rows,
-    the top-velocity gem) but emits markdown. The whole section is omitted on a quiet day
-    (no scoops and no trending items), matching the HTML's omit-when-empty behavior.
-    """
-    if not scoops and not trending_items:
-        return ""
-
-    blocks: list[str] = ["## Ahead of the curve"]
-
-    if scoops:
-        top_scoop = scoops[0]
-        scoop_id = str(getattr(top_scoop, "item_external_id", "") or "")
-        resolved = items_by_id.get(scoop_id)
-        attribution = (
-            (getattr(resolved, "channel_name", "") or "")
-            if resolved is not None
-            else (getattr(top_scoop, "creator_external_id", "") or "")
-        ) or "your network"
-        link = render._trending_deep_link(top_scoop, items_by_id)
-        lines = [f"### Scoop — {_oneline(attribution)}", "", _md_link(getattr(top_scoop, "title", "") or "", link)]
-        blurb = summaries.get(scoop_id, "")
-        if blurb.strip():
-            lines += ["", _oneline(blurb)]
-        blocks.append("\n".join(lines))
-
-    if trending_items:
-        rows = ["### Trending now", ""]
-        for trending_item in trending_items[: render._TRENDING_MAX_ROWS]:
-            category, your_count = render._trending_row_category(trending_item)
-            link = render._trending_deep_link(trending_item, items_by_id)
-            rows.append(
-                f"- {_trend_marker(category, your_count)} — {_md_link(getattr(trending_item, 'title', '') or '', link)}"
-            )
-        blocks.append("\n".join(rows))
-
-        gem = trending_items[0]
-        gem_id = str(getattr(gem, "item_external_id", "") or "")
-        ratio = float(getattr(gem, "baseline_relative_ratio", 0.0) or 0.0)
-        creator = (getattr(gem, "creator_external_id", "") or getattr(gem, "title", "") or "").upper()
-        pct = max(0, int(round(ratio * 100)))
-        gem_lines = [
-            f"### Hidden gem — {_oneline(creator)} · +{pct}% vs baseline",
-            "",
-            _oneline(getattr(gem, "title", "") or ""),
-        ]
-        gem_blurb = summaries.get(gem_id, "")
-        if gem_blurb.strip():
-            gem_lines += ["", _oneline(gem_blurb)]
-        blocks.append("\n".join(gem_lines))
-
-    return "\n\n".join(blocks)
 
 
 def _build_feature_entry(item: Any, *, summaries: dict[str, str], cross_links_by_id: dict[str, list[Any]]) -> str:
@@ -285,35 +204,36 @@ def _build_tweet_entry(item: Any) -> str:
 def _render_tier_entries(
     tier_items: list[Any], *, summaries: dict[str, str], cross_links_by_id: dict[str, list[Any]]
 ) -> list[str]:
-    """Render one tier group's items to markdown entries, dispatching per item.
+    """Render one YouTube tier group's items to markdown entries, dispatching per item.
 
-    Dispatch mirrors render._build_masonry_tiles exactly: an X item -> tweet entry (checked
-    FIRST, before the tier); a Hero/Standard item -> feature entry; everything lower ->
-    compact entry. An out-of-band tier lands in the ``else`` (compact), matching the HTML
-    non-spilled masonry's fallback for an unknown tier.
+    Dispatch mirrors render._build_masonry_tiles: a Hero/Standard item -> feature entry;
+    everything lower -> compact entry. An out-of-band tier lands in the ``else``
+    (compact), matching the HTML masonry's fallback for an unknown tier. X items never
+    reach here — they are split out upstream and rendered in their own section.
     """
     entries: list[str] = []
     for tiered_item in tier_items:
         item = tiered_item.scored_item.item
-        if render._is_tweet(item):
-            entries.append(_build_tweet_entry(item))
-        elif tiered_item.density_tier in render._FEATURE_TIERS:
+        if tiered_item.density_tier in render._FEATURE_TIERS:
             entries.append(_build_feature_entry(item, summaries=summaries, cross_links_by_id=cross_links_by_id))
         else:
             entries.append(_build_compact_entry(item))
     return entries
 
 
-def _build_feed(tiered_items: list[Any], *, summaries: dict[str, str], cross_links_by_id: dict[str, list[Any]]) -> str:
-    """Build the "From your feed · ranked" section, grouping every tiered item by tier.
+def _build_youtube_feed(
+    youtube_items: list[Any], *, summaries: dict[str, str], cross_links_by_id: dict[str, list[Any]]
+) -> str:
+    """Build the "From YouTube · ranked" section, grouping every video by density tier.
 
     Renders the four known density tiers in ladder order, then folds any leftover group (an
     out-of-band density_tier) under a generic heading — so the union of what is rendered is
-    ALWAYS every tiered item, never fewer than the HTML masonry shows (the parity invariant
-    #7 depends on). An empty batch yields a coherent quiet-day line, not a bare heading.
+    ALWAYS every video passed in, never fewer than the HTML masonry shows (the parity
+    invariant #7 depends on). An empty batch yields a coherent quiet-day line, not a bare
+    heading.
     """
-    grouped = render.group_items_by_tier(tiered_items)
-    sections = ["## From your feed · ranked"]
+    grouped = render.group_items_by_tier(youtube_items)
+    sections = ["## From YouTube · ranked"]
     rendered_any = False
     covered: set[str] = set()
 
@@ -337,9 +257,21 @@ def _build_feed(tiered_items: list[Any], *, summaries: dict[str, str], cross_lin
         sections.append("\n\n".join([f"### {_OTHER_TIER_HEADING}"] + entries))
 
     if not rendered_any:
-        sections.append("_No qualifying items in your feed today._")
+        sections.append("_No new videos from your channels today._")
 
     return "\n\n".join(sections)
+
+
+def _build_x_feed(x_items: list[Any]) -> str:
+    """Build the "From X" section below the videos, or ``""`` when there are no X posts.
+
+    Mirrors the HTML, which omits the X masonry entirely on a YouTube-only day rather
+    than leaving a dangling heading.
+    """
+    if not x_items:
+        return ""
+    entries = [_build_tweet_entry(tiered_item.scored_item.item) for tiered_item in x_items]
+    return "\n\n".join(["## From X"] + entries)
 
 
 def render_digest_markdown(
@@ -347,26 +279,23 @@ def render_digest_markdown(
     config: Any = None,
     *,
     clusters: list[Any] | None = None,
-    trending_items: list[Any] | None = None,
-    scoops: list[Any] | None = None,
-    verdict: str = "",
+    tracked_source_total: int = 0,
     summaries: dict[str, str] | None = None,
     reference_date: Optional[date] = None,
 ) -> str:
     """Render the tiered items into ONE self-contained ``digest.md`` markdown string.
 
-    Assembles the same content the HTML digest carries — masthead, verdict, the "ahead of
-    the curve" trio, and the tier-grouped feed — into a single markdown document. Unlike
-    :func:`lib.render.render_digest_pages`, the 2-page spill is collapsed: every tiered
-    item appears once, grouped by density tier. Text-first: no images, only web deep-links.
+    Assembles the same content the HTML digest carries — the masthead coverage counts, the
+    tier-grouped YouTube feed, and the X posts below it — into a single markdown document.
+    Unlike :func:`lib.render.render_digest_pages`, the 2-page spill is collapsed: every
+    tiered item appears once. Text-first: no images, only web deep-links.
 
     Args:
         tiered_items: The :class:`lib.density.TieredItem` list (already rank-ordered + tiered).
         config: An optional :class:`lib.config.OrbitConfig` — read for ``digest_title``.
-        clusters: OPTIONAL clusters (supply the feed cross-links + the masthead count).
-        trending_items: OPTIONAL trending list (the trio's rows + hidden gem).
-        scoops: OPTIONAL detected scoops (the trio's top scoop + the dormant count).
-        verdict: The pre-computed LLM verdict sentence (``""`` -> omitted).
+        clusters: OPTIONAL clusters (supply the feed cross-links).
+        tracked_source_total: Total sources watched, for the masthead coverage count
+            (0 degrades to the posted count — see :func:`lib.render._masthead_counts`).
         summaries: The pre-computed ``item_external_id`` -> blurb map (None -> ``{}``).
         reference_date: The masthead dateline date (defaults to today; injectable).
 
@@ -379,28 +308,24 @@ def render_digest_markdown(
         True
     """
     clusters = clusters or []
-    trending_items = trending_items or []
-    scoops = scoops or []
     summaries = summaries or {}
 
     page_title = getattr(config, "digest_title", None) or render.DEFAULT_DIGEST_TITLE
-    items_by_id = render._items_by_id(tiered_items)
     cross_links_by_id = render._cross_links_by_id(clusters)
+    youtube_items, x_items = render.split_youtube_and_x(tiered_items)
 
     sections = [
-        _build_header(page_title, reference_date, tiered_items, scoops, clusters),
-        _build_verdict(verdict),
-        _build_trio(scoops, trending_items, items_by_id, summaries),
-        _build_feed(tiered_items, summaries=summaries, cross_links_by_id=cross_links_by_id),
+        _build_header(page_title, reference_date, tiered_items, tracked_source_total),
+        _build_youtube_feed(youtube_items, summaries=summaries, cross_links_by_id=cross_links_by_id),
+        _build_x_feed(x_items),
     ]
     markdown = "\n\n".join(section for section in sections if section) + "\n"
 
     log.log_info(
         "markdown_render_completed",
         item_count=len(tiered_items),
-        has_verdict=bool(verdict.strip()),
-        trending_count=len(trending_items),
-        scoop_count=len(scoops),
+        youtube_count=len(youtube_items),
+        x_count=len(x_items),
         char_count=len(markdown),
     )
     return markdown

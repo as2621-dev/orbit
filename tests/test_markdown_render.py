@@ -41,7 +41,7 @@ from lib.rerank import RankableItem, ScoredItem  # noqa: E402
 # Reuse the HTML renderer's fixture factories so both surfaces are tested against the
 # SAME item shapes (Rule 11 — no parallel fixture set). pytest's default prepend import
 # mode puts the tests dir on sys.path, so the sibling module imports cleanly.
-from test_render import _chapter, _many, _tiered, _trending_item  # noqa: E402
+from test_render import _chapter, _many, _tiered  # noqa: E402
 
 
 def _tweet_tiered(item_external_id: str, tier: str, *, handle: str, body: str) -> TieredItem:
@@ -184,24 +184,56 @@ def test_out_of_band_density_tier_is_still_rendered_not_dropped() -> None:
     assert "vidKnown" in md
 
 
-def test_ahead_of_the_curve_trio_survives_with_working_links() -> None:
-    """The scoop / trending / hidden-gem trio reaches the markdown with its deep-links.
+def test_markdown_masthead_reports_the_same_coverage_counts_as_the_html() -> None:
+    """The twin's counts line carries the SAME tracked / posted / items tallies as the HTML.
 
-    WHY: the "ahead of the curve" items are the highest-value signal the digest exists to
-    surface; a twin that dropped them would hand #7 a lesser digest than the HTML. We pass
-    a scoop + trending items and assert the scoop headline, a trending headline, and the
-    trending deep-link all appear.
+    WHY (the parity invariant #7 depends on): the twin and the page are two renderings of
+    one digest. If the markdown reported a different coverage claim than the HTML — say by
+    re-deriving "tracked" from the items instead of the shared ``render._masthead_counts``
+    — a fresh session reading only the markdown would be told a different story than the
+    user saw in their inbox.
     """
-    scoop = _trending_item("sc1", "Scoop headline")
-    scoop.card_url = "https://x.com/breaker/status/sc1"
-    trending = [_trending_item(f"tr{n}", f"Trending headline {n}") for n in range(3)]
-    trending[0].card_url = "https://x.com/mover/status/tr0"
+    tiered = [_tiered("vidA", TIER_HERO), _tiered("vidB", TIER_STANDARD)]
 
-    md = markdown_render.render_digest_markdown([], scoops=[scoop], trending_items=trending)
+    md = markdown_render.render_digest_markdown(tiered, tracked_source_total=142)
+    html = render.render_digest_html(tiered, tracked_source_total=142, inline_image=lambda url: None)
 
-    assert "Scoop headline" in md
-    assert "Trending headline 0" in md
-    assert "https://x.com/mover/status/tr0" in md, "trending deep-link must survive into the markdown"
+    assert "142 tracked · 2 posted · 2 items" in md
+    assert "142 TRACKED · 2 POSTED · 2 ITEMS" in html
+
+
+def test_markdown_has_no_verdict_or_trio_section() -> None:
+    """The twin carries no verdict blockquote and no "Ahead of the curve" section.
+
+    WHY: the twin mirrors the page, and the page deliberately makes no day-level editorial
+    claim. A twin that kept a synthesized headline would re-introduce, through the #7 path,
+    exactly the layer the digest dropped.
+    """
+    md = markdown_render.render_digest_markdown([_tiered("vidA", TIER_HERO)])
+
+    assert "Ahead of the curve" not in md
+    assert "Trending now" not in md
+    assert "Hidden gem" not in md
+    assert not md.splitlines().__contains__("> "), "no verdict blockquote"
+
+
+def test_markdown_puts_x_posts_in_their_own_section_below_the_videos() -> None:
+    """X posts land under "## From X", after the YouTube section — mirroring the HTML.
+
+    WHY: the twin's section order IS the reading order a fresh session infers importance
+    from. Interleaving tweets among the videos here, while the HTML separates them, is
+    exactly the drift the parity-by-reuse coupling exists to prevent.
+    """
+    tiered = [
+        _tweet_tiered("tw1", TIER_HERO, handle="levelsio", body="a hot take"),
+        _tiered("vidA", TIER_STANDARD, title="a real episode"),
+    ]
+
+    md = markdown_render.render_digest_markdown(tiered)
+
+    assert "## From YouTube · ranked" in md
+    assert "## From X" in md
+    assert md.index("a real episode") < md.index("a hot take")
 
 
 def test_render_stage_writes_digest_md_beside_page_one_not_in_written_paths(tmp_path: Path) -> None:

@@ -2,23 +2,28 @@
 
 This is the orchestration layer ABOVE :mod:`lib.tiles`: it consumes the
 :class:`lib.density.TieredItem` list (already rank-ordered, already tiered) plus the
-M3 ``clusters`` / ``trending_items`` / ``scoops`` and the LLM ``verdict`` / per-item
-``summaries``, and assembles ONE self-contained newspaper "Tiles" HTML digest
-(``out/orbit-tiles-reference.html`` is the visual target). :mod:`lib.tiles` owns all
-the markup/CSS primitives and the XSS-safe link/image helpers; this module decides
-WHICH items go where and in what order.
+M3 ``clusters`` and the per-item LLM ``summaries``, and assembles ONE self-contained
+newspaper "Tiles" HTML digest. :mod:`lib.tiles` owns all the markup/CSS primitives and
+the XSS-safe link/image helpers; this module decides WHICH items go where and in what
+order.
 
-Layout (top to bottom, matching the design):
-  1. **masthead** — the "Orbit" wordmark + the day's counts (sources / accounted /
-     scoops / dormant / clusters), pure counting (Rule 5).
-  2. **verdict** — the ONE LLM editorial sentence (passed in; empty -> omitted).
-  3. **"Ahead of the curve" trio** — the top scoop tile, the "Trending now" rows, and
-     the top-velocity "Hidden gem". All-empty (a quiet day) -> the section is omitted.
-  4. **"From your feed · ranked" masonry** — a 3-column tile grid, one tile per item,
-     by density tier: Hero (biggest) / Standard / Compact, plus tweet tiles for X
-     items. Thumbnails are base64-inlined at render time via an INJECTABLE
-     ``inline_image`` seam (so tests stub it — no network).
-  5. **footer** — the accounted-for line + an optional "Full archive · page 2 →" link.
+Layout (top to bottom) — deliberately SHORT, three sections and a rule:
+  1. **masthead** — the "Orbit" wordmark, the dateline, and the coverage counts
+     (``N TRACKED · M POSTED · K ITEMS``), pure counting (Rule 5).
+  2. **"From YouTube · ranked" masonry** — a 3-column tile grid, one tile per video,
+     by density tier: Hero (biggest) / Standard / Compact. Each feature tile is a
+     16:9 thumbnail (YouTube's native ratio), a title, the one-line blurb, and the
+     timestamped chapter bullets. Thumbnails are base64-inlined at render time via an
+     INJECTABLE ``inline_image`` seam (so tests stub it — no network). The columns are
+     packed by :func:`lib.tiles.pack_tiles_into_columns` so none of them runs dry
+     early — see that module for why the layout is not left to CSS ``column-count``.
+  3. **"From X" masonry** — the X posts, BELOW the videos, in their own section.
+  4. **footer** — the coverage line + an optional "Full archive · page 2 →" link.
+
+There is deliberately NO editorial layer above the feed — no LLM verdict headline and
+no "ahead of the curve" scoop/trending/hidden-gem trio. The digest opens on the videos
+themselves; the masthead counts are the only claim the page makes about the day, and
+they are coverage facts, not judgments.
 
 THE CORE INVARIANT (api-contracts derank contract): rank controls DENSITY, never
 INCLUSION. Every tiered item appears SOMEWHERE on the page — a Hero big tile down to a
@@ -27,8 +32,8 @@ preserved: Hero + Standard stay on page 1 (which gains the footer page-2 link);
 Compact + Index spill to page 2.
 
 Rule 5: there is NO LLM here — rendering is pure deterministic string building. The
-verdict + summaries are computed UPSTREAM (orbit.py) and passed in; image inlining
-goes through the injectable ``inline_image`` seam.
+summaries are computed UPSTREAM (orbit.py) and passed in; image inlining goes through
+the injectable ``inline_image`` seam.
 """
 
 from __future__ import annotations
@@ -65,10 +70,10 @@ InlineImage = Callable[[str], Optional[str]]
 # link. Matches the design (3-4 visible rows, the rest behind the more-chapters link).
 _MAX_VISIBLE_CHAPTERS: int = 4
 
-# Max rows in the "Trending now" tile. The velocity ranker can surface many items;
-# the digest only wants the top few, so we render the highest-ranked rows and drop
-# the tail (trending_items is already velocity-ordered upstream).
-_TRENDING_MAX_ROWS: int = 5
+# Section headings for the two masonry runs (YouTube first, X below it).
+_YOUTUBE_SECTION_HEADING: str = "From YouTube · ranked"
+_YOUTUBE_SECTION_NOTE: str = "bigger tile = higher signal"
+_X_SECTION_HEADING: str = "From X"
 
 # --- Page-budget height heuristic (2-page spill) -----------------------------
 # FIRST-CUT, TUNABLE estimate-by-content table — NOT a measured layout (stdlib-first,
@@ -82,7 +87,7 @@ TIER_HEIGHT_PX: dict[str, int] = {
 }
 # Additional px per chapter row on a feature tile (chapter lists add height).
 CHAPTER_HEIGHT_PX: int = 26
-# Fixed chrome (masthead + verdict + trio + margins) added once per page estimate.
+# Fixed chrome (masthead + section headings + margins) added once per page estimate.
 PAGE_CHROME_PX: int = 120
 # Page-1 height budget. When estimate_page_height(...) exceeds this, Compact+Index
 # spill to page 2. First-cut: ~one tall screen / A4 page. Tunable.
@@ -337,55 +342,36 @@ def _count_distinct_creators(tiered_items: list[TieredItem]) -> int:
     return len(creator_keys)
 
 
-def _masthead_counts(
-    tiered_items: list[TieredItem], scoops: list[Any], clusters: list[Any]
-) -> tuple[int, int, int, int, int]:
-    """Compute the masthead tallies (pure counting, Rule 5): sources / accounted / scoops / dormant / clusters.
+def _masthead_counts(tiered_items: list[TieredItem], tracked_source_total: int) -> tuple[int, int, int]:
+    """Compute the masthead coverage tallies (pure counting, Rule 5).
 
-    Nothing is dropped, so every item is "accounted for"; "sources" is the distinct-creator
-    count. ``dormant`` falls back to the total scoop count when no scoop is explicitly flagged
-    ``is_scoop``. Shared with :mod:`lib.markdown_render` so the HTML and markdown mastheads
-    report identical tallies (no drift).
+    These three numbers answer "is Orbit watching everything I follow?", which is the
+    only claim the masthead makes:
+
+      * ``tracked_total`` — every source Orbit watches, posted-today or not. This is NOT
+        derivable from ``tiered_items`` (a channel that stayed quiet has no item), so it
+        is passed in from the sources table by the caller.
+      * ``posted_count`` — distinct creators appearing in today's digest.
+      * ``item_count`` — items in the digest. Nothing is ever dropped, so this is the
+        full batch size.
+
+    A ``tracked_source_total`` of 0 (an uninformed caller) degrades to ``posted_count``
+    rather than reporting a tracked total of zero alongside real items — an
+    obviously-false claim. Shared with :mod:`lib.markdown_render` so the HTML and
+    markdown mastheads report identical tallies (no drift).
 
     Args:
         tiered_items: The tiered batch.
-        scoops: The Stage-5 scoops (may be empty).
-        clusters: The Stage-5 clusters (may be empty).
+        tracked_source_total: Total rows in the sources table (all platforms). 0 when
+            the caller does not know, which degrades to ``posted_count``.
 
     Returns:
-        ``(source_total, accounted, scoop_count, dormant_count, cluster_count)``.
+        ``(tracked_total, posted_count, item_count)``.
     """
-    source_total = _count_distinct_creators(tiered_items)
-    accounted = len(tiered_items)
-    scoop_count = len(scoops)
-    dormant_count = sum(1 for scoop in scoops if bool(getattr(scoop, "is_scoop", False))) or scoop_count
-    cluster_count = len(clusters)
-    return source_total, accounted, scoop_count, dormant_count, cluster_count
-
-
-def _trending_deep_link(trending_item: Any, items_by_id: dict[str, Any]) -> str:
-    """Resolve a trending/scoop entry's deep-link (reuse the card link, source-aware).
-
-    Prefers the resolved item's :func:`_card_deep_link`; falls back to the entry's own
-    ``card_url``, then a YouTube ``watch?v=ID&t=0s``, then ``"#"`` (never invented).
-
-    Args:
-        trending_item: A :class:`lib.trending.TrendingItem`.
-        items_by_id: ``item_external_id`` -> :class:`lib.rerank.RankableItem` map.
-
-    Returns:
-        The deep-link URL string.
-    """
-    item_external_id = str(getattr(trending_item, "item_external_id", "") or "")
-    resolved = items_by_id.get(item_external_id)
-    if resolved is not None:
-        return _card_deep_link(resolved)
-    card_url = str(getattr(trending_item, "card_url", "") or "")
-    if card_url:
-        return card_url
-    if item_external_id:
-        return f"https://www.youtube.com/watch?v={item_external_id}&t=0s"
-    return "#"
+    posted_count = _count_distinct_creators(tiered_items)
+    item_count = len(tiered_items)
+    tracked_total = tracked_source_total if tracked_source_total > 0 else posted_count
+    return tracked_total, posted_count, item_count
 
 
 def _format_dateline(reference_date: Optional[date] = None) -> str:
@@ -414,7 +400,7 @@ def _build_feature_tile(
     cross_links_by_id: dict[str, list[tiles.CrossLink]],
     inline_image: InlineImage,
     flag: str,
-) -> str:
+) -> tiles.TileBlock:
     """Build one Hero/Standard feature tile (thumbnail + summary + chapters + cross-links).
 
     Args:
@@ -425,7 +411,7 @@ def _build_feature_tile(
         flag: An optional loud right flag (e.g. ``"▲ TOP SIGNAL"``), or ``""``.
 
     Returns:
-        A feature ``.tile`` block.
+        A feature ``.tile`` :class:`lib.tiles.TileBlock`.
     """
     item = tiered_item.scored_item.item
     item_external_id = str(getattr(item, "item_external_id", "") or "")
@@ -445,14 +431,14 @@ def _build_feature_tile(
     )
 
 
-def _build_compact_tile(item: Any) -> str:
+def _build_compact_tile(item: Any) -> tiles.TileBlock:
     """Build one Compact/Index tile — thumbnail-less, one optional key-moment chip-link.
 
     Args:
         item: A :class:`lib.rerank.RankableItem`.
 
     Returns:
-        A Compact ``.tile`` block.
+        A Compact ``.tile`` :class:`lib.tiles.TileBlock`.
     """
     chip_time = ""
     chip_label = ""
@@ -488,7 +474,7 @@ def _tweet_source_label(item: Any) -> str:
     return f"@{channel_name} · X" if channel_name and not channel_name.startswith("@") else f"{channel_name} · X"
 
 
-def _build_tweet_tile(item: Any, *, inline_image: InlineImage) -> str:
+def _build_tweet_tile(item: Any, *, inline_image: InlineImage) -> tiles.TileBlock:
     """Build one tweet (X) tile — text-first, with the inlined unavatar profile pic.
 
     Args:
@@ -496,7 +482,7 @@ def _build_tweet_tile(item: Any, *, inline_image: InlineImage) -> str:
         inline_image: The injectable image-inline seam (avatar fetch).
 
     Returns:
-        A tweet ``.tile`` block.
+        A tweet ``.tile`` :class:`lib.tiles.TileBlock`.
     """
     return tiles.render_tweet_tile(
         source_label=_tweet_source_label(item),
@@ -513,8 +499,8 @@ def _build_masonry_tiles(
     cross_links_by_id: dict[str, list[tiles.CrossLink]],
     inline_image: InlineImage,
     flag_top_signal: bool,
-) -> str:
-    """Build the concatenated per-tile HTML for the masonry, one tile per item (rank order).
+) -> list[tiles.TileBlock]:
+    """Build the per-tile blocks for the masonry, one tile per item (rank order).
 
     Dispatches by item kind + density tier: an X item -> tweet tile; a Hero/Standard
     YouTube item -> feature tile; everything lower -> compact tile. The very first
@@ -530,9 +516,11 @@ def _build_masonry_tiles(
         flag_top_signal: When True, the first Hero tile is flagged ``▲ TOP SIGNAL``.
 
     Returns:
-        The concatenated tile HTML (``""`` for an empty input).
+        The tile blocks in rank order (``[]`` for an empty input). The masonry packs
+        them into columns by their estimated heights — see
+        :func:`lib.tiles.render_feed_masonry`.
     """
-    parts: list[str] = []
+    parts: list[tiles.TileBlock] = []
     top_flag_used = False
     for tiered_item in tiered_items:
         item = tiered_item.scored_item.item
@@ -555,98 +543,7 @@ def _build_masonry_tiles(
             )
             continue
         parts.append(_build_compact_tile(item))
-    return "".join(parts)
-
-
-# --- "Ahead of the curve" trio -----------------------------------------------
-
-
-def _trending_row_category(trending_item: Any) -> tuple[str, int]:
-    """Map a trending item to its "Trending now" marker category + your-count.
-
-    A scoop (dormant break) -> ``◆`` dormant; a multi-creator convergence -> ``↗`` "N of
-    yours"; an externally-corroborated/other topic -> ``○`` external.
-
-    Args:
-        trending_item: A :class:`lib.trending.TrendingItem`.
-
-    Returns:
-        ``(category, your_count)``.
-    """
-    if bool(getattr(trending_item, "is_scoop", False)):
-        return tiles.CATEGORY_DORMANT, 0
-    convergence = int(getattr(trending_item, "convergence_count", 0) or 0)
-    if convergence >= 2:
-        return tiles.CATEGORY_YOURS, convergence
-    return tiles.CATEGORY_EXTERNAL, 0
-
-
-def _build_ahead_trio(
-    scoops: list[Any],
-    trending_items: list[Any],
-    items_by_id: dict[str, Any],
-    summaries: dict[str, str],
-) -> str:
-    """Assemble the "Ahead of the curve" trio (top scoop / trending rows / hidden gem).
-
-    Each sub-tile degrades to ``""`` when its source data is absent, and the whole
-    section is omitted when all three are empty (a quiet day, the M1/M2 path). No LLM
-    here — the prose is the pre-computed ``summaries``/verdict only.
-
-    Args:
-        scoops: The :class:`lib.trending.TrendingItem` scoops (loudest first).
-        trending_items: The velocity-ranked :class:`lib.trending.TrendingItem` list.
-        items_by_id: ``item_external_id`` -> :class:`lib.rerank.RankableItem` map.
-        summaries: The ``item_external_id`` -> blurb map.
-
-    Returns:
-        The trio section HTML, or ``""`` when there is nothing ahead of the curve.
-    """
-    scoop_tile = ""
-    if scoops:
-        top_scoop = scoops[0]
-        scoop_id = str(getattr(top_scoop, "item_external_id", "") or "")
-        resolved = items_by_id.get(scoop_id)
-        attribution = (
-            (getattr(resolved, "channel_name", "") or "")
-            if resolved is not None
-            else (getattr(top_scoop, "creator_external_id", "") or "")
-        ) or "your network"
-        scoop_tile = tiles.render_scoop_tile(
-            attribution,
-            getattr(top_scoop, "title", "") or "",
-            summaries.get(scoop_id, ""),
-            _trending_deep_link(top_scoop, items_by_id),
-        )
-
-    trending_tile = ""
-    if trending_items:
-        rows: list[tiles.TrendingRow] = []
-        for trending_item in trending_items[:_TRENDING_MAX_ROWS]:
-            category, your_count = _trending_row_category(trending_item)
-            rows.append(
-                tiles.TrendingRow(
-                    title=getattr(trending_item, "title", "") or "",
-                    category=category,
-                    your_count=your_count,
-                    link_url=_trending_deep_link(trending_item, items_by_id),
-                )
-            )
-        trending_tile = tiles.render_trending_now(rows)
-
-    gem_tile = ""
-    if trending_items:
-        gem = trending_items[0]
-        gem_id = str(getattr(gem, "item_external_id", "") or "")
-        ratio = float(getattr(gem, "baseline_relative_ratio", 0.0) or 0.0)
-        gem_tile = tiles.render_hidden_gem(
-            (getattr(gem, "creator_external_id", "") or getattr(gem, "title", "") or "").upper(),
-            max(0, int(round(ratio * 100))),
-            getattr(gem, "title", "") or "",
-            summaries.get(gem_id, ""),
-        )
-
-    return tiles.render_ahead_trio(scoop_tile, trending_tile, gem_tile)
+    return parts
 
 
 # --- Page assembly -----------------------------------------------------------
@@ -656,7 +553,7 @@ def _wrap_body_container(inner_html: str) -> str:
     """Wrap a page body in the design's outer page container (background + max-width).
 
     Args:
-        inner_html: The assembled masthead/verdict/trio/masonry/footer markup.
+        inner_html: The assembled masthead/masonry/footer markup.
 
     Returns:
         The body markup with the design's two outer wrapper divs.
@@ -669,46 +566,114 @@ def _wrap_body_container(inner_html: str) -> str:
     )
 
 
+def split_youtube_and_x(tiered_items: list[TieredItem]) -> tuple[list[TieredItem], list[TieredItem]]:
+    """Partition a tiered batch into its YouTube half and its X half, preserving rank order.
+
+    The page renders videos first and X posts below them, so the two runs are separated
+    here rather than interleaved by rank. A single pass keeps each half in its original
+    descending-rank order, and the two halves partition the input exactly — every item
+    lands in one of them, so the never-drop invariant survives the split.
+
+    Args:
+        tiered_items: The rank-ordered tiered batch.
+
+    Returns:
+        ``(youtube_items, x_items)``.
+    """
+    youtube_items: list[TieredItem] = []
+    x_items: list[TieredItem] = []
+    for tiered_item in tiered_items:
+        target = x_items if _is_tweet(tiered_item.scored_item.item) else youtube_items
+        target.append(tiered_item)
+    return youtube_items, x_items
+
+
+def _build_feed_sections(
+    page_items: list[TieredItem],
+    *,
+    summaries: dict[str, str],
+    cross_links_by_id: dict[str, list[tiles.CrossLink]],
+    inline_image: InlineImage,
+    flag_top_signal: bool,
+) -> str:
+    """Build the page's feed body: the YouTube masonry, then the X masonry below it.
+
+    Each section is omitted entirely when its half is empty, so a YouTube-only day gets
+    no dangling "From X" heading (and vice-versa).
+
+    Args:
+        page_items: The tiered items for this page, in rank order.
+        summaries: The ``item_external_id`` -> blurb map.
+        cross_links_by_id: The representative-id -> cross-links map.
+        inline_image: The injectable image-inline seam.
+        flag_top_signal: When True, the first Hero video tile is flagged ``▲ TOP SIGNAL``.
+
+    Returns:
+        The concatenated section markup (``""`` when the page has no items).
+    """
+    youtube_items, x_items = split_youtube_and_x(page_items)
+    sections: list[str] = []
+
+    youtube_tiles = _build_masonry_tiles(
+        youtube_items,
+        summaries=summaries,
+        cross_links_by_id=cross_links_by_id,
+        inline_image=inline_image,
+        flag_top_signal=flag_top_signal,
+    )
+    if youtube_tiles:
+        sections.append(
+            tiles.render_feed_masonry(
+                youtube_tiles, heading=_YOUTUBE_SECTION_HEADING, note=_YOUTUBE_SECTION_NOTE
+            )
+        )
+
+    x_tiles = _build_masonry_tiles(
+        x_items,
+        summaries=summaries,
+        cross_links_by_id=cross_links_by_id,
+        inline_image=inline_image,
+        flag_top_signal=False,
+    )
+    if x_tiles:
+        sections.append(tiles.render_feed_masonry(x_tiles, heading=_X_SECTION_HEADING))
+
+    return "\n".join(sections)
+
+
 def _build_page1_body(
     page_items: list[TieredItem],
     *,
     masthead_html: str,
-    verdict_html: str,
-    trio_html: str,
     summaries: dict[str, str],
     cross_links_by_id: dict[str, list[tiles.CrossLink]],
     inline_image: InlineImage,
     accounted_str: str,
     page_2_href: str,
 ) -> str:
-    """Assemble page 1's body: masthead -> verdict -> trio -> masonry -> footer.
+    """Assemble page 1's body: masthead -> YouTube masonry -> X masonry -> footer.
 
     Args:
         page_items: The tiered items rendered on page 1 (all items, or Hero+Standard on spill).
         masthead_html: The pre-rendered masthead.
-        verdict_html: The pre-rendered verdict (``""`` when absent).
-        trio_html: The pre-rendered "Ahead of the curve" trio (``""`` when absent).
         summaries: The ``item_external_id`` -> blurb map.
         cross_links_by_id: The representative-id -> cross-links map.
         inline_image: The injectable image-inline seam.
-        accounted_str: The footer accounted-for line.
+        accounted_str: The footer coverage line.
         page_2_href: The footer page-2 link href (``""`` -> no link, single-page digest).
 
     Returns:
         The page-1 body markup (absent sections omitted).
     """
-    masonry_tiles = _build_masonry_tiles(
+    feed_html = _build_feed_sections(
         page_items,
         summaries=summaries,
         cross_links_by_id=cross_links_by_id,
         inline_image=inline_image,
         flag_top_signal=True,
     )
-    masonry_html = tiles.render_feed_masonry(masonry_tiles) if masonry_tiles else ""
     footer_html = tiles.render_footer(accounted_str, page_2_href)
-    inner = "\n".join(
-        part for part in (masthead_html, verdict_html, trio_html, masonry_html, footer_html) if part
-    )
+    inner = "\n".join(part for part in (masthead_html, feed_html, footer_html) if part)
     return _wrap_body_container(inner)
 
 
@@ -729,21 +694,20 @@ def _build_page2_body(
         summaries: The ``item_external_id`` -> blurb map.
         cross_links_by_id: The representative-id -> cross-links map.
         inline_image: The injectable image-inline seam.
-        accounted_str: The footer accounted-for line.
+        accounted_str: The footer coverage line.
 
     Returns:
         The page-2 body markup.
     """
-    masonry_tiles = _build_masonry_tiles(
+    feed_html = _build_feed_sections(
         page_items,
         summaries=summaries,
         cross_links_by_id=cross_links_by_id,
         inline_image=inline_image,
         flag_top_signal=False,
     )
-    masonry_html = tiles.render_feed_masonry(masonry_tiles) if masonry_tiles else ""
     footer_html = tiles.render_footer(accounted_str, "")
-    inner = "\n".join(part for part in (masthead_html, masonry_html, footer_html) if part)
+    inner = "\n".join(part for part in (masthead_html, feed_html, footer_html) if part)
     return _wrap_body_container(inner)
 
 
@@ -753,19 +717,16 @@ def render_digest_pages(
     *,
     page_2_href: str = DEFAULT_PAGE_2_FILENAME,
     clusters: list[Any] | None = None,
-    trending_items: list[Any] | None = None,
-    scoops: list[Any] | None = None,
-    verdict: str = "",
+    tracked_source_total: int = 0,
     summaries: dict[str, str] | None = None,
     inline_image: InlineImage = images.fetch_and_inline,
     reference_date: Optional[date] = None,
 ) -> list[str]:
     """Render the digest into one or two self-contained Tiles HTML pages.
 
-    Assembles the newspaper layout — masthead, the LLM verdict, the "Ahead of the curve"
-    trio, the "From your feed · ranked" tile masonry, and the footer — from the tiered
-    items + the M3 ``clusters`` / ``trending_items`` / ``scoops`` + the pre-computed
-    ``verdict`` / ``summaries``. Thumbnails/avatars are base64-inlined at render time via
+    Assembles the layout — masthead, the YouTube tile masonry, the X masonry below it,
+    and the footer — from the tiered items + the M3 ``clusters`` (cross-links) + the
+    pre-computed ``summaries``. Thumbnails/avatars are base64-inlined at render time via
     the injectable ``inline_image`` seam (tests stub it — no network).
 
     When :func:`estimate_page_height` fits :data:`PAGE_1_BUDGET_PX`, returns
@@ -780,10 +741,10 @@ def render_digest_pages(
         tiered_items: The :class:`TieredItem` list (already rank-ordered + tiered).
         config: An optional :class:`lib.config.OrbitConfig` — read for ``digest_title``.
         page_2_href: The footer href page 1 links to for the spilled content.
-        clusters: OPTIONAL :class:`lib.cluster.Cluster` list (cross-links + the count).
-        trending_items: OPTIONAL :class:`lib.trending.TrendingItem` list (the trio).
-        scoops: OPTIONAL detected :class:`lib.trending.TrendingItem` scoops (the trio).
-        verdict: The pre-computed LLM verdict sentence (``""`` -> omitted).
+        clusters: OPTIONAL :class:`lib.cluster.Cluster` list (the tile cross-links).
+        tracked_source_total: Total sources Orbit watches, for the masthead coverage
+            count. NOT derivable from ``tiered_items`` (a quiet channel has no item), so
+            the caller reads it from the sources table; 0 degrades to the posted count.
         summaries: The pre-computed ``item_external_id`` -> blurb map (None -> ``{}``).
         inline_image: The injectable image-inline seam (defaults to the real fetch).
         reference_date: The masthead dateline date (defaults to today; injectable).
@@ -792,32 +753,20 @@ def render_digest_pages(
         ``[page1_html]`` (fits) or ``[page1_html, page2_html]`` (spilled).
     """
     clusters = clusters or []
-    trending_items = trending_items or []
-    scoops = scoops or []
     summaries = summaries or {}
 
     page_title = getattr(config, "digest_title", None) or DEFAULT_DIGEST_TITLE
     grouped = group_items_by_tier(tiered_items)
-    items_by_id = _items_by_id(tiered_items)
     cross_links_by_id = _cross_links_by_id(clusters)
 
-    # Masthead counts (pure counting, Rule 5). Nothing is dropped, so every item is
-    # "accounted for"; "sources" is the distinct-creator count (the feeds scanned).
-    source_total, accounted, scoop_count, dormant_count, cluster_count = _masthead_counts(
-        tiered_items, scoops, clusters
-    )
-    accounted_str = f"{accounted} OF {source_total} SOURCES ACCOUNTED FOR"
+    # Masthead coverage counts (pure counting, Rule 5): how many sources are watched,
+    # how many of them posted today, and how many items that produced.
+    tracked_total, posted_count, item_count = _masthead_counts(tiered_items, tracked_source_total)
+    accounted_str = f"{item_count} ITEMS FROM {posted_count} OF {tracked_total} TRACKED CHANNELS"
 
     masthead_html = tiles.render_masthead(
-        _format_dateline(reference_date),
-        source_total,
-        accounted,
-        scoop_count,
-        dormant_count,
-        cluster_count,
+        _format_dateline(reference_date), tracked_total, posted_count, item_count
     )
-    verdict_html = tiles.render_verdict(verdict)
-    trio_html = _build_ahead_trio(scoops, trending_items, items_by_id, summaries)
 
     estimated_height_px = estimate_page_height(tiered_items)
     spilled = estimated_height_px > PAGE_1_BUDGET_PX
@@ -826,8 +775,6 @@ def render_digest_pages(
         page1_body = _build_page1_body(
             tiered_items,
             masthead_html=masthead_html,
-            verdict_html=verdict_html,
-            trio_html=trio_html,
             summaries=summaries,
             cross_links_by_id=cross_links_by_id,
             inline_image=inline_image,
@@ -841,8 +788,6 @@ def render_digest_pages(
         page1_body = _build_page1_body(
             page1_items,
             masthead_html=masthead_html,
-            verdict_html=verdict_html,
-            trio_html=trio_html,
             summaries=summaries,
             cross_links_by_id=cross_links_by_id,
             inline_image=inline_image,
@@ -869,7 +814,8 @@ def render_digest_pages(
         estimated_height_px=estimated_height_px,
         page_count=len(pages),
         spilled=spilled,
-        has_verdict=bool(verdict.strip()),
+        tracked_source_total=tracked_total,
+        posted_source_count=posted_count,
         summary_count=len(summaries),
     )
     return pages
@@ -880,9 +826,7 @@ def render_digest_html(
     config: Any = None,
     *,
     clusters: list[Any] | None = None,
-    trending_items: list[Any] | None = None,
-    scoops: list[Any] | None = None,
-    verdict: str = "",
+    tracked_source_total: int = 0,
     summaries: dict[str, str] | None = None,
     inline_image: InlineImage = images.fetch_and_inline,
     reference_date: Optional[date] = None,
@@ -897,10 +841,8 @@ def render_digest_html(
     Args:
         tiered_items: The :class:`TieredItem` list (already rank-ordered + tiered).
         config: An optional :class:`lib.config.OrbitConfig` (``digest_title``).
-        clusters: OPTIONAL clusters (cross-links + the masthead count).
-        trending_items: OPTIONAL trending list (the trio).
-        scoops: OPTIONAL detected scoops (the trio).
-        verdict: The pre-computed LLM verdict sentence (``""`` -> omitted).
+        clusters: OPTIONAL clusters (the tile cross-links).
+        tracked_source_total: Total sources watched, for the masthead coverage count.
         summaries: The pre-computed ``item_external_id`` -> blurb map.
         inline_image: The injectable image-inline seam (defaults to the real fetch).
         reference_date: The masthead dateline date (defaults to today; injectable).
@@ -912,9 +854,7 @@ def render_digest_html(
         tiered_items,
         config,
         clusters=clusters,
-        trending_items=trending_items,
-        scoops=scoops,
-        verdict=verdict,
+        tracked_source_total=tracked_source_total,
         summaries=summaries,
         inline_image=inline_image,
         reference_date=reference_date,

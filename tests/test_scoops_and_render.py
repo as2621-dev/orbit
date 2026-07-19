@@ -188,14 +188,15 @@ def _tiered(item_external_id: str, tier: str, *, title: str, chapters: list[Chap
     return TieredItem(scored_item=ScoredItem(item=item, score=5.0), density_tier=tier)
 
 
-def test_three_m3_sections_render_with_deep_links() -> None:
-    """The overlap block, right-rail trending, and scoops strip all render with working links (DoD #3).
+def test_cluster_cross_link_reaches_the_tile_while_trending_stays_off_the_page() -> None:
+    """The M3 cluster cross-link renders on its tile; trending/scoops render NO section.
 
-    WHY: these three sections are the M3 payload — the whole reason for the milestone.
-    The test fails if ANY of the three is missing, or if a section's deep-link href is
-    absent/broken. We assert each section's container AND a real, allowlist-surviving
-    href in each (the YouTube ``watch?v=...`` card link, the chapter cross-link
-    ``&t=90s`` deep-link, and the scoop's own item link).
+    WHY: M3 now splits into two fates, and this test pins BOTH so neither drifts. The
+    cluster cross-link is the half that still reaches the reader — "same story, also
+    covered", carrying the chapter deep-link into the exact moment — so it must survive
+    render with a working href. The trending/scoop half was deliberately taken OFF the
+    page (it lives on as the rank multiplier only), so a regression that re-added the
+    "Trending now" or scoop tile above the feed fails here.
     """
     # An episode (long-form, has chapters) + a short reaction sharing the topic.
     episode = _tiered(
@@ -223,11 +224,7 @@ def test_three_m3_sections_render_with_deep_links() -> None:
         source_diversity=2,
     )
 
-    # A trending entry (corroborated) and a scoop entry.
-    trending_entry = _trending_item(
-        "twReact", title="M5 is insane", history_sample_count=50, baseline_relative_ratio=2.0,
-        corroboration_tag="corroborated",
-    )
+    # A scoop entry — built to prove that even a REAL detected scoop renders no section.
     scoop_entry = _trending_item(
         "vidEP", title="Apple M5 chip deep dive", history_sample_count=1, baseline_relative_ratio=5.0,
     )
@@ -237,8 +234,7 @@ def test_three_m3_sections_render_with_deep_links() -> None:
     output_html = render.render_digest_html(
         tiered_items,
         clusters=[cluster],
-        trending_items=[trending_entry, scoop_entry],
-        scoops=scoops,
+        tracked_source_total=12,
         inline_image=lambda url: None,
     )
 
@@ -248,14 +244,13 @@ def test_three_m3_sections_render_with_deep_links() -> None:
     assert "Same story, also covered" in output_html
     assert 'href="https://www.youtube.com/watch?v=vidEP&amp;t=90s"' in output_html
 
-    # 2. The "Trending now" trio tile renders, with a working item deep-link.
-    assert "↗ Trending now" in output_html
-    assert 'href="https://www.youtube.com/watch?v=twReact&amp;t=0s"' in output_html
+    # 2. The trending/scoop half renders NO section — it is a rank input, not a tile.
+    assert "Trending now" not in output_html
+    assert "The scoop" not in output_html
+    assert "Ahead of the curve" not in output_html
 
-    # 3. The loud scoop tile renders, and the masthead reflects the scoop + cluster counts.
-    assert "The scoop ·" in output_html
-    assert "1 scoop ·" in output_html  # masthead scoop count
-    assert "1 clusters" in output_html  # masthead cluster count
+    # 3. The masthead reports coverage, not editorial tallies.
+    assert "12 TRACKED · 2 POSTED · 2 ITEMS" in output_html
 
 
 # --- DoD #4: M1 regression — no M3 data -> the M1 page, unchanged -------------
@@ -271,10 +266,9 @@ def test_no_m3_data_renders_m1_page_without_new_sections() -> None:
     tiered_items = [_tiered("vidA", TIER_HERO, title="A talk")]
     output_html = render.render_digest_html(tiered_items, inline_image=lambda url: None)
 
-    # No M3 data -> no "Ahead of the curve" trio, no cross-links, all zero counts.
+    # No M3 data -> no "Ahead of the curve" trio, no cross-links.
     assert "Ahead of the curve" not in output_html
     assert "Same story, also covered" not in output_html
-    assert "0 scoop · 0 dormant · 0 clusters" in output_html
     # The M1 spine is still there: the masthead + a feature tile for the item.
     assert ">Orbit</div>" in output_html
     assert 'class="tile"' in output_html
@@ -359,17 +353,17 @@ def test_orbit_stage5_wires_overlap_trending_scoops_through_rank_and_render(tmp_
     tiered = orbit.run_stage6_rank_and_tier(items, config, trending_multipliers=trending_multipliers)
     assert tiered[0].scored_item.item.item_external_id == "d1", "the scoop must rank first via the multiplier"
 
-    # (c) Stage 7 writes a file with all three M3 sections populated.
+    # (c) Stage 7 writes the page — carrying the clusters, but NOT a trending/scoop strip.
     html_path = tmp_path / "out" / "today.html"
     written = orbit.run_stage7_render(
-        tiered, config, html_path=html_path, clusters=clusters, trending_items=trending_items,
-        scoops=scoops, inline_image=lambda url: None,
+        tiered, config, html_path=html_path, clusters=clusters, tracked_source_total=1,
+        inline_image=lambda url: None,
     )
     assert html_path in written and html_path.exists()
     written_html = html_path.read_text(encoding="utf-8")
-    # The M3 payload surfaces in the Tiles layout: the "Ahead of the curve" trio with the
-    # loud scoop tile + the "Trending now" tile, and a non-zero scoop count in the masthead.
-    assert "Ahead of the curve" in written_html
-    assert "The scoop ·" in written_html
-    assert "↗ Trending now" in written_html
-    assert "0 scoop · 0 dormant · 0 clusters" not in written_html
+    # The trending/scoop work is a RANK input only — it must not resurface as a page
+    # section. Assertion (b) above is what proves the multiplier still did its job.
+    assert "Ahead of the curve" not in written_html
+    assert "The scoop" not in written_html
+    assert "Trending now" not in written_html
+    assert "1 TRACKED · 1 POSTED · 3 ITEMS" in written_html
