@@ -294,32 +294,36 @@ _ORBIT_LAUNCHD_LABEL: str = "com.orbit.daily"
 DEFAULT_LAUNCH_AGENTS_DIR: Path = Path.home() / "Library" / "LaunchAgents"
 
 # A sane PATH for the headless agent: launchd hands a job a minimal environment, so the
-# downstream ``claude`` / ``yt-dlp`` / ``node`` subprocesses need common bin dirs on PATH
-# to resolve. Homebrew (Apple-silicon + Intel) first, then the system defaults.
+# pipeline's ``yt-dlp`` / ``node`` / ``gh`` / ``claude`` subprocesses need common bin dirs on
+# PATH to resolve. Homebrew (Apple-silicon + Intel) first, then the system defaults; the
+# per-user ``~/.local/bin`` (where the ``claude`` CLI installs) is appended at generation time
+# via :func:`_launchd_env_path`.
 _LAUNCHD_ENV_PATH: str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # Timeout (seconds) for a single ``launchctl`` subprocess. bootout/bootstrap are fast local
 # ops; a small ceiling keeps a hung ``launchctl`` from stalling setup.
 _LAUNCHCTL_TIMEOUT_SECONDS: int = 15
 
-# Why the plist carries ``--dangerously-skip-permissions`` — stated in BOTH the generated
-# plist (as an XML comment) and the ``setup_launchd_installed`` log, per the acceptance
-# criterion that this deliberate carry-over is not a silent port.
-_PERMISSIONS_NOTE: str = (
-    "--dangerously-skip-permissions is carried in the plist ProgramArguments because the "
-    "07:00 run is headless (no TTY); without it, `claude -p` blocks on an interactive "
-    "permission prompt and the digest never sends. Deliberate carry-over of the prior cron "
-    "behavior."
-)
-# The plist comment can't contain a literal "--" (illegal inside an XML comment), so it
-# refers to the flag by name without the leading dashes; the flag itself appears verbatim in
-# the ProgramArguments strings right below the comment.
-_PLIST_PERMISSIONS_COMMENT: str = (
-    "<!-- The ProgramArguments carry the dangerously-skip-permissions flag because the "
-    "07:00 run is headless (no TTY); without it, `claude -p` blocks on an interactive "
-    "permission prompt and the digest never sends. Deliberate carry-over of prior cron "
-    "behavior. -->"
-)
+
+def _launchd_env_path() -> str:
+    """The plist PATH: common bin dirs plus the per-user ``~/.local/bin`` (the claude CLI).
+
+    Returns:
+        The colon-joined PATH string baked into ``EnvironmentVariables.PATH``.
+    """
+    return f"{_LAUNCHD_ENV_PATH}:{Path.home() / '.local' / 'bin'}"
+
+
+def _launchd_log_path() -> Path:
+    """Where the agent's stdout/stderr accumulate (``~/Library/Logs/orbit.daily.log``).
+
+    launchd opens ``StandardOutPath``/``StandardErrPath`` with append, so the file grows
+    across runs; without it a failed 7am run leaves no trace to debug from.
+
+    Returns:
+        The absolute log-file path baked into the plist.
+    """
+    return Path.home() / "Library" / "Logs" / "orbit.daily.log"
 
 # The injectable subprocess boundary for launchctl I/O: called as
 # ``launchctl_runner(command)`` and returns a :class:`lib.subproc.SubprocResult`. launchctl
@@ -406,47 +410,34 @@ def _calendar_from_schedule(schedule: str) -> tuple[int, int]:
         ) from exc
 
 
-def _orbit_program_arguments(*, claude_executable: Optional[str] = None) -> list[str]:
+def _orbit_program_arguments(*, repo_path: Path, python_executable: Optional[str] = None) -> list[str]:
     """Build the plist ``ProgramArguments`` argv (no shell — an argument list).
 
-    Resolves ``claude`` to an absolute path via ``shutil.which`` at generation time so the
-    headless agent doesn't depend on launchd's minimal PATH to find it (falls back to the
-    bare name when unresolved, e.g. in a sandbox). Carries
-    ``--dangerously-skip-permissions`` deliberately — see :data:`_PERMISSIONS_NOTE`.
+    Runs the pipeline driver DIRECTLY — ``python3 scripts/orbit.py`` — not the historical
+    ``claude -p "/orbit"`` wrapper. The wrapper had two verified failure modes (2026-07-19):
+    it executed the version-keyed plugin-cache copy of the pipeline (stale until a
+    ``plugin.json`` version bump), and as a one-shot session it exited before a long run
+    finished, killing the pipeline mid-fetch. Direct invocation has neither; the pipeline's
+    LLM stages still shell out to ``claude -p`` per call (``lib.llm``), which is why
+    ``~/.local/bin`` rides on the plist PATH. Resolves ``python3`` to an absolute path via
+    ``shutil.which`` at generation time so the agent doesn't depend on launchd's minimal
+    PATH (falls back to the bare name when unresolved, e.g. in a sandbox).
 
     Args:
-        claude_executable: Explicit path to the ``claude`` binary; when None it is resolved
+        repo_path: The repo root; ``scripts/orbit.py`` under it is the argv target.
+        python_executable: Explicit path to the ``python3`` binary; when None it is resolved
             via ``shutil.which`` (injectable so tests are deterministic).
 
     Returns:
-        The ProgramArguments argv, e.g. ``["/opt/homebrew/bin/claude", "-p",
-        "--dangerously-skip-permissions", "/orbit"]``.
+        The ProgramArguments argv, e.g. ``["/opt/homebrew/bin/python3",
+        "/home/me/orbit/scripts/orbit.py"]``.
     """
-    resolved_claude = claude_executable or shutil.which("claude") or "claude"
-    return [resolved_claude, "-p", "--dangerously-skip-permissions", "/orbit"]
-
-
-def _annotate_plist_with_permissions_note(plist_body: str) -> str:
-    """Insert the ``--dangerously-skip-permissions`` rationale as an XML comment in the plist.
-
-    ``plistlib`` can't emit comments, so we splice one in after the ``<plist>`` open. XML
-    parsers (including ``plistlib.loads``) ignore comments, so this is human-only annotation
-    that leaves the parsed plist unchanged.
-
-    Args:
-        plist_body: The serialized plist XML from ``plistlib.dumps``.
-
-    Returns:
-        The plist XML with the rationale comment inserted (unchanged if the marker is absent).
-    """
-    marker = '<plist version="1.0">\n'
-    if marker in plist_body:
-        return plist_body.replace(marker, marker + _PLIST_PERMISSIONS_COMMENT + "\n", 1)
-    return plist_body
+    resolved_python = python_executable or shutil.which("python3") or "python3"
+    return [resolved_python, str(repo_path / "scripts" / "orbit.py")]
 
 
 def generate_launchd_plist(
-    *, repo_path: Optional[Path] = None, minute: int = 0, hour: int = 7, claude_executable: Optional[str] = None
+    *, repo_path: Optional[Path] = None, minute: int = 0, hour: int = 7, python_executable: Optional[str] = None
 ) -> str:
     """Build the ``com.orbit.daily`` LaunchAgent plist XML (PURE — no I/O beyond which).
 
@@ -455,32 +446,36 @@ def generate_launchd_plist(
     (cron silently skips). It deliberately does NOT set ``StartInterval`` or ``Disabled`` —
     either would reintroduce cron's skip behavior; that invariant is pinned in
     ``tests/test_scheduler.py``. ``RunAtLoad`` is left unset so bootstrapping the agent at
-    setup time does not immediately fire a digest.
+    setup time does not immediately fire a digest. Stdout/stderr append to
+    :func:`_launchd_log_path` so a failed headless run leaves a trace.
 
     Args:
-        repo_path: The directory the agent runs in (``WorkingDirectory``), so ``/orbit``
-            resolves ``orbit.config.json`` the same way a manual run does; defaults to cwd.
+        repo_path: The repo root: the agent's ``WorkingDirectory`` (so the run resolves
+            ``orbit.config.json`` the same way a manual run does) AND where
+            ``scripts/orbit.py`` lives; defaults to cwd.
         minute: The ``StartCalendarInterval`` minute (0 for the fixed 7am default).
         hour: The ``StartCalendarInterval`` hour (7 for the fixed 7am default).
-        claude_executable: Explicit ``claude`` path (injectable for deterministic tests).
+        python_executable: Explicit ``python3`` path (injectable for deterministic tests).
 
     Returns:
-        The plist XML as a UTF-8 string, with the permissions-flag rationale as a comment.
+        The plist XML as a UTF-8 string.
 
     Example:
         >>> "com.orbit.daily" in generate_launchd_plist(repo_path=Path("/home/me/orbit"))
         True
     """
     resolved_repo = repo_path if repo_path is not None else Path.cwd()
+    log_path = str(_launchd_log_path())
     plist_dict: dict[str, object] = {
         "Label": _ORBIT_LAUNCHD_LABEL,
-        "ProgramArguments": _orbit_program_arguments(claude_executable=claude_executable),
+        "ProgramArguments": _orbit_program_arguments(repo_path=resolved_repo, python_executable=python_executable),
         "WorkingDirectory": str(resolved_repo),
-        "EnvironmentVariables": {"PATH": _LAUNCHD_ENV_PATH},
+        "EnvironmentVariables": {"PATH": _launchd_env_path()},
         "StartCalendarInterval": {"Hour": hour, "Minute": minute},
+        "StandardOutPath": log_path,
+        "StandardErrPath": log_path,
     }
-    plist_body = plistlib.dumps(plist_dict).decode("utf-8")
-    return _annotate_plist_with_permissions_note(plist_body)
+    return plistlib.dumps(plist_dict).decode("utf-8")
 
 
 def default_plist_path(launch_agents_dir: Optional[Path] = None) -> Path:
@@ -589,7 +584,7 @@ def _install_launchd_agent(
         "setup_launchd_installed",
         launchd_label=_ORBIT_LAUNCHD_LABEL,
         plist_path=str(plist_path),
-        permissions_note=_PERMISSIONS_NOTE,
+        run_log_path=str(_launchd_log_path()),
     )
     return True
 

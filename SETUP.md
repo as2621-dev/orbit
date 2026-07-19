@@ -132,11 +132,13 @@ is your own inbox.
    two schedulers racing. If `launchctl` is unavailable (e.g. a sandboxed shell), setup prints
    the plist and the `launchctl bootstrap` command for you to run by hand, and still completes.
 
-   The scheduled run executes `claude -p --dangerously-skip-permissions "/orbit"`. The
-   `--dangerously-skip-permissions` flag is deliberate: the 7am run is **headless** (no
-   terminal), so without it `claude -p` would block on an interactive permission prompt and the
-   digest would never send. The flag is disclosed in the plist (as a comment) and in the install
-   log, and applies only to this one scheduled Orbit command.
+   The scheduled run executes the pipeline directly — `python3 scripts/orbit.py` with the
+   repo as its working directory — and appends stdout/stderr to
+   `~/Library/Logs/orbit.daily.log`, so a failed headless run always leaves a trace. (It
+   deliberately does NOT go through `claude -p "/orbit"`: that wrapper ran the plugin-cache
+   copy of the pipeline — stale until a plugin version bump — and, being a one-shot session,
+   exited before a long run finished, killing it. The pipeline's own LLM stages still call
+   `claude -p` per prompt; those short calls need no permission bypass.)
 
 Config reference: see `orbit.config.example.json` (a documented template of every field) and
 `.env.example` (placeholders for env-based X cookies and the Gmail email-delivery credentials —
@@ -155,7 +157,7 @@ Orbit asks for six things. For each: why it is needed, and what we do / don't do
 | **Network access** (youtube.com, x.com) | To fetch new videos, transcripts, and tweets from the people you follow. | Talks only to YouTube and X, plus the LLM endpoint used for summarizing. Cookies are never sent to anyone but YouTube/X. |
 | **Send email** (Gmail SMTP, optional) | To deliver the digest to your inbox so you can read it on any device, not just this Mac. | Only if you set `delivery.email_to` plus `ORBIT_EMAIL_FROM` + `GMAIL_APP_PASSWORD` in `.env`. Connects to `smtp.gmail.com` to send the summary + attached HTML. The app password is read at send time, passed straight to SMTP login, and never logged, echoed, or written into a header. Skipped entirely if unconfigured. |
 | **LLM usage** (your plan) | To classify, cluster, chapterize, and summarize items. | Runs on your own Claude Code / Codex usage, controlled by `depth`. Orbit manages no separate API key. |
-| **Schedule a headless daily run** (launchd) | To run Orbit unattended at 7am, with catch-up on wake. | Installs a launchd agent (`com.orbit.daily`) that runs `claude -p --dangerously-skip-permissions "/orbit"`. The `--dangerously-skip-permissions` flag is required because the scheduled run is **headless** — an interactive permission prompt would hang it — and applies only to this one command. Disclosed in the plist and install log. Remove the agent with `launchctl bootout gui/$(id -u)/com.orbit.daily`. |
+| **Schedule a headless daily run** (launchd) | To run Orbit unattended at 7am, with catch-up on wake. | Installs a launchd agent (`com.orbit.daily`) that runs `python3 scripts/orbit.py` directly from the repo and appends its output to `~/Library/Logs/orbit.daily.log`. Remove the agent with `launchctl bootout gui/$(id -u)/com.orbit.daily`. |
 
 > Note: email delivery is opt-in. If you leave `delivery.email_to` (or the two `.env`
 > credentials) unset, Orbit skips the send entirely and just writes the HTML digest to disk —

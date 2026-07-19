@@ -42,9 +42,9 @@ Read that before running Orbit.
    7am run on the next wake**. If `launchctl` is unavailable (e.g. a sandboxed shell), setup
    still completes and prints the plist + `launchctl bootstrap` command to install by hand.
 
-   The schedule is fixed (not a prompt). The scheduled job runs
-   `claude -p --dangerously-skip-permissions "/orbit"` — the flag is required because the run
-   is headless (see [`SETUP.md`](SETUP.md) §8.3 step 5 and §8.4).
+   The schedule is fixed (not a prompt). The scheduled job runs the pipeline directly —
+   `python3 scripts/orbit.py` from the repo — and appends its output to
+   `~/Library/Logs/orbit.daily.log` (see [`SETUP.md`](SETUP.md) §8.3 step 5 and §8.4).
 
 The full 5-step setup is in [`SETUP.md`](SETUP.md) §8.3.
 

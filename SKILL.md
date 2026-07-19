@@ -55,11 +55,14 @@ The first-run wizard. It:
 4. Seeds your `interests` from subscription titles, then asks for the delivery target
    (HTML path + optional email address). The schedule is not asked — it is fixed at 7am daily.
 5. Writes a validated `orbit.config.json`, then **installs a launchd LaunchAgent**
-   (`com.orbit.daily`, 7am) that runs `claude -p --dangerously-skip-permissions "/orbit"` and
-   retires any legacy `# orbit-daily-digest` crontab line. If `launchctl` is unavailable it
-   prints manual plist instructions instead.
+   (`com.orbit.daily`, 7am) that runs `python3 scripts/orbit.py` directly from the repo
+   (output appends to `~/Library/Logs/orbit.daily.log`) and retires any legacy
+   `# orbit-daily-digest` crontab line. If `launchctl` is unavailable it prints manual
+   plist instructions instead.
 
 Scheduling is a local launchd agent (no cloud scheduler), because the cookie-based feed reads
-must run where your browser sessions live. launchd fires a run missed at 7am on the next wake;
-the scheduled command carries `--dangerously-skip-permissions` because it runs headless. Email
-delivery reads `ORBIT_EMAIL_FROM` + `GMAIL_APP_PASSWORD` from `.env` (see `SETUP.md`).
+must run where your browser sessions live. launchd fires a run missed at 7am on the next wake.
+The scheduled job invokes the pipeline directly — not `claude -p "/orbit"` — so it always runs
+the repo's current code and survives long runs; the pipeline's LLM stages still shell out to
+`claude -p` per prompt. Email delivery reads `ORBIT_EMAIL_FROM` + `GMAIL_APP_PASSWORD` from
+`.env` (see `SETUP.md`).

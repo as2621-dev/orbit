@@ -7,8 +7,8 @@ FAIL on wrong BUSINESS logic, not merely "returns something"):
     (07:00 ``StartCalendarInterval``), the wake-catch-up invariant (no ``StartInterval`` /
     ``Disabled`` that would reintroduce cron's skip), idempotent-by-label install (bootout
     before bootstrap), the one-time cron migration (retire the orbit line, keep foreign
-    jobs), the ``--dangerously-skip-permissions`` carry-over + its stated rationale, and the
-    two fail-soft paths.
+    jobs), the direct ``python3 scripts/orbit.py`` argv (never the retired ``claude -p``
+    wrapper), run-log capture + the ``~/.local/bin`` PATH entry, and the two fail-soft paths.
   * **legacy cron** — ``generate_cron_entry`` / ``install_cron_entry`` and the read helpers,
     MOVED here verbatim from ``tests/test_setup_wizard.py`` when the code moved out of the
     wizard. Their assertions are kept intact so the characterized cron surface (which the
@@ -124,29 +124,29 @@ class _FakeLaunchctl:
 # ---------------------------------------------------------------------------
 
 
-def test_generate_launchd_plist_schedules_7am_with_skip_permissions() -> None:
-    """The plist is a valid ``com.orbit.daily`` LaunchAgent: 7am schedule + headless run flag.
+def test_generate_launchd_plist_schedules_7am_and_runs_the_pipeline_directly() -> None:
+    """The plist is a valid ``com.orbit.daily`` LaunchAgent: 7am schedule, direct python argv.
 
     WHY: setup writes this plist verbatim under ``~/Library/LaunchAgents``. If the label,
-    schedule, working dir, or the headless ``--dangerously-skip-permissions`` flag were
-    wrong, the daily run would not fire at 7am, would not find its config, or would silently
-    block on a permission prompt and produce nothing. We parse the generated plist and assert
-    each load-bearing field — not merely that a string was returned.
+    schedule, working dir, or argv were wrong, the daily run would not fire at 7am, would
+    not find its config, or would run the wrong program. The argv MUST be
+    ``python3 scripts/orbit.py`` — the historical ``claude -p "/orbit"`` wrapper ran the
+    stale plugin-cache copy of the pipeline and, as a one-shot session, exited before a
+    long run finished, killing it (both verified 2026-07-19). We parse the generated plist
+    and assert each load-bearing field — not merely that a string was returned.
     """
     plist_text = scheduler.generate_launchd_plist(
-        repo_path=Path("/home/me/orbit"), minute=0, hour=7, claude_executable="/opt/homebrew/bin/claude"
+        repo_path=Path("/home/me/orbit"), minute=0, hour=7, python_executable="/opt/homebrew/bin/python3"
     )
     parsed = plistlib.loads(plist_text.encode("utf-8"))
 
     assert parsed["Label"] == "com.orbit.daily"
     assert parsed["StartCalendarInterval"] == {"Hour": 7, "Minute": 0}
     assert parsed["WorkingDirectory"] == "/home/me/orbit"
-    # The headless run flag must be an argv element (never shell-interpolated).
+    # Direct pipeline argv (never shell-interpolated, never the claude wrapper).
     assert parsed["ProgramArguments"] == [
-        "/opt/homebrew/bin/claude",
-        "-p",
-        "--dangerously-skip-permissions",
-        "/orbit",
+        "/opt/homebrew/bin/python3",
+        "/home/me/orbit/scripts/orbit.py",
     ]
 
 
@@ -167,18 +167,38 @@ def test_plist_uses_startcalendarinterval_so_a_missed_run_fires_on_wake() -> Non
     assert parsed.get("Disabled", False) is False  # would suppress all runs, incl. catch-up
 
 
-def test_plist_states_why_the_permissions_flag_is_carried() -> None:
-    """The plist itself must state WHY ``--dangerously-skip-permissions`` is present.
+def test_plist_captures_run_output_and_puts_claude_dir_on_path() -> None:
+    """The plist must capture stdout/stderr to a log file and carry ``~/.local/bin`` on PATH.
 
-    WHY: the flag is a deliberate carry-over of cron's headless behavior, not a silent port
-    (acceptance criterion). A human opening the plist must see both the flag AND the reason,
-    so a future maintainer doesn't strip it as "dangerous-looking" and break the headless run.
-    We assert the flag appears and the rationale comment explains the headless-prompt reason.
+    WHY: without ``StandardOutPath``/``StandardErrPath`` a failed 7am headless run leaves NO
+    trace to debug from (verified gap, 2026-07-19). And the pipeline's LLM stages shell out
+    to a bare ``claude`` (``lib.llm.CLAUDE_CLI``), which installs under ``~/.local/bin`` —
+    a dir absent from launchd's minimal env — so the plist PATH must include it or every
+    classify/summarize call dies with command-not-found.
+    """
+    parsed = plistlib.loads(scheduler.generate_launchd_plist(repo_path=Path("/repo")).encode("utf-8"))
+
+    assert parsed["StandardOutPath"] == parsed["StandardErrPath"]  # one combined run log
+    assert parsed["StandardOutPath"].endswith("Library/Logs/orbit.daily.log")
+    assert parsed["EnvironmentVariables"]["PATH"].endswith("/.local/bin")
+    assert "/opt/homebrew/bin" in parsed["EnvironmentVariables"]["PATH"]
+
+
+def test_plist_does_not_use_the_claude_wrapper() -> None:
+    """No part of the plist may invoke ``claude -p "/orbit"`` — the retired wrapper command.
+
+    WHY: the wrapper had two verified failure modes (2026-07-19): it executed the
+    version-keyed plugin-cache copy of the pipeline (stale until a plugin version bump, so
+    repo fixes silently never shipped to the 7am run), and its one-shot session exited
+    before a long pipeline run completed, killing it mid-fetch. A future edit that
+    "restores" the wrapper — e.g. to reuse the plugin packaging — would silently
+    reintroduce both. The permissions flag disappears with the wrapper: plain ``claude -p``
+    prompt calls inside ``lib.llm`` need no permission bypass.
     """
     plist_text = scheduler.generate_launchd_plist(repo_path=Path("/repo"))
 
-    assert "--dangerously-skip-permissions" in plist_text
-    assert "headless" in plist_text and "permission prompt" in plist_text
+    assert "/orbit" not in plistlib.loads(plist_text.encode("utf-8"))["ProgramArguments"]
+    assert "--dangerously-skip-permissions" not in plist_text
 
 
 def test_install_daily_scheduler_is_idempotent_bootout_before_bootstrap(tmp_path: Path) -> None:
