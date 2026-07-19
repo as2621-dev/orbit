@@ -722,18 +722,25 @@ def render_feed_masonry(tile_blocks: Sequence[TileBlock], *, heading: str, note:
     )
 
 
-def render_footer(accounted_str: str, page_2_href: str) -> str:
-    """Render the double-rule footer (accounted-for line + optional page-2 link).
+def render_footer(accounted_str: str, page_2_href: str, *, chat_href: str = "") -> str:
+    """Render the double-rule footer (coverage line + optional chat + page-2 links).
 
     Args:
-        accounted_str: The mono summary line (e.g. ``"26 OF 26 SOURCES ACCOUNTED FOR"``),
-            escaped.
+        accounted_str: The mono coverage line (e.g. ``"14 ITEMS FROM 9 OF 142 TRACKED
+            CHANNELS"``), escaped.
         page_2_href: The href to the overflow page. Empty → no page-2 link is shown
             (single-page digest).
+        chat_href: The ``claude.ai/new?q=`` chat-bridge link (issue #7). Empty → no
+            chat link is shown (page 2 / pre-bridge callers).
 
     Returns:
         The footer ``<div>`` block.
     """
+    chat_html = (
+        f'<a href="{safe_href(chat_href)}" style="color:#B7472A;">Chat about this digest →</a>'
+        if (chat_href or "").strip()
+        else ""
+    )
     page_2_html = (
         f'<a href="{safe_href(page_2_href)}" style="color:#B7472A;">Full archive · page 2 →</a>'
         if (page_2_href or "").strip()
@@ -741,7 +748,7 @@ def render_footer(accounted_str: str, page_2_href: str) -> str:
     )
     return (
         '<div style="margin-top:26px;padding-top:16px;border-top:3px double #1F1B16;display:flex;'
-        'justify-content:space-between;font-family:\'JetBrains Mono\',monospace;font-size:11px;'
+        'justify-content:space-between;gap:14px;font-family:\'JetBrains Mono\',monospace;font-size:11px;'
         'letter-spacing:.06em;color:#8a7f6c;">'
-        f"<span>{escape(accounted_str)}</span>{page_2_html}</div>"
+        f"<span>{escape(accounted_str)}</span>{chat_html}{page_2_html}</div>"
     )

@@ -1,20 +1,21 @@
-"""Tests for lib.deliver — the Briefcast file emit + the shared message-body helper.
+"""Tests for lib.deliver — the email send path, the Briefcast file emit, and the stage-7 seams.
 
 iMessage and WhatsApp delivery were deleted (PRD story #8: one delivery path to
-configure, permission, and debug). What remains here has NO auth surface:
+configure, permission, and debug). What lives here now:
 
+  * :func:`lib.deliver.deliver_email` — the Gmail SMTP send path and its failure
+    posture, with the chat-bridge subject/body (issue #7) composed via
+    :mod:`lib.chat_bridge`.
   * :func:`lib.deliver.emit_briefcast_payload` — writes the TL;DR + episode list as a
     JSON payload file (integrations §6). A file deliverable, not a network send.
-  * :func:`lib.deliver.build_message_body` — a PURE helper composing the one-line
-    delivery body. It survives the iMessage/WhatsApp removal because the email-delivery
-    slice reuses it as the email body; this test locks its contract in the interim.
+  * The ``orbit.py`` stage-7 seams (deliver / archive wiring).
 
 Why these tests matter (Rule 9 — encode WHY, not just WHAT):
 
   * The removal is a product decision, not a refactor: the send functions must NOT come
     back. ``test_send_functions_are_gone`` fails if iMessage/WhatsApp are reintroduced.
-  * ``build_message_body`` is now the seam the next slice builds the email body on top of.
-    Its tests pin the exact composed shape so that reuse starts from a known contract.
+    (``build_message_body`` was likewise deleted in issue #7: the chat bridge it was
+    reserved for landed as ``lib.chat_bridge.build_email_body`` instead.)
   * Briefcast writes real files; the tests assert the on-disk JSON carries every episode.
 """
 
@@ -23,6 +24,7 @@ from __future__ import annotations
 import json
 import smtplib
 import sys
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -37,31 +39,6 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from lib import deliver  # noqa: E402
 
 
-# --- build_message_body (shared body helper) ------------------------------------
-
-
-def test_build_message_body_joins_summary_and_link() -> None:
-    """The body is the summary and the link joined with an em-dash separator.
-
-    WHY: this is the exact seam the email-delivery slice reuses as the email body. If the
-    composed shape drifts (dropped link, different separator), the next slice inherits a
-    silently-wrong body. Pin the contract now that its former iMessage caller is gone.
-    """
-    body = deliver.build_message_body("3 new items", "file:///tmp/today.html")
-    assert body == "3 new items — file:///tmp/today.html"
-
-
-def test_build_message_body_falls_back_when_summary_blank() -> None:
-    """A blank summary falls back to a sane default line, never an empty lead.
-
-    WHY: the summary can be empty on a quiet feed day; the body must still read as a
-    notification, not a bare separator + link. This pins the fallback so an empty-feed
-    email is not a broken-looking one.
-    """
-    body = deliver.build_message_body("   ", "file:///tmp/today.html")
-    assert body == "Your Orbit digest is ready. — file:///tmp/today.html"
-
-
 # --- removal is a product decision, not a refactor ------------------------------
 
 
@@ -73,6 +50,7 @@ def test_send_functions_are_gone() -> None:
     It guards the product decision at the module boundary.
     """
     removed = [
+        "build_message_body",  # superseded by lib.chat_bridge.build_email_body (issue #7)
         "deliver_imessage",
         "deliver_whatsapp",
         "_escape_for_applescript",
@@ -407,6 +385,57 @@ def test_deliver_email_never_leaks_credential_in_logs_or_headers(
     assert secret not in ok_smtp.sent_messages[0].as_string(), "the app password must never appear in the email"
 
 
+def test_deliver_email_subject_and_body_carry_the_chat_bridge(tmp_path: Path) -> None:
+    """Issue #7 happy path: stable searchable subject; body = TL;DR -> chat link -> markdown.
+
+    WHY: the email body IS the chat bridge's fetchable store. The subject must lead with
+    the stable ``Orbit Digest — YYYY-MM-DD`` prefix (what the chat prompt searches Gmail
+    for), and the body must carry the chat link plus the full digest markdown — while the
+    Tiles HTML attachment behavior stays exactly as before.
+    """
+    from lib import chat_bridge
+
+    page_1 = _write_page(tmp_path / "today.html", "<!DOCTYPE html><html>page one</html>")
+    digest_markdown = "# Orbit Digest\n\n## Big News\nA thing happened."
+    smtp = _RecordingSmtp()
+
+    sent = deliver.deliver_email(
+        "Orbit: 2 new items — top: Big News",
+        [page_1],
+        "you@example.com",
+        digest_markdown=digest_markdown,
+        digest_date=date(2026, 7, 18),
+        env=_ENV_OK,
+        transport=smtp,
+    )
+
+    assert sent is True
+    message = smtp.sent_messages[0]
+    assert message["Subject"] == "Orbit Digest — 2026-07-18: Orbit: 2 new items — top: Big News"
+    body = message.get_body(preferencelist=("plain",)).get_content()
+    assert body.startswith("Orbit: 2 new items — top: Big News"), "the TL;DR still leads the body"
+    assert chat_bridge.build_chat_link() in body, "the chat link rides in the body"
+    assert digest_markdown in body, "the FULL digest markdown rides in the body"
+    attachments = list(message.iter_attachments())
+    assert [a.get_filename() for a in attachments] == ["today.html"], "attachment behavior unchanged"
+
+
+def test_deliver_email_defaults_subject_date_to_today(tmp_path: Path) -> None:
+    """Omitting digest_date still yields the searchable prefix + a real ISO date.
+
+    WHY: the pipeline caller passes no date; the subject must still be searchable by
+    prefix — a missing date must never degrade the subject back to the raw TL;DR.
+    """
+    page_1 = _write_page(tmp_path / "today.html", "<html>x</html>")
+    smtp = _RecordingSmtp()
+
+    deliver.deliver_email("Orbit: 1 new item", [page_1], "you@example.com", env=_ENV_OK, transport=smtp)
+
+    subject = smtp.sent_messages[0]["Subject"]
+    assert subject.startswith("Orbit Digest — ")
+    date.fromisoformat(subject.removeprefix("Orbit Digest — ").split(":")[0].strip())  # a real ISO date
+
+
 def test_deliver_email_sanitizes_crlf_in_subject(tmp_path: Path) -> None:
     """A summary with an embedded CR/LF (from an external title) still sends, no injection.
 
@@ -502,6 +531,105 @@ def test_stage7_deliver_emails_both_rendered_pages(tmp_path: Path) -> None:
     assert len(smtp.sent_messages) == 1, "exactly one email carries both pages"
     filenames = [a.get_filename() for a in smtp.sent_messages[0].iter_attachments()]
     assert filenames == ["today.html", "today-page2.html"], "both pages attached, page 1 first"
+
+
+def test_stage7_deliver_reads_digest_md_beside_page_one_into_the_body(tmp_path: Path) -> None:
+    """run_stage7_deliver picks up digest.md beside page 1 and rides it in the email body.
+
+    WHY (issue #7): the email body is the chat bridge's fetchable store — the pipeline
+    must read the render stage's digest.md twin (the #6 contract path) and hand it to
+    deliver_email, or the Gmail-connector prompt has nothing to read.
+    """
+    import orbit  # imported here so the sys.path insert above is in effect
+    from lib.config import OrbitConfig
+
+    page_1 = _write_page(tmp_path / "today.html", "<html>one</html>")
+    (tmp_path / "digest.md").write_text("# Orbit Digest\n\nMARKDOWN-SENTINEL body line.", encoding="utf-8")
+    config = OrbitConfig(delivery={"email_to": "you@example.com"})
+    smtp = _RecordingSmtp()
+
+    orbit.run_stage7_deliver([], [], [page_1], config, transport=smtp, env=_ENV_OK)
+
+    body = smtp.sent_messages[0].get_body(preferencelist=("plain",)).get_content()
+    assert "MARKDOWN-SENTINEL" in body, "the digest.md twin rides in the email body"
+
+
+def test_stage7_deliver_missing_digest_md_still_sends_with_chat_link(tmp_path: Path) -> None:
+    """A missing digest.md twin never blocks the send; the chat link still rides along.
+
+    WHY (PRD story #19): the markdown twin is fail-soft upstream — its absence must
+    degrade the body (no markdown section), not the delivery. The chat link is pure
+    string-building, so it must survive every fail-soft path.
+    """
+    import orbit  # imported here so the sys.path insert above is in effect
+    from lib import chat_bridge
+    from lib.config import OrbitConfig
+
+    page_1 = _write_page(tmp_path / "today.html", "<html>one</html>")  # no digest.md written
+    config = OrbitConfig(delivery={"email_to": "you@example.com"})
+    smtp = _RecordingSmtp()
+
+    orbit.run_stage7_deliver([], [], [page_1], config, transport=smtp, env=_ENV_OK)
+
+    assert len(smtp.sent_messages) == 1, "the email still sends without the twin"
+    body = smtp.sent_messages[0].get_body(preferencelist=("plain",)).get_content()
+    assert chat_bridge.build_chat_link() in body
+
+
+def test_stage7_deliver_survives_a_corrupt_digest_md(tmp_path: Path) -> None:
+    """A digest.md with invalid UTF-8 (crash mid-write) never blocks the send.
+
+    WHY: the fail-soft posture must cover DECODE failures, not just missing files — a
+    run that died mid-write can leave a split multibyte character at the file tail. The
+    email (with the chat link) must still go out; only the markdown section is lost.
+    """
+    import orbit  # imported here so the sys.path insert above is in effect
+    from lib.config import OrbitConfig
+
+    page_1 = _write_page(tmp_path / "today.html", "<html>one</html>")
+    (tmp_path / "digest.md").write_bytes(b"# Orbit Digest\n\xe2\x80")  # truncated multibyte char
+    config = OrbitConfig(delivery={"email_to": "you@example.com"})
+    smtp = _RecordingSmtp()
+
+    orbit.run_stage7_deliver([], [], [page_1], config, transport=smtp, env=_ENV_OK)
+
+    assert len(smtp.sent_messages) == 1, "a corrupt twin must not block the email"
+
+
+def test_stage7_archive_forwards_digest_and_pages_and_never_raises(tmp_path: Path) -> None:
+    """run_stage7_archive derives digest.md beside page 1 and forwards all pages; fail-soft.
+
+    WHY (issue #7): the pipeline seam must hand lib.archive the SAME digest.md contract
+    path the render stage writes (resolve_digest_md_path), plus every rendered page —
+    and an archive explosion (gh missing entirely) must never escape into the pipeline,
+    or it would kill the email that follows.
+    """
+    import orbit  # imported here so the sys.path insert above is in effect
+
+    page_1 = _write_page(tmp_path / "today.html", "<html>one</html>")
+    page_2 = _write_page(tmp_path / "today-page2.html", "<html>two</html>")
+    recorded_calls: list[tuple[Path, list[Path]]] = []
+
+    def recording_archive(digest_md_path: Path, html_paths: list[Path], **kwargs: Any) -> bool:
+        recorded_calls.append((digest_md_path, list(html_paths)))
+        return True
+
+    original_archive_digest = orbit.archive.archive_digest
+    orbit.archive.archive_digest = recording_archive
+    try:
+        orbit.run_stage7_archive([page_1, page_2])
+    finally:
+        orbit.archive.archive_digest = original_archive_digest
+
+    assert recorded_calls == [(tmp_path / "digest.md", [page_1, page_2])]
+
+    # Fail-soft: even a runner that RAISES must not escape the stage (the real
+    # archive_digest owns the boundary; the stage adds nothing that can throw).
+    def exploding_runner(args: list[str]) -> Any:
+        raise FileNotFoundError("gh")
+
+    result = orbit.run_stage7_archive([page_1, page_2], run_gh=exploding_runner)
+    assert result is None
 
 
 def test_stage7_deliver_failure_is_nonfatal_and_leaves_seen_untouched(

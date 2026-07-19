@@ -52,7 +52,7 @@ for _candidate_dir in (_SCRIPTS_DIR, _LIB_DIR):
     if str(_candidate_dir) not in sys.path:
         sys.path.insert(0, str(_candidate_dir))
 
-from lib import images, log, tiles  # noqa: E402  (import must follow the sys.path inserts above)
+from lib import chat_bridge, images, log, tiles  # noqa: E402  (import must follow the sys.path inserts above)
 from lib.html_render import _format_timestamp, wrap_page  # noqa: E402
 from lib.density import TIER_COMPACT, TIER_HERO, TIER_INDEX, TIER_STANDARD, TieredItem  # noqa: E402
 
@@ -672,7 +672,9 @@ def _build_page1_body(
         inline_image=inline_image,
         flag_top_signal=True,
     )
-    footer_html = tiles.render_footer(accounted_str, page_2_href)
+    # Page 1 carries the chat-bridge entry point (issue #7) — the SAME encoded link
+    # as the email body, built by lib.chat_bridge (never hand-concatenated, spike #5 AC4).
+    footer_html = tiles.render_footer(accounted_str, page_2_href, chat_href=chat_bridge.build_chat_link())
     inner = "\n".join(part for part in (masthead_html, feed_html, footer_html) if part)
     return _wrap_body_container(inner)
 

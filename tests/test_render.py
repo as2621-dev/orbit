@@ -29,6 +29,7 @@ of tests/test_density.py.
 
 from __future__ import annotations
 
+import html
 import sys
 from pathlib import Path
 
@@ -604,6 +605,40 @@ def test_tiles_footer_omits_page2_link_when_no_href() -> None:
     """
     assert "page 2" not in tiles.render_footer("ALL ACCOUNTED FOR", "")
     assert "page 2" in tiles.render_footer("ALL ACCOUNTED FOR", "page2.html")
+
+
+def test_tiles_footer_carries_the_chat_link_when_given() -> None:
+    """The footer renders a labeled "Chat about this digest" anchor for a chat href.
+
+    WHY (issue #7): the Tiles HTML must carry the same one-tap chat entry point as the
+    email body — a reader who opened the attachment can still reach the Claude chat.
+    Empty href (page 2 / pre-bridge callers) must render no chat anchor at all.
+    """
+    chat_href = "https://claude.ai/new?q=Using%20your%20Gmail%20tools"
+
+    footer_with_link = tiles.render_footer("ALL ACCOUNTED FOR", "", chat_href=chat_href)
+    assert f'href="{chat_href}"' in footer_with_link
+    assert "Chat about this digest" in footer_with_link
+
+    assert "Chat about this digest" not in tiles.render_footer("ALL ACCOUNTED FOR", "")
+
+
+def test_rendered_page_one_footer_carries_the_chat_bridge_link() -> None:
+    """render_digest_pages puts the real claude.ai chat link in page 1's footer.
+
+    WHY (issue #7 acceptance): the AC is end-to-end — the rendered Tiles page the email
+    attaches must carry the SAME percent-encoded chat link as the email body, built by
+    lib.chat_bridge (never hand-concatenated, per spike #5 AC4).
+    """
+    from lib import chat_bridge
+
+    tiered = [_tiered("vidH", TIER_HERO), _tiered("vidS", TIER_STANDARD)]
+
+    pages = render.render_digest_pages(tiered, inline_image=lambda url: None)
+
+    expected_href = html.escape(chat_bridge.build_chat_link(), quote=True)
+    assert expected_href in pages[0], "page 1's footer carries the encoded chat link"
+    assert "Chat about this digest" in pages[0]
 
 
 def test_x_posts_render_in_their_own_section_below_the_videos() -> None:

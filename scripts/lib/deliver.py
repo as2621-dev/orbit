@@ -11,9 +11,9 @@ What lives here:
   * :func:`deliver_email` — the send path AND its failure posture (skip on missing config,
     no-retry auth rejection, one-retry transient error, 25MB cap). The SMTP transport is an
     injected boundary (a ``smtplib.SMTP_SSL`` factory) so tests fake it, never the message
-    logic.
-  * :func:`build_message_body` — a PURE helper composing a one-line summary+link body
-    (reserved for the M7 chat-link bridge; the email body is the TL;DR summary as-is).
+    logic. Subject + body composition is delegated to :mod:`lib.chat_bridge` (issue #7):
+    the searchable ``Orbit Digest — YYYY-MM-DD`` subject and the TL;DR -> chat link ->
+    digest-markdown body.
   * :func:`emit_briefcast_payload` — OPTIONAL / STRETCH. Writes the TL;DR + episode list
     as a JSON Briefcast payload file (integrations §6). A file, not a live integration —
     NO auth surface.
@@ -31,6 +31,7 @@ import os
 import smtplib
 import sys
 from collections.abc import Mapping, Sequence
+from datetime import date, datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -44,7 +45,7 @@ for _candidate_dir in (_SCRIPTS_DIR, _LIB_DIR):
     if str(_candidate_dir) not in sys.path:
         sys.path.insert(0, str(_candidate_dir))
 
-from lib import log  # noqa: E402  (import must follow the sys.path inserts above)
+from lib import chat_bridge, log  # noqa: E402  (import must follow the sys.path inserts above)
 
 # Gmail SMTP over implicit SSL (integrations §4 / stack-notes §email). Sender + app
 # password come from ``.env`` (never from the JSON config); the recipient is
@@ -82,16 +83,22 @@ def deliver_email(
     html_pages: Sequence[Path],
     email_to: Optional[str],
     *,
+    digest_markdown: str = "",
+    digest_date: Optional[date] = None,
     env: Mapping[str, str] = os.environ,
     transport: SmtpTransport = _DEFAULT_SMTP_TRANSPORT,
 ) -> bool:
-    """Send the digest as ONE email: TL;DR body + the Tiles HTML page(s) as attachments.
+    """Send the digest as ONE email: chat-bridge body + the Tiles HTML page(s) as attachments.
 
-    The morning digest lands in the user's inbox (PRD M5). The body is the delivery TL;DR
-    (``summary``); each rendered page rides as a self-contained ``text/html`` attachment
-    (page 1 first) so it opens in a real browser with fonts, thumbnails, and deep-links
-    intact — Gmail never renders it inline. The sender + app password are read from ``env``
-    (``.env``); the recipient is ``email_to`` (``delivery.email_to``).
+    The morning digest lands in the user's inbox (PRD M5). The subject is the stable,
+    searchable ``Orbit Digest — YYYY-MM-DD: <TL;DR>`` and the body is the chat bridge's
+    fetchable store — TL;DR lead, "Chat about this digest" link, then the full
+    ``digest_markdown`` (issue #7; assembled by :func:`lib.chat_bridge.build_email_body`,
+    which owns the Gmail-clip truncation guard). Each rendered page rides as a
+    self-contained ``text/html`` attachment (page 1 first) so it opens in a real browser
+    with fonts, thumbnails, and deep-links intact — Gmail never renders it inline. The
+    sender + app password are read from ``env`` (``.env``); the recipient is ``email_to``
+    (``delivery.email_to``).
 
     Failure posture (loud but never destructive — PRD story #7):
 
@@ -109,9 +116,13 @@ def deliver_email(
     day cannot crash the pipeline or re-send yesterday's items tomorrow.
 
     Args:
-        summary: The delivery TL;DR (used as the email subject + body lead).
+        summary: The delivery TL;DR (trails the subject prefix + leads the body).
         html_pages: The rendered page paths in order (page 1 first); page 2 when present.
         email_to: The recipient (``config.delivery.email_to``); None/empty => skip.
+        digest_markdown: The full ``digest.md`` text for the body ("" when the twin is
+            unavailable — the body then points at the HTML attachment instead).
+        digest_date: The digest's date for the subject (defaults to today, UTC — the
+            same convention as the rendered masthead dateline).
         env: Environment mapping to read secrets from (defaults to ``os.environ``).
         transport: Injected ``smtplib.SMTP_SSL``-shaped factory (faked in tests).
 
@@ -160,7 +171,14 @@ def deliver_email(
     # From/To header (ValueError from EmailMessage) must be a loud, NON-FATAL failure — the
     # pipeline (and seen state) must survive it, per the module's "never raises" contract.
     try:
-        message = _build_email_message(summary, html_pages, email_from=email_from, email_to=recipient)
+        message = _build_email_message(
+            summary,
+            html_pages,
+            email_from=email_from,
+            email_to=recipient,
+            digest_markdown=digest_markdown,
+            digest_date=digest_date,
+        )
     except (OSError, ValueError) as build_error:
         log.log_error(
             "email_delivery_build_failed",
@@ -201,9 +219,14 @@ def _build_email_message(
     *,
     email_from: str,
     email_to: str,
+    digest_markdown: str = "",
+    digest_date: Optional[date] = None,
 ) -> EmailMessage:
-    """Assemble the delivery email: TL;DR body + each HTML page as a ``text/html`` attachment.
+    """Assemble the delivery email: chat-bridge body + each HTML page as a ``text/html`` attachment.
 
+    Subject and body come from :mod:`lib.chat_bridge` (issue #7): the subject is the
+    stable searchable ``Orbit Digest — YYYY-MM-DD: <TL;DR>``; the body is TL;DR ->
+    chat link -> the full digest markdown (truncated loudly under Gmail's clip limit).
     Each page is attached as raw BYTES read from disk (not a re-serialized string) so the
     digest the user opens is byte-identical to the rendered file. The credential is never a
     header. Reads happen here (inside the caller's failure guard) so a vanished/unreadable
@@ -216,10 +239,12 @@ def _build_email_message(
     the body, where newlines are harmless.
 
     Args:
-        summary: The delivery TL;DR (subject + body lead); a blank summary falls back.
+        summary: The delivery TL;DR (subject tail + body lead); a blank summary falls back.
         html_pages: The rendered page paths in send order (page 1 first).
         email_from: The ``From`` address (also the SMTP login username).
         email_to: The ``To`` recipient.
+        digest_markdown: The full ``digest.md`` text ("" when unavailable).
+        digest_date: The digest's date for the subject (None -> today, UTC).
 
     Returns:
         A ready-to-send :class:`email.message.EmailMessage`.
@@ -229,11 +254,12 @@ def _build_email_message(
         ValueError: If a header value (e.g. a malformed From/To) contains a CR/LF.
     """
     summary_line = summary.strip() or "Your Orbit digest is ready."
+    subject_date = digest_date if digest_date is not None else datetime.now(timezone.utc).date()
     message = EmailMessage()
-    message["Subject"] = _sanitize_header_value(summary_line)
+    message["Subject"] = _sanitize_header_value(chat_bridge.build_digest_subject(subject_date, summary_line))
     message["From"] = email_from
     message["To"] = email_to
-    message.set_content(f"{summary_line}\n\nYour full Orbit digest is attached — open it in any browser.")
+    message.set_content(chat_bridge.build_email_body(summary_line, digest_markdown))
     for page_path in html_pages:
         message.add_attachment(page_path.read_bytes(), maintype="text", subtype="html", filename=page_path.name)
     return message
@@ -343,30 +369,6 @@ def _send_with_retry(
         attachment_count=attachment_count,
     )
     return True
-
-
-def build_message_body(summary: str, html_link: str) -> str:
-    """Compose the short delivery body: the TL;DR summary + a link to the digest page.
-
-    A PURE helper (deterministic, no I/O — Rule 5) shared by the delivery path so the body
-    stays consistent. The ``summary`` already folds in the TL;DR + scoops (the caller in
-    ``orbit.py`` builds it from the tiered items / scoops). Kept to one line so it reads as
-    a notification, not a wall of text. The email-delivery slice reuses this as the email
-    body.
-
-    Args:
-        summary: The one-line TL;DR (already includes any scoops prefix).
-        html_link: A link to the HTML digest.
-
-    Returns:
-        The composed message body string.
-
-    Example:
-        >>> build_message_body("3 new items", "file:///tmp/today.html")
-        '3 new items — file:///tmp/today.html'
-    """
-    summary_text = summary.strip() or "Your Orbit digest is ready."
-    return f"{summary_text} — {html_link}"
 
 
 def emit_briefcast_payload(summary: str, episodes: list[Any], out_path: Path | str) -> Path:

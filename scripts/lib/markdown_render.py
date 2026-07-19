@@ -89,6 +89,36 @@ def resolve_digest_md_path(html_path: Path) -> Path:
     return Path(html_path).parent / DIGEST_MD_FILENAME
 
 
+def read_digest_markdown(html_path: Path) -> str:
+    """Read the ``digest.md`` twin beside page 1 for the email body — fail-soft, never raises.
+
+    Lives beside :func:`resolve_digest_md_path` so the twin's path AND read contract stay
+    in one module (orbit.py stays sequencing-only). A missing/unreadable/corrupt twin (its
+    render is itself fail-soft, issue #6) degrades to ``""`` with a loud warning: the email
+    then carries the TL;DR + chat link and points at the HTML attachment instead (PRD
+    story #19).
+
+    Args:
+        html_path: The page-1 HTML output path (the twin sits beside it).
+
+    Returns:
+        The digest.md text, or "" when unavailable.
+    """
+    markdown_path = resolve_digest_md_path(html_path)
+    try:
+        return markdown_path.read_text(encoding="utf-8")
+    # UnicodeDecodeError too: a crash mid-write can leave a split multibyte char at the
+    # file's tail, and the email must still send (fail-soft) — not just on OSError.
+    except (OSError, UnicodeDecodeError) as read_error:
+        log.log_warning(
+            "digest_markdown_unreadable_for_email",
+            markdown_path=str(markdown_path),
+            error_type=type(read_error).__name__,
+            detail="The email body will carry the TL;DR + chat link without the markdown section.",
+        )
+        return ""
+
+
 # --- Text + link primitives --------------------------------------------------
 
 

@@ -27,7 +27,7 @@ from typing import Any, Callable, Optional
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
 
 import store  # noqa: E402  (import must follow the sys.path insert above)
-from lib import bird_x, classify, deliver, log, markdown_render, render, runlock  # noqa: E402
+from lib import archive, bird_x, classify, deliver, log, markdown_render, render, runlock  # noqa: E402
 from lib.bird_x import Follow, Tweet, XAuthError  # noqa: E402
 from lib.classify import LlmClassifier, _default_llm_classifier  # noqa: E402
 from lib.cluster import Cluster, cluster_overlaps  # noqa: E402
@@ -997,6 +997,37 @@ def _build_delivery_summary(tiered_items: list[TieredItem], scoops: list[Trendin
     return lead
 
 
+def run_stage7_archive(
+    written_paths: list[Path],
+    *,
+    run_gh: Optional[archive.GhRunner] = None,
+) -> None:
+    """Stage 7 (archive): push digest.md + the rendered pages to the private archive repo.
+
+    Sequencing only — :func:`lib.archive.archive_digest` owns the whole push and its
+    fail-soft boundary (it NEVER raises). The pipeline runs this AFTER delivery: the
+    archive is strictly secondary, so even its worst case (gh timeouts) can never delay
+    or endanger the email (PRD story #19). The digest.md path is the render stage's
+    contract path (:func:`lib.markdown_render.resolve_digest_md_path`, beside page 1).
+    Nothing rendered => nothing to archive.
+
+    Args:
+        written_paths: The rendered page paths from Stage 7 (page 1 first).
+        run_gh: Optional injected gh runner; forwarded to ``archive_digest`` when set
+            (mirrors the ``transport``/``env`` seams in :func:`run_stage7_deliver`).
+    """
+    if not written_paths:
+        return
+    archive_kwargs: dict[str, Any] = {}
+    if run_gh is not None:
+        archive_kwargs["run_gh"] = run_gh
+    archive.archive_digest(
+        markdown_render.resolve_digest_md_path(written_paths[0]),
+        written_paths,
+        **archive_kwargs,
+    )
+
+
 def run_stage7_deliver(
     tiered_items: list[TieredItem],
     scoops: list[TrendingItem],
@@ -1014,11 +1045,14 @@ def run_stage7_deliver(
 
     Two outputs, both no-ops until configured:
 
-      * Email (:func:`lib.deliver.deliver_email`) — sends the deterministic one-line TL;DR
-        (:func:`_build_delivery_summary` — no LLM, Rule 5) as the body with every
-        ``written_paths`` page attached. It SKIPS cleanly when ``delivery.email_to`` or the
-        ``.env`` credentials are unset, and a send failure is loud but non-fatal — so this
-        stage never crashes the pipeline or changes ``seen`` state.
+      * Email (:func:`lib.deliver.deliver_email`) — sends the chat-bridge body (issue #7):
+        the deterministic one-line TL;DR (:func:`_build_delivery_summary` — no LLM, Rule 5),
+        the "Chat about this digest" link, and the digest.md twin read fail-soft by
+        :func:`lib.markdown_render.read_digest_markdown` — with every ``written_paths``
+        page attached. It SKIPS
+        cleanly when ``delivery.email_to`` or the ``.env`` credentials are unset, and a send
+        failure is loud but non-fatal — so this stage never crashes the pipeline or changes
+        ``seen`` state.
       * Briefcast (stretch, integrations §6) — a payload FILE gated behind
         ``delivery.briefcast_path`` and skipped by default. No auth surface.
 
@@ -1050,7 +1084,14 @@ def run_stage7_deliver(
         email_kwargs["transport"] = transport
     if env is not None:
         email_kwargs["env"] = env
-    deliver.deliver_email(summary, written_paths, config.delivery.get("email_to"), **email_kwargs)
+    digest_markdown = markdown_render.read_digest_markdown(written_paths[0]) if written_paths else ""
+    deliver.deliver_email(
+        summary,
+        written_paths,
+        config.delivery.get("email_to"),
+        digest_markdown=digest_markdown,
+        **email_kwargs,
+    )
 
 
 def run_pipeline(depth: str) -> int:
@@ -1174,6 +1215,12 @@ def _run_pipeline_stages(depth: str) -> int:
     # when the recipient/credentials are unconfigured and is loud-but-non-fatal on failure,
     # so the run still exits 0 and seen state (written in Stage 1) is never disturbed.
     run_stage7_deliver(tiered_items, scoops, written_paths, config)
+
+    # Stage 7 (archive) — push digest.md + the rendered pages to the private archive repo
+    # (issue #7). Deliberately AFTER the email: the archive is strictly secondary, so its
+    # worst case (gh timeouts in a network black hole) can never delay the morning email.
+    # archive_digest NEVER raises (fail-soft at the module edge).
+    run_stage7_archive(written_paths)
 
     log.log_info(
         "pipeline_completed",

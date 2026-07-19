@@ -50,12 +50,21 @@ The full 5-step setup is in [`SETUP.md`](SETUP.md) §8.3.
 
 ## Delivery
 
-**Email is the delivery channel.** Each morning Orbit emails you the digest over Gmail SMTP: a
-one-line summary as the body, the full self-contained Tiles HTML page(s) attached so they open
-in a real browser on any device. Delivery is opt-in — set `delivery.email_to` in the config and
-`ORBIT_EMAIL_FROM` + `GMAIL_APP_PASSWORD` (a Gmail app password; 2FA required) in `.env`. Leave
-them unset and Orbit just writes the HTML locally. The earlier local-only delivery channels
-were removed (2026-07-18) in favor of one email path. See [`SETUP.md`](SETUP.md) §8.3-§8.4.
+**Email is the delivery channel.** Each morning Orbit emails you the digest over Gmail SMTP
+under the searchable subject `Orbit Digest — YYYY-MM-DD: <TL;DR>`: the body is the TL;DR, a
+**"Chat about this digest"** link, and the full digest markdown; the self-contained Tiles HTML
+page(s) ride as attachments so they open in a real browser on any device. The chat link opens
+a prefilled claude.ai conversation that reads the digest out of that very email via your Gmail
+connector — one tap from inbox to a chat (or voice) session about today's items. Delivery is
+opt-in — set `delivery.email_to` in the config and `ORBIT_EMAIL_FROM` + `GMAIL_APP_PASSWORD`
+(a Gmail app password; 2FA required) in `.env`. Leave them unset and Orbit just writes the
+HTML locally. The earlier local-only delivery channels were removed (2026-07-18) in favor of
+one email path. See [`SETUP.md`](SETUP.md) §8.3-§8.4.
+
+**Archive.** After each render, `digest.md` + the Tiles HTML are also pushed (one commit per
+run, fail-soft) to the private `as2621-dev/orbit-digests` repo under `YYYY/MM/DD/`, via the
+`gh` CLI. Every run first verifies the repo is still private; any push failure only costs the
+archive — the email still sends.
 
 ## Configuration & environment
 
