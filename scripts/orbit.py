@@ -17,6 +17,7 @@ import argparse
 import os
 import sys
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -27,7 +28,20 @@ from typing import Any, Callable, Optional
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
 
 import store  # noqa: E402  (import must follow the sys.path insert above)
-from lib import archive, bird_x, classify, deliver, log, markdown_render, render, runlock  # noqa: E402
+from lib import (  # noqa: E402
+    archive,
+    bird_x,
+    chat_bridge,
+    classify,
+    deliver,
+    ledger,
+    ledger_adapter,
+    log,
+    markdown_render,
+    render,
+    runlock,
+    sections,
+)
 from lib.bird_x import Follow, Tweet, XAuthError  # noqa: E402
 from lib.classify import LlmClassifier, _default_llm_classifier  # noqa: E402
 from lib.cluster import Cluster, cluster_overlaps  # noqa: E402
@@ -41,6 +55,7 @@ from lib.external_trending import (  # noqa: E402
 )
 from lib.rerank import RankableItem, cap_x_items, derank_items  # noqa: E402
 from lib.setup_wizard import run_setup_wizard  # noqa: E402
+from lib.sections import Section  # noqa: E402
 from lib.summarize import summarize_items  # noqa: E402
 from lib.trending import TrendingItem, compute_internal_trending  # noqa: E402
 from lib.youtube_yt import (  # noqa: E402
@@ -793,6 +808,137 @@ def run_stage6_rank_and_tier(
     return tiered_items
 
 
+# How many chapterless digest videos may have a transcript fetched for their anchors.
+# A transcript fetch costs NO tokens (it is a yt-dlp subprocess) but does cost wall-clock,
+# so this is a latency budget, not a cost one. Rule 12: when it bites, the drop is LOGGED
+# rather than silently truncating coverage.
+SECTIONS_TRANSCRIPT_LIMIT: int = 20
+
+# Concurrent transcript fetches. Each is an independent yt-dlp subprocess with its own
+# temp dir and no shared state, so fanning out is safe; 6 keeps us well inside YouTube's
+# tolerance while cutting a ~20-video sweep from ~15 minutes to ~2.
+SECTIONS_TRANSCRIPT_WORKERS: int = 6
+
+
+def run_stage6_5_build_sections(
+    tiered_items: list[TieredItem],
+    depth: str,
+    *,
+    transcript_fetcher: Optional[Callable[[str, str], Optional[Transcript]]] = None,
+    llm_call: Optional[Callable[[str], str]] = None,
+) -> dict[str, list[Section]]:
+    """Stage 6.5: build each digest video's three timestamped sections in ONE model call.
+
+    Runs AFTER ranking, on the digest's YouTube half only — Stage 1 classifies up to 60
+    uploads but only the ranked survivors are rendered, so building sections earlier would
+    summarize videos nobody ever sees.
+
+    The cost shape is the whole point (Rule 6). Anchors — the three offsets each section
+    deep-links to — are chosen by CODE, from the cheapest source available:
+
+      1. the item's Stage-1 ``chapters``, reused verbatim. FREE: no fetch, no tokens.
+      2. failing that, a freshly fetched transcript, compacted in code to three short
+         excerpts. The fetch is a yt-dlp subprocess (no tokens) and the full cue list
+         never reaches a model.
+
+    Only the PROSE is a model judgment, and every video's anchors ride in a SINGLE
+    ``claude -p`` call (~6k tokens for a ~35-video digest, versus ~35 calls / ~105k tokens
+    if each video asked the model to find its own split points).
+
+    **Fail-soft (Rule 12):** a video with no usable anchors, a failed transcript fetch, or
+    a failed batch call simply yields no sections for the affected videos — those rows
+    render title-only. Nothing here can abort the run.
+
+    Args:
+        tiered_items: The Stage-6 output (tiered, rank-ordered, both platforms).
+        depth: The run depth, forwarded to the transcript fetcher.
+        transcript_fetcher: Injectable ``(video_id, depth) -> Transcript | None``;
+            defaults to :func:`lib.transcribe.fetch_transcript_with_cues`.
+        llm_call: Injectable model boundary for the batch call; defaults to the live
+            ``claude`` CLI caller inside :func:`lib.sections.build_sections_batch`.
+
+    Returns:
+        A ``{video_id: [Section, ...]}`` map covering whichever videos resolved sections.
+    """
+    youtube_items, _x_items = render.split_youtube_and_x(tiered_items)
+    if not youtube_items:
+        return {}
+
+    active_fetcher = transcript_fetcher or fetch_transcript_with_cues
+
+    # Pass 1 — take the free path wherever Stage 1 already produced chapters.
+    section_sources: list[sections.SectionSource] = []
+    needs_transcript: list[Any] = []
+    for tiered_item in youtube_items:
+        item = tiered_item.scored_item.item
+        source = sections.build_section_source(
+            str(getattr(item, "item_external_id", "") or ""),
+            str(getattr(item, "title", "") or ""),
+            chapters=getattr(item, "chapters", None) or [],
+        )
+        if source is not None:
+            section_sources.append(source)
+        else:
+            needs_transcript.append(item)
+
+    # Pass 2 — fetch transcripts for the chapterless remainder, concurrently.
+    fetch_targets = needs_transcript[:SECTIONS_TRANSCRIPT_LIMIT]
+    if len(needs_transcript) > len(fetch_targets):
+        log.log_warning(
+            "sections_transcript_budget_exhausted",
+            chapterless_count=len(needs_transcript),
+            fetched_count=len(fetch_targets),
+            dropped_count=len(needs_transcript) - len(fetch_targets),
+            fix_suggestion=(
+                "More chapterless digest videos than SECTIONS_TRANSCRIPT_LIMIT; the excess "
+                "render WITHOUT section lines. Raise the limit if this recurs."
+            ),
+        )
+
+    if fetch_targets:
+        with ThreadPoolExecutor(max_workers=SECTIONS_TRANSCRIPT_WORKERS) as pool:
+            futures = {
+                pool.submit(active_fetcher, str(getattr(item, "item_external_id", "") or ""), depth): item
+                for item in fetch_targets
+            }
+            for future in as_completed(futures):
+                item = futures[future]
+                video_id = str(getattr(item, "item_external_id", "") or "")
+                try:
+                    transcript = future.result()
+                except Exception as exc:  # noqa: BLE001 — one bad fetch must not lose the sweep.
+                    log.log_warning(
+                        "sections_transcript_fetch_failed",
+                        video_id=video_id,
+                        error_message=str(exc),
+                        fix_suggestion=(
+                            "This video renders WITHOUT section lines. Check yt-dlp and network "
+                            "reachability if this recurs across many videos."
+                        ),
+                    )
+                    continue
+                source = sections.build_section_source(
+                    video_id,
+                    str(getattr(item, "title", "") or ""),
+                    transcript=transcript,
+                )
+                if source is not None:
+                    section_sources.append(source)
+
+    # Pass 3 — ONE model call for every video's prose.
+    sections_by_video = sections.build_sections_batch(section_sources, llm_call=llm_call)
+
+    log.log_info(
+        "sections_stage_completed",
+        youtube_item_count=len(youtube_items),
+        from_chapters_count=len(youtube_items) - len(needs_transcript),
+        transcript_fetched_count=len(fetch_targets),
+        sourced_count=len(section_sources),
+        covered_count=len(sections_by_video),
+    )
+    return sections_by_video
+
+
 def _default_html_writer(path: Path, html: str) -> None:
     """Write ``html`` to ``path`` (UTF-8), creating parent directories as needed.
 
@@ -958,6 +1104,109 @@ def run_stage7_render(
         html_path=str(page_1_path),
     )
     return written_paths
+
+
+# The ledger pages are written BESIDE page 1 under these names.
+LEDGER_WEB_FILENAME: str = "today-ledger.html"
+LEDGER_MOBILE_FILENAME: str = "today-ledger-mobile.html"
+
+
+def run_stage7_render_ledger(
+    tiered_items: list[TieredItem],
+    *,
+    page_1_path: Path,
+    sections_by_video: dict[str, list[Section]],
+    tracked_source_total: int,
+    writer: Callable[[Path, str], None] = _default_html_writer,
+    inline_image: Optional[Callable[[str], Optional[str]]] = None,
+) -> list[Path]:
+    """Render the Final ledger (web + mobile) beside page 1, fail-soft.
+
+    The ledger is the Phase-9 successor to the Tiles masonry, but this stage does NOT yet
+    displace it: Tiles still writes page 1 and still rides the email, and these two files
+    are written alongside for review. That keeps the live morning email byte-identical
+    while the ledger's real three-section output can be opened and judged (Rule 3 —
+    surgical; promoting the ledger to page 1 is a deliberate follow-up, not a side effect).
+
+    Deliberately NOT added to the caller's ``written_paths``: every path there is attached
+    to the delivery email, and these are review artifacts, not attachments.
+
+    Loud-but-non-fatal (Rule 12): a render or write failure here is logged and swallowed,
+    exactly like the markdown twin — it must never disturb the digest or delivery.
+
+    Args:
+        tiered_items: The Stage-6 output (tiered, rank-ordered).
+        page_1_path: The Tiles page-1 path; the ledger files are written into its directory.
+        sections_by_video: The Stage-6.5 ``{video_id: [Section]}`` map.
+        tracked_source_total: Total sources Orbit watches, for the masthead.
+        writer: The same ``(path, text) -> None`` writer the HTML pages use.
+        inline_image: OPTIONAL image-inline stub (tests pass one to stay offline).
+
+    Returns:
+        The ledger paths actually written (``[]`` on failure).
+    """
+    try:
+        view_kwargs: dict[str, Any] = {}
+        if inline_image is not None:
+            view_kwargs["inline_image"] = inline_image
+
+        view = ledger_adapter.build_ledger_view(
+            tiered_items,
+            sections_by_video=sections_by_video,
+            tracked_source_total=tracked_source_total,
+            **view_kwargs,
+        )
+        chat_href = chat_bridge.build_chat_link()
+
+        web_path = page_1_path.parent / LEDGER_WEB_FILENAME
+        mobile_path = page_1_path.parent / LEDGER_MOBILE_FILENAME
+        writer(
+            web_path,
+            ledger.render_web_document(
+                dateline=view.dateline,
+                counts=view.counts,
+                videos=view.videos,
+                channels=view.channels,
+                posts=view.posts,
+                handles=view.handles,
+                chat_href=chat_href,
+            ),
+        )
+        writer(
+            mobile_path,
+            ledger.render_mobile_document(
+                dateline=view.dateline,
+                counts=view.counts,
+                videos=view.videos,
+                channel_count=len(view.channels),
+                posts=view.posts,
+                handle_count=len(view.handles),
+                chat_href=chat_href,
+            ),
+        )
+
+        videos_with_sections = sum(1 for video in view.videos if video.points)
+        log.log_info(
+            "ledger_render_completed",
+            stage="stage_7_render_ledger",
+            video_count=len(view.videos),
+            videos_with_sections=videos_with_sections,
+            post_count=len(view.posts),
+            web_path=str(web_path),
+            mobile_path=str(mobile_path),
+        )
+        return [web_path, mobile_path]
+    except Exception as exc:  # noqa: BLE001 — review artifact; never disturb the digest.
+        log.log_error(
+            "ledger_render_failed",
+            error_message=str(exc),
+            fix_suggestion=(
+                "The Final ledger pages could not be rendered; the Tiles digest, email and "
+                "archive were unaffected. Inspect lib/ledger_adapter.py against the "
+                "current TieredItem shape."
+            ),
+        )
+        return []
 
 
 def _build_delivery_summary(tiered_items: list[TieredItem], scoops: list[TrendingItem]) -> str:
@@ -1203,12 +1452,28 @@ def _run_pipeline_stages(depth: str) -> int:
     # show that quiet channels are still being watched.
     tracked_source_total = len(store.list_sources())
 
+    # Stage 6.5 — the Final design's three timestamped sections per digest video. Anchors
+    # come from Stage-1 chapters where they exist (free) and a fetched transcript
+    # otherwise; the prose for EVERY video rides one ``claude -p`` call. Fail-soft: an
+    # empty map just means the ledger rows render title-only.
+    sections_by_video = run_stage6_5_build_sections(tiered_items, depth)
+
     written_paths = run_stage7_render(
         tiered_items,
         config,
         clusters=clusters,
         tracked_source_total=tracked_source_total,
         summaries=summaries,
+    )
+
+    # Stage 7 (ledger) — write the Final web + mobile ledgers beside page 1 for review.
+    # Kept OUT of written_paths on purpose: Tiles still owns page 1 and the email until
+    # the ledger is deliberately promoted.
+    ledger_paths = run_stage7_render_ledger(
+        tiered_items,
+        page_1_path=written_paths[0],
+        sections_by_video=sections_by_video,
+        tracked_source_total=tracked_source_total,
     )
 
     # Stage 7 (deliver) — email the rendered pages (PRD M5). deliver_email skips cleanly
@@ -1228,6 +1493,8 @@ def _run_pipeline_stages(depth: str) -> int:
         status="rank_render_half",
         item_count=len(tiered_items),
         pages_written=len(written_paths),
+        sectioned_video_count=len(sections_by_video),
+        ledger_pages_written=len(ledger_paths),
     )
     return 0
 

@@ -11,22 +11,28 @@ sections are a fixed-arity RENDER contract — always three, for every rendered 
 long-form or not. Chapterize keeps feeding classify/blurb grounding; sections feed the
 digest rows.
 
-Where it runs matters (cost): sections are built AFTER ranking, on the final digest
-items only. Stage 1 classifies up to 60 uploads but only ~35 reach the digest, so
-building sections there would transcribe and summarize ~25 videos that are never shown.
+TWO paths produce sections. They differ in WHO chooses the timestamps, and that drives
+their cost by two orders of magnitude:
 
-The decision tree (Rule 5 — only the split/summary is a model judgment; everything
-that produces a URL is deterministic code):
+  - :func:`build_sections` (per video) — sends a whole transcript and lets the MODEL pick
+    three topic-shift starts, then SNAPS each returned offset to the nearest real cue.
+    ~3k tokens and one ``claude -p`` call per video.
+  - :func:`build_sections_batch` (all videos at once) — CODE picks each video's three
+    anchors from material already on hand (Stage-1 chapters, else a fetched transcript
+    compacted to three short excerpts), and the model writes only the prose, for every
+    video, in ONE call. ~6k tokens total for a ~35-video digest.
 
-  1. no transcript, or fewer than :data:`_MIN_CUES_FOR_SECTIONS` cues -> return ``[]``
-     (the row renders with no section lines rather than with invented ones).
-  2. otherwise -> ask the injected LLM to pick three topic-shift starts and summarize
-     each (prompt in references/sections.md), then SNAP every returned
-     ``start_seconds`` to the nearest real cue offset.
+**The pipeline runs the batched path** (Rule 6). The per-video path is kept for the case
+where a caller genuinely wants the model to find the topic shifts in one video.
 
-The snap is the load-bearing safety property: a section's timestamp is always a real
-cue offset, so the ``watch?v=ID&t=Ns`` deep link always lands on content the summary
-actually describes. A model-invented offset never survives into a link.
+Both share the same safety property — a section's timestamp always traces back to a real
+source offset, so the ``watch?v=ID&t=Ns`` deep link always lands on content the summary
+describes. The per-video path enforces it by snapping; the batched path enforces it more
+strongly still, by never letting the model return a timestamp at all.
+
+Where it runs matters (cost): sections are built AFTER ranking, on the final digest items
+only. Stage 1 classifies up to 60 uploads but only ~35 reach the digest, so building
+sections there would summarize ~25 videos that are never shown.
 
 **Fail-soft (Rule 12):** any LLM error, unparseable response, or short/empty result
 returns ``[]`` and logs — the digest renders structurally without section lines rather
@@ -368,3 +374,328 @@ def build_sections(
         log.log_info("sections_built", video_id=video_id, section_count=len(sections))
 
     return sections
+
+
+# --- Batched, anchor-grounded path (what the pipeline runs) -------------------------
+# Cost is why this exists. The per-video :func:`build_sections` above sends a whole
+# transcript and asks the model to CHOOSE the split points — ~3k tokens and one
+# ``claude -p`` call per video, so a ~35-video digest costs ~35 calls / ~105k tokens.
+# The batched path inverts the split: CODE picks each video's three anchors from material
+# it already has (Stage-1 chapters, else a fetched transcript), and the model writes only
+# the prose, for EVERY video, in ONE call (~6k tokens total). Rule 5 — the offsets are a
+# deterministic choice, so only the summaries are a model judgment; Rule 6 — one call.
+#
+# The safety property is stronger here than in the per-video path: the model never returns
+# a timestamp at all, so there is nothing to snap and no invented offset can exist.
+
+# Per-anchor cap on the grounding text sent to the model. Three anchors at this cap is
+# ~660 chars (~170 tokens) per video, so a ~35-video batch stays around 6k tokens.
+MAX_ANCHOR_SOURCE_CHARS: int = 220
+
+# How many consecutive cues are joined to describe a transcript anchor. Enough to carry a
+# sentence or two of real speech; the char cap above is the hard backstop.
+_CUES_PER_TRANSCRIPT_ANCHOR: int = 4
+
+# Where the three transcript anchors sit in the cue list, as fractions of its length.
+# Front-loaded rather than even thirds: the opening and the middle argument carry most of
+# a video's substance, and the last fraction still leaves cues after it to describe.
+_TRANSCRIPT_ANCHOR_FRACTIONS: tuple[float, ...] = (0.0, 0.40, 0.75)
+
+
+@dataclass(frozen=True)
+class SectionAnchor:
+    """One fixed moment in a video, with the material found there.
+
+    Attributes:
+        start_seconds: The anchor's offset. ALWAYS a real source offset — a Stage-1
+            chapter's ``start_seconds`` or a transcript cue's ``cue_start_seconds``.
+        source_text: The grounding material at that moment (a chapter title, or the
+            transcript speech there), capped at :data:`MAX_ANCHOR_SOURCE_CHARS`.
+    """
+
+    start_seconds: float
+    source_text: str
+
+
+@dataclass(frozen=True)
+class SectionSource:
+    """One video's input to :func:`build_sections_batch`.
+
+    Attributes:
+        video_id: The video's external id — the key the model's response is mapped back by.
+        video_title: The title, given to the model as context.
+        anchors: The code-chosen anchors, ascending, at most
+            :data:`SECTIONS_PER_VIDEO` of them.
+    """
+
+    video_id: str
+    video_title: str
+    anchors: list[SectionAnchor]
+
+
+def _spread_indices(item_count: int, pick_count: int) -> list[int]:
+    """Pick ``pick_count`` evenly-spread indices across ``item_count`` items.
+
+    Reason: an even spread makes the three sections cover the whole video. Taking the
+    first three chapters instead would describe only its opening minutes.
+
+    Args:
+        item_count: How many items there are to pick from.
+        pick_count: How many indices to pick.
+
+    Returns:
+        Ascending, de-duplicated indices (fewer than ``pick_count`` when the input is
+        too short to yield distinct ones).
+
+    Example:
+        >>> _spread_indices(7, 3)
+        [0, 3, 6]
+        >>> _spread_indices(2, 3)
+        [0, 1]
+    """
+    if item_count <= 0 or pick_count <= 0:
+        return []
+    if item_count <= pick_count:
+        return list(range(item_count))
+    step = (item_count - 1) / (pick_count - 1) if pick_count > 1 else 0
+    return sorted({int(round(index * step)) for index in range(pick_count)})
+
+
+def _cap_source_text(source_text: str) -> str:
+    """Collapse whitespace and cap anchor grounding at :data:`MAX_ANCHOR_SOURCE_CHARS`.
+
+    Args:
+        source_text: The raw grounding text.
+
+    Returns:
+        The cleaned, capped text.
+    """
+    return " ".join(source_text.split())[:MAX_ANCHOR_SOURCE_CHARS]
+
+
+def anchors_from_chapters(chapters: list[Any]) -> list[SectionAnchor]:
+    """Pick three anchors from a video's Stage-1 chapters (FREE — no fetch, no tokens).
+
+    The preferred source: chapters were already built and paid for in Stage 1 (creator
+    chapters verbatim, or an LLM segmentation that already ran), so reusing them costs
+    nothing. A chapter's ``title`` is often a bare label ("Intro") — that is fine as
+    GROUNDING, because the batch prompt is told to describe the segment rather than echo
+    the label.
+
+    Args:
+        chapters: The item's :class:`lib.chapterize.Chapter` list (may be empty).
+
+    Returns:
+        Up to :data:`SECTIONS_PER_VIDEO` anchors in ascending time order, or ``[]``.
+
+    Example:
+        >>> anchors_from_chapters([])
+        []
+    """
+    usable = [
+        chapter
+        for chapter in chapters
+        if isinstance(getattr(chapter, "start_seconds", None), (int, float))
+    ]
+    if not usable:
+        return []
+    usable.sort(key=lambda chapter: float(chapter.start_seconds))
+    return [
+        SectionAnchor(
+            start_seconds=float(usable[index].start_seconds),
+            source_text=_cap_source_text(str(getattr(usable[index], "title", "") or "")),
+        )
+        for index in _spread_indices(len(usable), SECTIONS_PER_VIDEO)
+    ]
+
+
+def anchors_from_transcript(transcript: Transcript | None) -> list[SectionAnchor]:
+    """Pick three anchors from a transcript (the chapterless fallback).
+
+    Used only when a video has no chapters to reuse. The transcript fetch itself costs no
+    tokens (it is a ``yt-dlp`` subprocess); compacting it to three short excerpts HERE, in
+    code, is what keeps the batched prompt small — the full cue list never reaches a model.
+
+    Args:
+        transcript: The cue-preserving transcript, or None.
+
+    Returns:
+        Up to :data:`SECTIONS_PER_VIDEO` anchors in ascending time order, or ``[]`` when
+        there is no transcript or it has fewer than :data:`_MIN_CUES_FOR_SECTIONS` cues.
+
+    Example:
+        >>> anchors_from_transcript(None)
+        []
+    """
+    if transcript is None or len(transcript.cues) < _MIN_CUES_FOR_SECTIONS:
+        return []
+
+    cues = transcript.cues
+    anchors: list[SectionAnchor] = []
+    seen_offsets: set[float] = set()
+    for fraction in _TRANSCRIPT_ANCHOR_FRACTIONS:
+        start_index = min(len(cues) - 1, int(len(cues) * fraction))
+        start_seconds = float(cues[start_index].cue_start_seconds)
+        if start_seconds in seen_offsets:
+            continue
+        seen_offsets.add(start_seconds)
+        excerpt = " ".join(
+            str(cue.text) for cue in cues[start_index : start_index + _CUES_PER_TRANSCRIPT_ANCHOR]
+        )
+        anchors.append(
+            SectionAnchor(start_seconds=start_seconds, source_text=_cap_source_text(excerpt))
+        )
+    return anchors
+
+
+def build_section_source(
+    video_id: str,
+    video_title: str,
+    *,
+    chapters: Optional[list[Any]] = None,
+    transcript: Transcript | None = None,
+) -> SectionSource | None:
+    """Build one video's batch input, preferring FREE chapters over a transcript.
+
+    The cost decision lives here: chapters are reused when present (zero fetch, zero
+    tokens) and the transcript is consulted only as the chapterless fallback.
+
+    Args:
+        video_id: The video's external id.
+        video_title: The video title.
+        chapters: The item's Stage-1 chapters, if any.
+        transcript: A fetched transcript, used only when ``chapters`` yields no anchors.
+
+    Returns:
+        The :class:`SectionSource`, or None when neither source yields any anchor (the
+        row then renders with no section lines rather than invented ones).
+
+    Example:
+        >>> build_section_source("abc", "A talk") is None
+        True
+    """
+    anchors = anchors_from_chapters(chapters or [])
+    if not anchors:
+        anchors = anchors_from_transcript(transcript)
+    if not anchors:
+        return None
+    return SectionSource(video_id=video_id, video_title=video_title, anchors=anchors)
+
+
+def _render_videos_block(sources: list[SectionSource]) -> str:
+    """Render the batch prompt's VIDEOS block.
+
+    One header line per video, then one ``- <timestamp> <material>`` line per anchor, so
+    the model sees each video's shape without ever seeing a full transcript.
+
+    Args:
+        sources: The batch inputs.
+
+    Returns:
+        The newline-joined block.
+    """
+    block_lines: list[str] = []
+    for source in sources:
+        block_lines.append(f"{source.video_id}\t{source.video_title}")
+        for anchor in source.anchors:
+            label = format_timestamp_label(anchor.start_seconds)
+            block_lines.append(f"  - {label} {anchor.source_text}")
+    return "\n".join(block_lines)
+
+
+def build_sections_batch(
+    sources: list[SectionSource],
+    *,
+    llm_call: Optional[SectionSummarizer] = None,
+) -> dict[str, list[Section]]:
+    """Summarize every video's anchors in ONE model call, keyed by ``video_id``.
+
+    Each returned :class:`Section` pairs a code-chosen anchor offset with the model's
+    prose for it, so the deep link always lands on a real source offset. Only ids present
+    in BOTH the input and the model's map are returned — an extra id never invents a row,
+    and a missing one simply renders without section lines.
+
+    **Fail-soft (Rule 12):** ANY LLM error or unparseable response returns ``{}`` and logs
+    ``sections_batch_failed`` — the digest renders structurally, never with placeholders.
+
+    Args:
+        sources: One :class:`SectionSource` per video (build via
+            :func:`build_section_source`). An empty list makes NO model call.
+        llm_call: The injectable live-model boundary; defaults to
+            :func:`lib.llm.call_claude_cli` (resolved at call time so a patch works).
+
+    Returns:
+        A ``{video_id: [Section, ...]}`` map. ``{}`` for empty input or ANY failure.
+
+    Example:
+        >>> build_sections_batch([])
+        {}
+    """
+    if not sources:
+        # Edge case: nothing to summarize — no model call at all.
+        return {}
+
+    indexed_sources = {source.video_id: source for source in sources if source.video_id}
+    if not indexed_sources:
+        return {}
+
+    try:
+        template = _load_prompt_section("build_sections_batch")
+        prompt = template.format(videos_block=_render_videos_block(list(indexed_sources.values())))
+        parsed = json.loads(_resolve_summarizer(llm_call)(prompt))
+        if not isinstance(parsed, dict):
+            raise ValueError("model did not return a JSON object of video_id->summaries")
+    except Exception as exc:  # noqa: BLE001 — fail-soft is the whole point (Rule 12).
+        log.log_error(
+            "sections_batch_failed",
+            video_count=len(indexed_sources),
+            error_message=str(exc),
+            fix_suggestion=(
+                "The batched section call failed or returned unparseable JSON; EVERY video "
+                "renders WITHOUT section lines (graceful degradation). Check the 'claude' "
+                "CLI/subscription and references/sections.md's build_sections_batch contract."
+            ),
+        )
+        return {}
+
+    sections_by_video: dict[str, list[Section]] = {}
+    for video_id, source in indexed_sources.items():
+        summaries = parsed.get(video_id)
+        if not isinstance(summaries, list):
+            continue
+        built: list[Section] = []
+        for anchor, summary_text in zip(source.anchors, summaries):
+            if not isinstance(summary_text, str) or not summary_text.strip():
+                # Reason: one blank summary must not lose the video's other sections.
+                continue
+            built.append(
+                Section(
+                    start_seconds=anchor.start_seconds,
+                    timestamp_label=format_timestamp_label(anchor.start_seconds),
+                    deep_link=build_deep_link(video_id, anchor.start_seconds),
+                    summary_text=_truncate_summary(summary_text),
+                )
+            )
+        if built:
+            sections_by_video[video_id] = built
+
+    missing_count = len(indexed_sources) - len(sections_by_video)
+    if missing_count:
+        # Rule 12: partial model coverage is never silent.
+        log.log_warning(
+            "sections_batch_incomplete",
+            video_count=len(indexed_sources),
+            covered_count=len(sections_by_video),
+            missing_count=missing_count,
+            fix_suggestion=(
+                "The model omitted some video ids (or returned unusable summaries for them); "
+                "those rows render without section lines. Check references/sections.md's "
+                "build_sections_batch output contract if this recurs."
+            ),
+        )
+    log.log_info(
+        "sections_batch_built",
+        video_count=len(indexed_sources),
+        covered_count=len(sections_by_video),
+    )
+    return sections_by_video

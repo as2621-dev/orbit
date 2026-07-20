@@ -1,10 +1,15 @@
 <!--
 Orbit section-summary prompt template (Final-design three-section split).
 
-ONE LLM job lives here, in a labeled section (delimited by the
+TWO LLM jobs live here, each in a labeled section (delimited by the
 `<!-- PROMPT:name -->` / `<!-- /PROMPT:name -->` markers below):
 
-  - `build_sections` — exactly THREE timestamped sections for one video.
+  - `build_sections` — exactly THREE timestamped sections for ONE video, where the
+    model picks the split points from a full transcript. One call per video.
+  - `build_sections_batch` — summaries for MANY videos in ONE call, where CODE has
+    already chosen each video's three anchors. This is what the pipeline runs
+    (Rule 6: ~35 videos in a single call instead of ~35 calls). The model writes
+    prose only; it never returns a timestamp, so nothing needs snapping.
 
 `lib/sections.py` loads THIS file at runtime, slices the section it needs, and
 `.format(...)`-substitutes the placeholders (so the maintainer can tune wording
@@ -53,3 +58,35 @@ no trailing commentary:
 
 [{{"start_seconds": <number>, "text": "<summary>"}}]
 <!-- /PROMPT:build_sections -->
+
+<!-- PROMPT:build_sections_batch -->
+You are Orbit's section editor. Below are several videos the reader follows. For EACH
+video you are given three ANCHORS — already-chosen moments in the video, each with the
+material that occurs there. Write ONE summary per anchor.
+
+You do NOT choose where the sections start. The anchors are fixed. Your only job is to
+say what each anchor's stretch of the video covers.
+
+VIDEOS:
+{videos_block}
+
+For each anchor write ONE summary of AT MOST 200 characters describing what that stretch
+ACTUALLY covers — the specific claim, example, or argument a reader would get by jumping
+there. Be concrete: name the thing being discussed. Ground every summary ONLY in that
+anchor's material plus the video title; never invent facts, guests, numbers, or claims
+that are not supported by what you were given.
+
+Never write generic filler that would fit any video ("opens by laying out the problem",
+"the main walkthrough", "stress-tests the approach"); a summary that could be pasted onto
+a different video is a failed summary. When an anchor's material is a bare label like
+"Intro" or "Sponsor", do NOT echo it — say what the video's opening or that segment is
+actually about, using the title and the surrounding anchors as context.
+
+No hashtags, no emoji, no surrounding quotes, no restating the video title verbatim.
+
+Return ONLY a strict JSON object mapping each video id to its array of exactly three
+summary strings, in the same order as that video's anchors — no prose, no markdown fence,
+no trailing commentary:
+
+{{"<video_id>": ["<summary1>", "<summary2>", "<summary3>"]}}
+<!-- /PROMPT:build_sections_batch -->
